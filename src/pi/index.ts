@@ -150,11 +150,24 @@ function buildWidgetState(services: ReturnType<typeof createHostServices>): AgyW
     }
   })
 
+  const cfg = services.getConfig()
+
   return {
     version: services.status.version,
     dormantReason: services.status.dormantReason,
     activeAccountId: activeId,
     accounts: mappedAccounts,
+    settings: {
+      mode: poolData.mode,
+      proxyUrl: cfg.proxyUrl || '',
+      permissionMode: cfg.permissionMode || 'skip',
+      defaultEffort: cfg.defaultEffort || '',
+      parallelSameAccount: Boolean(cfg.parallelSameAccount),
+      maxConcurrent: Number(cfg.maxConcurrent ?? 0),
+      dispatchTimeoutMinutes: Number(cfg.dispatchTimeoutMinutes ?? 0),
+      dispatchRetries: Number(cfg.dispatchRetries ?? 0),
+      suppressAgyAutoUpdate: Boolean(cfg.suppressAgyAutoUpdate),
+    },
     updatedAt: now,
   }
 }
@@ -513,6 +526,90 @@ export default function (pi: ExtensionAPI): void {
         services.pool.setAccountProxy(target.id, proxy)
         publishAgyUi(ctx, services)
         emitOutput(ctx, proxy ? `Proxy set for ${target.email || target.alias}: ${proxy}` : `Cleared proxy for ${target.email || target.alias}`)
+        return
+      }
+      if ((sub === 'enable' || sub === 'disable') && rest[0]) {
+        const target = findAccount(rest[0])
+        if (!target) {
+          emitOutput(ctx, `Account not found: ${rest[0]}`, 'error')
+          return
+        }
+        const enabled = sub === 'enable'
+        services.pool.setAccountEnabled(target.id, enabled)
+        publishAgyUi(ctx, services)
+        emitOutput(ctx, `${enabled ? 'Enabled' : 'Disabled'} AGY account ${target.email || target.alias}`)
+        return
+      }
+      if (sub === 'mode' && rest[0]) {
+        const mode = rest[0].toLowerCase()
+        if (mode !== 'sequential' && mode !== 'round-robin') {
+          emitOutput(ctx, 'Usage: /agy mode <sequential|round-robin>', 'error')
+          return
+        }
+        services.pool.setMode(mode)
+        publishAgyUi(ctx, services)
+        emitOutput(ctx, `Pool rotation mode set to ${mode}`)
+        return
+      }
+      if (sub === 'proxy-global') {
+        const raw = (rest[0] || '').trim()
+        const nextProxy = !raw || raw === 'clear' || raw === 'none' ? '' : raw
+        services.setOverride('proxyUrl', nextProxy)
+        publishAgyUi(ctx, services)
+        emitOutput(ctx, nextProxy ? `Global upstream proxy set to ${nextProxy}` : 'Global upstream proxy cleared')
+        return
+      }
+      if (sub === 'permission' && rest[0]) {
+        const p = rest[0].toLowerCase()
+        if (p !== 'skip' && p !== 'plan' && p !== 'accept-edits') {
+          emitOutput(ctx, 'Usage: /agy permission <skip|plan|accept-edits>', 'error')
+          return
+        }
+        services.setOverride('permissionMode', p)
+        publishAgyUi(ctx, services)
+        emitOutput(ctx, `Permission mode set to ${p}`)
+        return
+      }
+      if (sub === 'effort' && rest[0]) {
+        const eff = rest[0].toLowerCase()
+        if (!['default', 'low', 'medium', 'high'].includes(eff)) {
+          emitOutput(ctx, 'Usage: /agy effort <default|low|medium|high>', 'error')
+          return
+        }
+        services.setOverride('defaultEffort', eff === 'default' ? '' : eff)
+        publishAgyUi(ctx, services)
+        emitOutput(ctx, `Default effort set to ${eff}`)
+        return
+      }
+      if (sub === 'parallel' && rest[0]) {
+        const on = rest[0].toLowerCase() === 'on' || rest[0].toLowerCase() === 'true'
+        services.setOverride('parallelSameAccount', on)
+        publishAgyUi(ctx, services)
+        emitOutput(ctx, `Same-account parallelism ${on ? 'enabled' : 'disabled'}`)
+        return
+      }
+      if (sub === 'max-concurrent' && rest[0]) {
+        const n = Number(rest[0])
+        if (!Number.isFinite(n) || n < 0 || n > 64) {
+          emitOutput(ctx, 'Usage: /agy max-concurrent <0-64>', 'error')
+          return
+        }
+        services.setOverride('maxConcurrent', Math.floor(n))
+        publishAgyUi(ctx, services)
+        emitOutput(ctx, n === 0 ? 'Max concurrent streams: unlimited' : `Max concurrent streams set to ${Math.floor(n)}`)
+        return
+      }
+      if (sub === 'suppress-update' && rest[0]) {
+        const on = rest[0].toLowerCase() === 'on' || rest[0].toLowerCase() === 'true'
+        services.setOverride('suppressAgyAutoUpdate', on)
+        publishAgyUi(ctx, services)
+        emitOutput(ctx, `Suppress agy CLI auto-update: ${on ? 'enabled' : 'disabled'}`)
+        return
+      }
+      if (sub === 'clear-cooldown') {
+        services.pool.clearCooldown(rest[0] || undefined, undefined, true)
+        publishAgyUi(ctx, services)
+        emitOutput(ctx, 'Cleared all Antigravity cooldowns and low-quota benches')
         return
       }
       showStatus(ctx)
