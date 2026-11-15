@@ -109,6 +109,8 @@ export interface ManagedAccount {
    * cleared, because its argon cooldowns come from real 429s.
    */
   dedicatedGroups?: ModelFamily[]
+  /** Subscription tier reported by loadCodeAssist (`ULTRA`, `PRO`, `FREE`). */
+  subscriptionTier?: string
 }
 
 /**

@@ -124,7 +124,9 @@ function buildWidgetState(services: ReturnType<typeof createHostServices>): AgyW
       }
     }
 
-    const tier = acc.dedicatedGroups?.includes('argon') || arg !== undefined ? 'PRO/ULTRA' : 'STANDARD'
+    const tier =
+      acc.subscriptionTier ||
+      (acc.dedicatedGroups?.includes('argon') || arg !== undefined ? 'PRO/ULTRA' : 'STANDARD')
 
     return {
       id: acc.id,
@@ -151,12 +153,16 @@ function buildWidgetState(services: ReturnType<typeof createHostServices>): AgyW
   })
 
   const cfg = services.getConfig()
+  const availableModels = services.catalog
+    .get(activeId)
+    .models.map((m) => m.id)
 
   return {
     version: services.status.version,
     dormantReason: services.status.dormantReason,
     activeAccountId: activeId,
     accounts: mappedAccounts,
+    availableModels,
     settings: {
       mode: poolData.mode,
       proxyUrl: cfg.proxyUrl || '',
@@ -167,6 +173,15 @@ function buildWidgetState(services: ReturnType<typeof createHostServices>): AgyW
       dispatchTimeoutMinutes: Number(cfg.dispatchTimeoutMinutes ?? 0),
       dispatchRetries: Number(cfg.dispatchRetries ?? 0),
       suppressAgyAutoUpdate: Boolean(cfg.suppressAgyAutoUpdate),
+      poolWideCatalog: Boolean(cfg.poolWideCatalog),
+      autoFallbackModel: Boolean(cfg.autoFallbackModel),
+      hiddenModels: Array.isArray(cfg.hiddenModels) ? [...cfg.hiddenModels] : [],
+      autoWarmup: Boolean(cfg.autoWarmup),
+      imageModel: cfg.imageModel || '',
+      imageEffort: cfg.imageEffort || 'low',
+      imageTimeoutMs: Number(cfg.imageTimeoutMs ?? 240000),
+      imageRetries: Number(cfg.imageRetries ?? 1),
+      imageOutputDir: cfg.imageOutputDir || '',
     },
     updatedAt: now,
   }
@@ -610,6 +625,90 @@ export default function (pi: ExtensionAPI): void {
         services.pool.clearCooldown(rest[0] || undefined, undefined, true)
         publishAgyUi(ctx, services)
         emitOutput(ctx, 'Cleared all Antigravity cooldowns and low-quota benches')
+        return
+      }
+      if (sub === 'pool-wide' && rest[0]) {
+        const on = rest[0].toLowerCase() === 'on' || rest[0].toLowerCase() === 'true'
+        services.setOverride('poolWideCatalog', on)
+        publishAgyUi(ctx, services)
+        emitOutput(ctx, `Pool-wide model catalog ${on ? 'enabled' : 'disabled'}`)
+        return
+      }
+      if (sub === 'auto-fallback' && rest[0]) {
+        const on = rest[0].toLowerCase() === 'on' || rest[0].toLowerCase() === 'true'
+        services.setOverride('autoFallbackModel', on)
+        publishAgyUi(ctx, services)
+        emitOutput(ctx, `Auto fallback model ${on ? 'enabled' : 'disabled'}`)
+        return
+      }
+      if (sub === 'warmup' && rest[0]) {
+        const on = rest[0].toLowerCase() === 'on' || rest[0].toLowerCase() === 'true'
+        services.setOverride('autoWarmup', on)
+        publishAgyUi(ctx, services)
+        emitOutput(ctx, `Auto 7-day warmup ${on ? 'enabled' : 'disabled'}`)
+        return
+      }
+      if (sub === 'hidden-models') {
+        const raw = rest.join(' ').trim()
+        const list =
+          !raw || raw === 'clear' || raw === 'none'
+            ? []
+            : raw
+                .split(',')
+                .map((s) => s.trim())
+                .filter(Boolean)
+        services.setOverride('hiddenModels', list)
+        publishAgyUi(ctx, services)
+        emitOutput(ctx, list.length > 0 ? `Hidden models: ${list.join(', ')}` : 'Cleared hidden models')
+        return
+      }
+      if (sub === 'image-model') {
+        const val = (rest[0] || '').trim()
+        const nextModel = !val || val === 'default' || val === 'clear' ? '' : val
+        services.setOverride('imageModel', nextModel)
+        publishAgyUi(ctx, services)
+        emitOutput(ctx, nextModel ? `Image generation model set to ${nextModel}` : 'Image generation model reset to default')
+        return
+      }
+      if (sub === 'image-effort' && rest[0]) {
+        const eff = rest[0].toLowerCase()
+        if (!['low', 'medium', 'high'].includes(eff)) {
+          emitOutput(ctx, 'Usage: /agy image-effort <low|medium|high>', 'error')
+          return
+        }
+        services.setOverride('imageEffort', eff)
+        publishAgyUi(ctx, services)
+        emitOutput(ctx, `Image generation effort set to ${eff}`)
+        return
+      }
+      if (sub === 'image-timeout' && rest[0]) {
+        const sec = Number(rest[0])
+        if (!Number.isFinite(sec) || sec < 10 || sec > 1800) {
+          emitOutput(ctx, 'Usage: /agy image-timeout <10-1800 seconds>', 'error')
+          return
+        }
+        services.setOverride('imageTimeoutMs', Math.floor(sec * 1000))
+        publishAgyUi(ctx, services)
+        emitOutput(ctx, `Image generation timeout set to ${Math.floor(sec)}s`)
+        return
+      }
+      if (sub === 'image-retries' && rest[0]) {
+        const n = Number(rest[0])
+        if (!Number.isFinite(n) || n < 0 || n > 5) {
+          emitOutput(ctx, 'Usage: /agy image-retries <0-5>', 'error')
+          return
+        }
+        services.setOverride('imageRetries', Math.floor(n))
+        publishAgyUi(ctx, services)
+        emitOutput(ctx, `Image generation retries set to ${Math.floor(n)}`)
+        return
+      }
+      if (sub === 'image-dir') {
+        const raw = rest.join(' ').trim()
+        const nextDir = !raw || raw === 'clear' || raw === 'default' ? '' : raw
+        services.setOverride('imageOutputDir', nextDir)
+        publishAgyUi(ctx, services)
+        emitOutput(ctx, nextDir ? `Image output directory set to ${nextDir}` : 'Image output directory reset to default')
         return
       }
       showStatus(ctx)

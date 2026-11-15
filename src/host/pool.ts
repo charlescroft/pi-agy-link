@@ -464,6 +464,14 @@ export class AccountPoolManager {
     this.persist()
   }
 
+  /** Persist detected subscription tier (`ULTRA`, `PRO`, `FREE`). */
+  setSubscriptionTier(id: string, tier: string): void {
+    const acc = this.getAccount(id)
+    if (!acc || acc.subscriptionTier === tier) return
+    acc.subscriptionTier = tier
+    this.persist()
+  }
+
   /**
    * Reset cooldown timers.
    *

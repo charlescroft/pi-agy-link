@@ -53,6 +53,45 @@ export async function fetchUserInfo(accessToken: string, proxyUrl?: string): Pro
   return null
 }
 
+/**
+ * Resolve Google Cloud Code subscription tier (`ULTRA`, `PRO`, `FREE`) via loadCodeAssist.
+ */
+export async function fetchSubscriptionTier(
+  deps: QuotaHttpDeps,
+  accessToken: string,
+  proxyUrl?: string,
+): Promise<string | null> {
+  const endpoints = orderedEndpoints(deps.getPreferredEndpointIndex())
+  for (const endpoint of endpoints) {
+    try {
+      const res = await agyFetch(`${endpoint}/v1internal:loadCodeAssist`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          'Content-Type': 'application/json',
+          'User-Agent': agyUserAgent(deps.agyVersion()),
+          'Client-Metadata': '{"ideType":"ANTIGRAVITY"}',
+        },
+        body: JSON.stringify({ metadata: { ideType: 'ANTIGRAVITY' } }),
+      }, proxyUrl)
+      if (!res.ok) continue
+      const data = (await res.json()) as {
+        paidTier?: { id?: string; name?: string }
+        currentTier?: { id?: string; name?: string }
+      }
+      const raw = (data.paidTier?.id || data.paidTier?.name || data.currentTier?.id || data.currentTier?.name || '').toLowerCase()
+      if (!raw) continue
+      if (raw.includes('ultra')) return 'ULTRA'
+      if (raw.includes('pro')) return 'PRO'
+      if (raw.includes('free') || raw.includes('standard')) return 'FREE'
+      return raw.toUpperCase()
+    } catch {
+      // try next endpoint
+    }
+  }
+  return null
+}
+
 /** POST /v1internal:retrieveUserQuotaSummary for one endpoint. */
 export function requestQuotaSummaryEndpoint(
   endpoint: string,

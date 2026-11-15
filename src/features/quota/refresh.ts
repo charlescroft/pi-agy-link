@@ -34,6 +34,7 @@ export interface QuotaRefreshPool {
   hasDedicatedGroup(id: string, family: ModelFamily): boolean
   resetAccountIdentity(id: string, email: string): void
   updateAccountQuotas(id: string, quotas: Partial<Record<ModelFamily, FamilyQuotaInfo>>, email?: string): void
+  setSubscriptionTier?(id: string, tier: string): void
 }
 
 /**
@@ -52,6 +53,7 @@ export interface QuotaRefreshDeps {
   fetchQuotaSummary(token: string, proxyUrl?: string): Promise<QuotaSummaryResponse | null>
   fetchAvailableModels(token: string, proxyUrl?: string): Promise<DiscoveredModelsResponse | null>
   fetchUserQuota(token: string, proxyUrl?: string): Promise<UserQuotaResponse | null>
+  fetchSubscriptionTier?(token: string, proxyUrl?: string): Promise<string | null>
   getTokenFilePath(account: ManagedAccount): string
   detectEmailFromLogs(home: string): string | undefined
   readPrimaryCredential(baseDir: string): PrimaryCredentialLike | null
@@ -208,11 +210,15 @@ export async function refreshAccountQuotaPipeline(
     deps.pool.resetAccountIdentity(account.id, email)
   }
 
-  const [summary, discovered, userQuota] = await Promise.all([
+  const [summary, discovered, userQuota, subTier] = await Promise.all([
     deps.fetchQuotaSummary(accessToken, deps.proxyFor(account)),
     deps.fetchAvailableModels(accessToken, deps.proxyFor(account)),
     deps.fetchUserQuota(accessToken, deps.proxyFor(account)).catch(() => null),
+    deps.fetchSubscriptionTier ? deps.fetchSubscriptionTier(accessToken, deps.proxyFor(account)).catch(() => null) : Promise.resolve(null),
   ])
+  if (subTier && deps.pool.setSubscriptionTier) {
+    deps.pool.setSubscriptionTier(account.id, subTier)
+  }
 
   // Query the userinfo endpoint ONLY when the email is still unknown.
   // Account switching on systemHome accounts is already caught locally by

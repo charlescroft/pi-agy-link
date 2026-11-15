@@ -39,6 +39,7 @@ import { refreshAccountQuotaPipeline, type QuotaRefreshDeps } from '../features/
 import {
   fetchAvailableModels as fetchAvailableModelsImpl,
   fetchQuotaSummary as fetchQuotaSummaryImpl,
+  fetchSubscriptionTier as fetchSubscriptionTierImpl,
   fetchUserInfo as fetchUserInfoImpl,
   fetchUserQuota as fetchUserQuotaImpl,
   requestQuotaSummaryEndpoint,
@@ -382,6 +383,7 @@ export class QuotaService {
       fetchQuotaSummary: (token, proxyUrl) => this.fetchQuotaSummary(token, proxyUrl),
       fetchAvailableModels: (token, proxyUrl) => this.fetchAvailableModels(token, proxyUrl),
       fetchUserQuota: (token, proxyUrl) => this.fetchUserQuota(token, proxyUrl),
+      fetchSubscriptionTier: (token, proxyUrl) => fetchSubscriptionTierImpl(this.httpDeps(), token, proxyUrl),
       getTokenFilePath: (a) => this.getTokenFilePath(a),
       detectEmailFromLogs: (home) => detectEmailFromAgyLogs(home),
       readPrimaryCredential: (baseDir) => readPrimaryCredential(baseDir),
