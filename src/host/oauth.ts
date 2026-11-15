@@ -236,7 +236,7 @@ export interface CallbackHandle {
 const CALLBACK_SUCCESS_HTML = `<!doctype html><html><head><meta charset="utf-8"><title>登录成功</title></head>
 <body style="font-family:system-ui;text-align:center;padding:3rem">
 <h2>✓ 授权成功</h2>
-<p>可以关闭此标签页，返回 DeepSeek Harness。</p>
+<p>可以关闭此标签页，返回 PiCrust。</p>
 </body></html>`
 
 /**

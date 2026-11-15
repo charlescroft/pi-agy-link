@@ -583,6 +583,14 @@ export default function (pi: ExtensionAPI): void {
           emitOutput(ctx, `Account not found: ${rest[0]}`, 'error')
           return
         }
+        if (sub === 'reauth-url') {
+          const st = services.poolAuth.status()
+          if (st.phase === 'waiting' && st.url && (st.stagingId === target.id || st.alias === target.alias)) {
+            publishAgyUi(ctx, services)
+            emitOutput(ctx, st.url)
+            return
+          }
+        }
         if (target.systemHome || !target.dir) {
           return await runPrimaryAuth(ctx)
         }
@@ -843,16 +851,28 @@ export default function (pi: ExtensionAPI): void {
           clearInterval(authWatchTimer)
           authWatchTimer = null
         }
+        registerAgyProvider()
+        publishAgyUi(lastUiCtx, services)
+        if (lastUiCtx) {
+          emitOutput(lastUiCtx, `Google OAuth completed${st.alias ? ` for ${st.alias}` : ''}.`)
+        }
+        const activeId = services.pool.getActiveAccount()?.id
+        if (activeId) {
+          void services.catalog.forceRefreshAndNotify(activeId).catch(() => undefined)
+        }
         void services.quota.refreshAllQuotas(true).catch(() => undefined).finally(() => {
           lastQuotaRefreshAt = Date.now()
           publishAgyUi(lastUiCtx, services)
         })
-      } else if (st.phase === 'error' || st.phase === 'idle' || checks >= 180) {
+      } else if (st.phase === 'failed' || st.phase === 'idle' || checks >= 180) {
         if (authWatchTimer) {
           clearInterval(authWatchTimer)
           authWatchTimer = null
         }
         publishAgyUi(lastUiCtx, services)
+        if (st.phase === 'failed' && lastUiCtx) {
+          emitOutput(lastUiCtx, `Google OAuth failed (${st.code || 'unknown'}).`, 'error')
+        }
       }
     }, 1000)
     authWatchTimer.unref?.()

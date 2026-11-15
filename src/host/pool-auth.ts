@@ -355,7 +355,7 @@ export class PoolAuthFlow {
         }
         const normalized = email.toLowerCase()
         if ((account.email && account.email.toLowerCase() !== normalized) ||
-            this.pool.getAccounts().some((other) => other.id !== account.id && other.email?.toLowerCase() === normalized)) {
+            this.pool.getAccounts().some((other) => other.id !== account.id && !other.systemHome && other.email?.toLowerCase() === normalized)) {
           this.fail('identity_mismatch')
           return
         }
@@ -374,6 +374,7 @@ export class PoolAuthFlow {
         this.flow = null
         if (flow.listener) void flow.listener.close().catch(() => undefined)
         this.setStatus({ phase: 'done', alias: account.alias, code: 'account_activated' })
+        this.onUpdate?.()
         return
       }
       const tokenFile = writeAgyTokenFile(flow.dir, tokens)
@@ -414,6 +415,7 @@ export class PoolAuthFlow {
         this.flow = null
         if (flow.listener) void flow.listener.close().catch(() => undefined)
         this.setStatus({ phase: 'done', alias: email, code: 'primary_activated' })
+        this.onUpdate?.()
         return
       }
       const acc = this.pool.commitStagingAccount(flow.stagingId, flow.dir, flow.alias, email, flow.proxyUrl)
@@ -425,6 +427,7 @@ export class PoolAuthFlow {
       this.flow = null
       if (flow.listener) void flow.listener.close().catch(() => undefined)
       this.setStatus({ phase: 'done', alias: acc.alias, code: 'account_activated' })
+      this.onUpdate?.()
     } catch (err) {
       if (this.flow === flow) this.fail('exchange_failed', err)
     }
