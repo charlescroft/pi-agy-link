@@ -1,0 +1,40 @@
+name: Publish
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  npm:
+    runs-on: ubuntu-latest
+    environment: npm
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          registry-url: https://registry.npmjs.org
+
+      - run: npm ci
+
+      - run: npm run check
+
+      # build before test: the MCP bridge E2E test spawns dist/bridge.mjs
+      - run: npm run build
+
+      - run: npm test
+
+      # v0.6.19 / v0.6.20 shipped GitHub Releases that were never installable:
+      # a single transient `404 Not Found - PUT registry.npmjs.org` killed the
+      # publish step, and nothing verified the version was actually readable.
+      # The wrapper retries transient failures and polls `npm view` before the
+      # run may pass; fatal auth/version errors still fail fast.
+      - run: node scripts/publish-retry.mjs
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

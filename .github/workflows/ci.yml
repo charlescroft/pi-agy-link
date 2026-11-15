@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - run: npm ci
+
+      - run: npm run check
+      - run: npm run lint:arch
+      - run: npm run lint:budget
+
+      # build before test: the MCP bridge E2E test spawns dist/bridge.mjs
+      - run: npm run build
+
+      # Full suite + built-in coverage thresholds (lines/branches/functions).
+      - run: npm run test:coverage
