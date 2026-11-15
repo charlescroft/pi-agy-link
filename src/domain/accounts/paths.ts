@@ -36,15 +36,20 @@ export function defaultPoolDir(home?: string): string {
   if (home === undefined && process.env.DSH_STATE_DIR) {
     return join(process.env.DSH_STATE_DIR, 'agy-accounts')
   }
+  const baseEnv = home === undefined ? (process.env.PI_CODING_AGENT_DIR ?? process.env.PI_AGENT_DIR) : undefined
+  if (baseEnv) {
+    return join(baseEnv, 'agy-accounts')
+  }
   const effectiveHome = home ?? homedir()
   // Guard against isolated sub-account environments where HOME/USERPROFILE
-  // has been redirected into `<dshState>/agy-accounts/<accountId>`.
+  // has been redirected into `<piAgentDir>/agy-accounts/<accountId>`.
   const norm = effectiveHome.replace(/\\/g, '/')
-  const marker = '/.dsh/agy-accounts/'
-  const idx = norm.indexOf(marker)
-  if (idx !== -1) {
-    const realHome = effectiveHome.slice(0, idx)
-    return join(realHome, '.dsh', 'agy-accounts')
+  for (const marker of ['/.pi/agent/agy-accounts/', '/.dsh/agy-accounts/']) {
+    const idx = norm.indexOf(marker)
+    if (idx !== -1) {
+      const realHome = effectiveHome.slice(0, idx)
+      return join(realHome, '.pi', 'agent', 'agy-accounts')
+    }
   }
-  return join(effectiveHome, '.dsh', 'agy-accounts')
+  return join(effectiveHome, '.pi', 'agent', 'agy-accounts')
 }

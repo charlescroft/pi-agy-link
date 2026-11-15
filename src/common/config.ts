@@ -9,12 +9,16 @@ import { join } from 'node:path'
 
 export interface OverridesFile { [key: string]: unknown }
 
+export function piHome(): string {
+  return process.env.PI_CODING_AGENT_DIR ?? process.env.PI_AGENT_DIR ?? process.env.DSH_HOME ?? join(homedir(), '.pi', 'agent')
+}
+
 export function dshHome(): string {
-  return process.env.DSH_HOME ?? join(homedir(), '.dsh')
+  return piHome()
 }
 
 export function stateDir(): string {
-  return join(dshHome(), 'agy-link')
+  return join(piHome(), 'agy-link')
 }
 
 export function overridesPath(): string {

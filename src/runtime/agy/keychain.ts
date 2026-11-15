@@ -106,7 +106,7 @@ export function repairMacSystemKeychain(
   const realKc = realCandidates.find((p) => existsSync(p))
   if (!realKc) return false
 
-  const isIsolatedPath = (p: string) => /[\\/]\.dsh[\\/]agy-accounts[\\/]/i.test(p)
+  const isIsolatedPath = (p: string) => /[\\/](?:\.pi[\\/]agent|\.dsh)[\\/]agy-accounts[\\/]/i.test(p)
   const env = { ...process.env, HOME: userHome }
 
   try {

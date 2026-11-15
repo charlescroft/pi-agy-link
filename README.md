@@ -66,11 +66,26 @@ pi -p --model agy-link/gemini-3.8-flash "Hello"
 | `/agy details [id\|email\|index]` | Show Tier, Priority, Proxy, and full `Official Sub-models & Quotas` breakdown |
 | `/agy models [id\|email\|index]` | Alias for `/agy details` |
 | `/agy add` | Add a new Google account via loopback browser OAuth |
+| `/agy auth-url` | Print the Google OAuth URL for adding an account in any browser |
 | `/agy primary` | Sign in the primary system account via loopback browser OAuth |
+| `/agy primary-url` | Print the primary account OAuth URL for manual browser sign-in |
+| `/agy reauth <id\|email\|index>` | Re-authenticate an existing account via loopback browser OAuth |
+| `/agy reauth-url <id\|email\|index>` | Print the re-authentication OAuth URL for manual browser sign-in |
 | `/agy switch <id\|email\|index>` | Switch the active Antigravity account |
 | `/agy remove <id\|email\|index>` | Remove an account from the pool |
 | `/agy proxy <id\|email\|index> <url\|clear>` | Set or clear a per-account proxy URL |
+| `/agy hidden-models <ids\|clear>` | Hide or restore model IDs in the chat model selector |
+| `/agy pool-wide <on\|off>` | Toggle automatic multi-account rotation/failover across the pool |
+| `/agy effort <level>` | Set default thinking effort (`minimal`, `low`, `medium`, `high`, `xhigh`) |
 | `/agy refresh` / `/agy quota` | Force refresh all account quotas and model catalog |
+
+### Configuration & Storage Paths
+
+All configuration and account-pool state is stored under Pi's agent directory (`$PI_CODING_AGENT_DIR`, `$PI_AGENT_DIR`, or `~/.pi/agent` by default):
+
+- `~/.pi/agent/agy-accounts/pool.json` — Account pool index and active account metadata
+- `~/.pi/agent/agy-accounts/<accountId>/` — Isolated per-account auth & Antigravity state
+- `~/.pi/agent/agy-link/runtime-overrides.json` — Runtime overrides (hidden models, effort, pool-wide toggle, etc.)
 
 ## License
 

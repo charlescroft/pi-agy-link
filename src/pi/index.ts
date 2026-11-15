@@ -43,6 +43,7 @@ interface AgyWidgetState {
   version?: string | null
   dormantReason?: string | null
   activeAccountId?: string | null
+  pendingAuthUrl?: string
   accounts: AgyWidgetAccount[]
   updatedAt: number
 }
@@ -67,20 +68,23 @@ function formatResetShort(iso?: string): string | undefined {
 }
 
 function mapCatalogToPiModels(services: ReturnType<typeof createHostServices>) {
-  const catalog = services.catalog.get()
-  const rawModels = catalog.models
+  const poolData = services.pool.getPoolData()
+  const activeId = services.pool.getActiveAccountId('google') ?? poolData.lastActiveAccountId ?? poolData.primaryAccountId ?? undefined
+  const catalog = services.catalog.get(activeId)
+  const cfg = services.getConfig()
+  const hidden = new Set(
+    (Array.isArray(cfg.hiddenModels) ? cfg.hiddenModels : [])
+      .map((s) => s.trim())
+      .filter(Boolean)
+  )
+  const rawModels = catalog.models.filter((m) => !hidden.has(m.id))
   return rawModels.map((m) => {
     const efforts = Array.isArray(m.efforts) ? m.efforts : []
     const supportsReasoning = efforts.length > 0
     const thinkingLevelMap: Record<string, string | null> = {}
     if (supportsReasoning) {
-      for (const lvl of ['minimal', 'low', 'medium', 'high', 'xhigh', 'max']) {
-        if (efforts.includes(lvl)) thinkingLevelMap[lvl] = lvl
-        else if (lvl === 'xhigh' && efforts.includes('high')) thinkingLevelMap[lvl] = 'high'
-        else if (lvl === 'max' && efforts.includes('xhigh')) thinkingLevelMap[lvl] = 'xhigh'
-        else if (lvl === 'max' && efforts.includes('high')) thinkingLevelMap[lvl] = 'high'
-        else if (lvl === 'minimal' && efforts.includes('low')) thinkingLevelMap[lvl] = 'low'
-        else thinkingLevelMap[lvl] = null
+      for (const lvl of ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']) {
+        thinkingLevelMap[lvl] = efforts.includes(lvl) ? lvl : null
       }
     }
     return {
@@ -157,10 +161,14 @@ function buildWidgetState(services: ReturnType<typeof createHostServices>): AgyW
     .get(activeId)
     .models.map((m) => m.id)
 
+  const authSt = services.poolAuth.status()
+  const pendingAuthUrl = authSt.phase === 'waiting' ? authSt.url : undefined
+
   return {
     version: services.status.version,
     dormantReason: services.status.dormantReason,
     activeAccountId: activeId,
+    pendingAuthUrl,
     accounts: mappedAccounts,
     availableModels,
     settings: {
@@ -258,6 +266,7 @@ function emitOutput(ctx: ExtensionCommandContext, text: string, type: 'info' | '
 }
 
 export default function (pi: ExtensionAPI): void {
+  let onAdaptersUpdated = () => {}
   const mockCtx: CordisContext = {
     logger: {
       info: (msg: string) => console.log(msg),
@@ -267,15 +276,46 @@ export default function (pi: ExtensionAPI): void {
     get: () => undefined,
     effect: () => () => {},
     on: () => () => {},
-    emit: () => {},
+    emit: (event?: string) => {
+      if (event === 'llm/adapters-updated') {
+        onAdaptersUpdated()
+      }
+    },
   }
 
   const services = createHostServices(mockCtx, {})
   runBootHygiene(services)
 
   let lastUiCtx: ExtensionContext | undefined
+  let lastQuotaRefreshAt = 0
+  let bgQuotaRefreshing = false
+
+  const maybeRefreshActiveQuotaInBackground = async (force = false) => {
+    if (bgQuotaRefreshing) return
+    const now = Date.now()
+    if (!force && now - lastQuotaRefreshAt < 20_000) return
+    const poolData = services.pool.getPoolData()
+    const activeId = services.pool.getActiveAccountId('google') ?? poolData.lastActiveAccountId ?? poolData.primaryAccountId
+    const activeAcc = activeId ? services.pool.getAccounts().find((a) => a.id === activeId) : undefined
+    if (!activeAcc) return
+    bgQuotaRefreshing = true
+    try {
+      await services.quota.refreshAccountQuota(activeAcc, force).catch(() => undefined)
+      lastQuotaRefreshAt = Date.now()
+      publishAgyUi(lastUiCtx, services)
+    } finally {
+      bgQuotaRefreshing = false
+    }
+  }
+
+  const bgQuotaTimer = setInterval(() => {
+    if (!lastUiCtx) return
+    void maybeRefreshActiveQuotaInBackground(false)
+  }, 45_000)
+  bgQuotaTimer.unref?.()
 
   const refreshBootState = async () => {
+    publishAgyUi(lastUiCtx, services)
     const currentBin = services.bin()
     if (!currentBin) {
       services.status.dormantReason = 'agy binary not found'
@@ -297,26 +337,12 @@ export default function (pi: ExtensionAPI): void {
     const activeId = services.pool.getActiveAccountId('google') ?? poolData.lastActiveAccountId ?? poolData.primaryAccountId
     await services.catalog.refreshIfNeeded(activeId).catch(() => undefined)
     await services.quota.refreshAllQuotas(false).catch(() => undefined)
+    lastQuotaRefreshAt = Date.now()
+    registerAgyProvider()
     publishAgyUi(lastUiCtx, services)
   }
 
-  void refreshBootState()
-
-  const initialModels = mapCatalogToPiModels(services)
-
-  pi.registerProvider(AGY_PROVIDER_ID, {
-    name: AGY_PROVIDER_NAME,
-    baseUrl: 'agy-cli://local',
-    api: AGY_PROVIDER_ID,
-    apiKey: 'agy-cli-local',
-    models: initialModels,
-    refreshModels: async () => {
-      const poolData = services.pool.getPoolData()
-      const activeId = services.pool.getActiveAccountId('google') ?? poolData.lastActiveAccountId ?? poolData.primaryAccountId
-      await services.catalog.refreshIfNeeded(activeId).catch(() => undefined)
-      return mapCatalogToPiModels(services)
-    },
-    streamSimple: (model: any, context: any, options?: any) => {
+  const streamSimpleImpl = (model: any, context: any, options?: any) => {
       const stream = createAssistantMessageEventStream()
       const partial: any = {
         role: 'assistant',
@@ -418,8 +444,32 @@ export default function (pi: ExtensionAPI): void {
       })()
 
       return stream
-    },
-  } as any)
+    }
+
+  const registerAgyProvider = () => {
+    pi.registerProvider(AGY_PROVIDER_ID, {
+      name: AGY_PROVIDER_NAME,
+      baseUrl: 'agy-cli://local',
+      api: AGY_PROVIDER_ID,
+      apiKey: 'agy-cli-local',
+      models: mapCatalogToPiModels(services),
+      refreshModels: async () => {
+        const poolData = services.pool.getPoolData()
+        const activeId = services.pool.getActiveAccountId('google') ?? poolData.lastActiveAccountId ?? poolData.primaryAccountId
+        await services.catalog.refreshIfNeeded(activeId).catch(() => undefined)
+        return mapCatalogToPiModels(services)
+      },
+      streamSimple: streamSimpleImpl,
+    } as any)
+  }
+
+  onAdaptersUpdated = () => {
+    registerAgyProvider()
+    publishAgyUi(lastUiCtx, services)
+  }
+
+  registerAgyProvider()
+  void refreshBootState()
 
   pi.on('session_start', async (_event, ctx) => {
     lastUiCtx = ctx
@@ -429,6 +479,7 @@ export default function (pi: ExtensionAPI): void {
   pi.on('turn_end', async (_event, ctx) => {
     lastUiCtx = ctx
     publishAgyUi(ctx, services)
+    void maybeRefreshActiveQuotaInBackground(false)
   })
 
   pi.on('session_shutdown', async () => {
@@ -507,7 +558,44 @@ export default function (pi: ExtensionAPI): void {
 
       if (sub === 'refresh' || sub === 'quota') return await runRefresh(ctx)
       if (sub === 'add') return await runAddAccount(ctx)
+      if (sub === 'auth-url') {
+        const st = services.poolAuth.status()
+        if (st.phase === 'waiting' && st.url && st.stagingId !== 'acc_primary') {
+          publishAgyUi(ctx, services)
+          emitOutput(ctx, st.url)
+          return
+        }
+        return await runAddAccount(ctx)
+      }
       if (sub === 'primary') return await runPrimaryAuth(ctx)
+      if (sub === 'primary-url') {
+        const st = services.poolAuth.status()
+        if (st.phase === 'waiting' && st.url && st.stagingId === 'acc_primary') {
+          publishAgyUi(ctx, services)
+          emitOutput(ctx, st.url)
+          return
+        }
+        return await runPrimaryAuth(ctx)
+      }
+      if ((sub === 'reauth' || sub === 'reauth-url') && rest[0]) {
+        const target = findAccount(rest[0])
+        if (!target) {
+          emitOutput(ctx, `Account not found: ${rest[0]}`, 'error')
+          return
+        }
+        if (target.systemHome || !target.dir) {
+          return await runPrimaryAuth(ctx)
+        }
+        const res = await services.poolAuth.beginAccount(target.id)
+        if (res.ok) {
+          emitOutput(ctx, res.url ? `Opened Google OAuth for ${target.email || target.alias} (${res.url}).` : 'Google OAuth started.')
+          watchPoolAuthCompletion()
+        } else {
+          emitOutput(ctx, `Failed to start OAuth: ${res.error || res.code || 'unknown'}`, 'error')
+        }
+        publishAgyUi(ctx, services)
+        return
+      }
       if (sub === 'details' || sub === 'models') return showDetails(ctx, rest[0])
       if (sub === 'switch' && rest[0]) {
         const target = findAccount(rest[0])
@@ -516,7 +604,10 @@ export default function (pi: ExtensionAPI): void {
           return
         }
         services.pool.setActiveAccount(target.id, 'google')
+        registerAgyProvider()
         publishAgyUi(ctx, services)
+        void services.catalog.forceRefreshAndNotify(target.id).catch(() => undefined)
+        void maybeRefreshActiveQuotaInBackground(true)
         emitOutput(ctx, `Switched active AGY account to ${target.email || target.alias}`)
         return
       }
@@ -630,6 +721,7 @@ export default function (pi: ExtensionAPI): void {
       if (sub === 'pool-wide' && rest[0]) {
         const on = rest[0].toLowerCase() === 'on' || rest[0].toLowerCase() === 'true'
         services.setOverride('poolWideCatalog', on)
+        registerAgyProvider()
         publishAgyUi(ctx, services)
         emitOutput(ctx, `Pool-wide model catalog ${on ? 'enabled' : 'disabled'}`)
         return
@@ -658,6 +750,7 @@ export default function (pi: ExtensionAPI): void {
                 .map((s) => s.trim())
                 .filter(Boolean)
         services.setOverride('hiddenModels', list)
+        registerAgyProvider()
         publishAgyUi(ctx, services)
         emitOutput(ctx, list.length > 0 ? `Hidden models: ${list.join(', ')}` : 'Cleared hidden models')
         return
@@ -728,15 +821,48 @@ export default function (pi: ExtensionAPI): void {
   async function runRefresh(ctx: ExtensionCommandContext): Promise<void> {
     emitOutput(ctx, 'Refreshing Antigravity quotas…')
     await services.quota.refreshAllQuotas(true).catch(() => undefined)
+    lastQuotaRefreshAt = Date.now()
     await services.catalog.refreshIfNeeded().catch(() => undefined)
     publishAgyUi(ctx, services)
     emitOutput(ctx, 'Antigravity quotas refreshed.')
+  }
+
+  let authWatchTimer: ReturnType<typeof setInterval> | null = null
+
+  function watchPoolAuthCompletion(): void {
+    if (authWatchTimer) {
+      clearInterval(authWatchTimer)
+      authWatchTimer = null
+    }
+    let checks = 0
+    authWatchTimer = setInterval(() => {
+      checks += 1
+      const st = services.poolAuth.status()
+      if (st.phase === 'done') {
+        if (authWatchTimer) {
+          clearInterval(authWatchTimer)
+          authWatchTimer = null
+        }
+        void services.quota.refreshAllQuotas(true).catch(() => undefined).finally(() => {
+          lastQuotaRefreshAt = Date.now()
+          publishAgyUi(lastUiCtx, services)
+        })
+      } else if (st.phase === 'error' || st.phase === 'idle' || checks >= 180) {
+        if (authWatchTimer) {
+          clearInterval(authWatchTimer)
+          authWatchTimer = null
+        }
+        publishAgyUi(lastUiCtx, services)
+      }
+    }, 1000)
+    authWatchTimer.unref?.()
   }
 
   async function runAddAccount(ctx: ExtensionCommandContext): Promise<void> {
     const res = await services.poolAuth.begin()
     if (res.ok) {
       emitOutput(ctx, res.url ? `Opened Google OAuth in browser (${res.url}). Complete sign-in to add account.` : 'Google OAuth started.')
+      watchPoolAuthCompletion()
     } else {
       emitOutput(ctx, `Failed to start OAuth: ${res.error || res.code || 'unknown'}`, 'error')
     }
@@ -747,6 +873,7 @@ export default function (pi: ExtensionAPI): void {
     const res = await services.poolAuth.beginPrimary()
     if (res.ok) {
       emitOutput(ctx, 'Opened Google OAuth for primary account in browser.')
+      watchPoolAuthCompletion()
     } else {
       emitOutput(ctx, `Failed to start primary OAuth: ${res.error || res.code || 'unknown'}`, 'error')
     }

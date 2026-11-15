@@ -63,7 +63,7 @@ const USAGE = `dsh-agy-image — 用 agy 内置的 generate_image 生成图片�
   dsh-agy-image -p "一只戴墨镜的柴犬，扁平插画风" -a 16:9 -o ./dog.jpg
   dsh-agy-image -p "把背景换成夜晚" -i ./day.png -n night_scene --json
 
-账号池：与 DSH 主流程共用 ~/.dsh/agy-accounts/pool.json。额度耗尽/地区拒绝
+账号池：读取 ~/.pi/agent/agy-accounts/pool.json。额度耗尽/地区拒绝
 会在重试时自动换号（与真实对话完全同一套逻辑）。
 
 退出码：

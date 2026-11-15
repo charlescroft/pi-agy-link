@@ -14,7 +14,7 @@ export function setAgyDbDir(dir: string): void {
 /**
  * Candidate conversations directories for a conversation id.
  * Pool/isolated accounts write agy state under their own HOME
- * (~/.dsh/agy-accounts/<id>/.gemini/...), NOT the system ~/.gemini
+ * (~/.pi/agent/agy-accounts/<id>/.gemini/...), NOT the system ~/.gemini
  * (issue: thinking/tool-args invisible when using isolated accounts).
  */
 export function conversationsDirCandidates(accountHome?: string): string[] {
@@ -28,8 +28,8 @@ export function conversationsDirCandidates(accountHome?: string): string[] {
   push(AGY_DB_DIR)
   push(join(homedir(), '.gemini', 'antigravity-cli', 'conversations'))
   const realHome = process.env.USERPROFILE || process.env.HOME || homedir()
-  const poolBases = [join(homedir(), '.dsh', 'agy-accounts')]
-  if (realHome && realHome !== homedir()) poolBases.push(join(realHome, '.dsh', 'agy-accounts'))
+  const poolBases = [join(homedir(), '.pi', 'agent', 'agy-accounts')]
+  if (realHome && realHome !== homedir()) poolBases.push(join(realHome, '.pi', 'agent', 'agy-accounts'))
   for (const pb of poolBases) {
     try {
       for (const ent of readdirSync(pb)) {
