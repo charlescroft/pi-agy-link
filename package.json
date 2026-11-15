@@ -1,14 +1,13 @@
 {
-  "name": "dsh-agy-link",
+  "name": "pi-agy-link",
   "version": "0.6.28",
-  "description": "Google Antigravity (agy CLI) models for DeepSeek Harness — stream Gemini/Claude/GPT-OSS subscriptions into DSH with thinking, tool activity, token usage and in-GUI Google OAuth login.",
+  "description": "Google Antigravity (agy CLI) provider & multi-account pool extension for Pi Coding Agent and PiCrust.",
   "type": "module",
   "license": "MIT",
   "icon": "./assets/icon.svg",
   "keywords": [
-    "dsh-plugin",
-    "dsh",
-    "deepseek-harness",
+    "pi-package",
+    "pi-extension",
     "antigravity",
     "agy",
     "gemini"
@@ -123,10 +122,10 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+ssh://git@github.com/amlyczz/dsh-agy-link.git"
+    "url": "https://github.com/charlescroft/pi-agy-link.git"
   },
   "bugs": {
-    "url": "https://github.com/amlyczz/dsh-agy-link/issues"
+    "url": "https://github.com/charlescroft/pi-agy-link/issues"
   },
-  "homepage": "https://github.com/amlyczz/dsh-agy-link#readme"
+  "homepage": "https://github.com/charlescroft/pi-agy-link#readme"
 }

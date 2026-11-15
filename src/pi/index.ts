@@ -70,13 +70,15 @@ function mapCatalogToPiModels(services: ReturnType<typeof createHostServices>) {
   const catalog = services.catalog.get()
   const rawModels = catalog.models
   return rawModels.map((m) => {
-    const efforts = Array.isArray(m.reasoningEfforts) ? m.reasoningEfforts : []
-    const supportsReasoning = Boolean(m.supportsReasoning ?? efforts.length > 0)
+    const efforts = Array.isArray(m.efforts) ? m.efforts : []
+    const supportsReasoning = efforts.length > 0
     const thinkingLevelMap: Record<string, string | null> = {}
     if (supportsReasoning) {
       for (const lvl of ['minimal', 'low', 'medium', 'high', 'xhigh', 'max']) {
         if (efforts.includes(lvl)) thinkingLevelMap[lvl] = lvl
         else if (lvl === 'xhigh' && efforts.includes('high')) thinkingLevelMap[lvl] = 'high'
+        else if (lvl === 'max' && efforts.includes('xhigh')) thinkingLevelMap[lvl] = 'xhigh'
+        else if (lvl === 'max' && efforts.includes('high')) thinkingLevelMap[lvl] = 'high'
         else if (lvl === 'minimal' && efforts.includes('low')) thinkingLevelMap[lvl] = 'low'
         else thinkingLevelMap[lvl] = null
       }
@@ -91,8 +93,8 @@ function mapCatalogToPiModels(services: ReturnType<typeof createHostServices>) {
       thinkingLevelMap,
       input: ['text'] as Array<'text' | 'image'>,
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-      contextWindow: m.contextWindow ?? 1_000_000,
-      maxTokens: m.maxOutputTokens ?? 65_536,
+      contextWindow: 1_000_000,
+      maxTokens: 65_536,
     }
   })
 }
