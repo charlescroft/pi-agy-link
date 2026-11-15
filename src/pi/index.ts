@@ -3,6 +3,7 @@ import { createAssistantMessageEventStream } from '@earendil-works/pi-ai'
 import { createHostServices } from '../host/services.ts'
 import { runBootHygiene } from '../host/boot-hygiene.ts'
 import { MIN_AGY_VERSION, compareVersions, parseVersion, probeProcess } from '../host/runner.ts'
+import { defineAgyMirrorTool } from '../provider/mirror/definition.ts'
 import type { Context as CordisContext } from './dsh-shims/cordis.ts'
 import type { Message, StreamChunk, TokenUsage } from './dsh-shims/dsh-llm.ts'
 import type { ManagedAccount, ModelFamily } from '../common/pool-types.ts'
@@ -220,23 +221,43 @@ function publishAgyUi(ctx: ExtensionContext | undefined, services: ReturnType<ty
   }
 }
 
-function convertPiMessagesToDsh(context: { systemPrompt?: string; messages?: Array<{ role: string; content: unknown; toolCallId?: string; toolName?: string; isError?: boolean }> }): Message[] {
+function convertPiMessagesToDsh(context: { systemPrompt?: string; messages?: Array<{ role: string; content: unknown; sections?: Record<string, string | null>; toolCallId?: string; toolName?: string; isError?: boolean }> }): Message[] {
   const out: Message[] = []
   for (const m of context.messages ?? []) {
     if (m.role === 'user' || m.role === 'assistant' || m.role === 'system') {
       if (typeof m.content === 'string') {
-        out.push({ role: m.role, content: m.content })
+        let text = m.content
+        if (m.role === 'system' && m.sections && typeof m.sections === 'object') {
+          const extra = Object.entries(m.sections)
+            .filter(([, v]) => typeof v === 'string' && v.length > 0)
+            .map(([k, v]) => `[${k}]\n${v}`)
+            .join('\n\n')
+          if (extra) text = text ? `${text}\n\n${extra}` : extra
+        }
+        out.push({ role: m.role, content: text })
       } else if (Array.isArray(m.content)) {
         const parts = m.content
           .map((p: any) => {
-            if (p && typeof p === 'object' && p.type === 'text' && typeof p.text === 'string') {
+            if (!p || typeof p !== 'object') return null
+            if (p.type === 'text' && typeof p.text === 'string') {
               return { type: 'text', text: p.text }
+            }
+            if (p.type === 'thinking' && typeof p.thinking === 'string') {
+              return { type: 'reasoning', text: p.thinking }
+            }
+            if (p.type === 'toolCall') {
+              return {
+                type: 'tool-call',
+                id: String(p.id || ''),
+                name: String(p.name || ''),
+                arguments: typeof p.arguments === 'string' ? p.arguments : JSON.stringify(p.arguments ?? {}),
+              }
             }
             return null
           })
-          .filter((x): x is { type: string; text: string } => x !== null)
+          .filter((x): x is Record<string, unknown> => x !== null)
         if (parts.length > 0) {
-          out.push({ role: m.role, content: parts })
+          out.push({ role: m.role, content: parts as any })
         }
       }
     } else if (m.role === 'toolResult') {
@@ -380,9 +401,11 @@ export default function (pi: ExtensionAPI): void {
           let thinkingIndex: number | null = null
           let textAcc = ''
           let thinkingAcc = ''
-          let finishReason: 'stop' | 'length' | 'error' | 'aborted' = 'stop'
+          const toolCallIndices = new Map<number, number>()
+          let finishReason: 'stop' | 'length' | 'toolUse' | 'error' | 'aborted' = 'stop'
 
           for await (const chunk of iter as AsyncIterable<StreamChunk>) {
+            const rawChunk = chunk as any
             if (chunk.type === 'text-delta' && typeof chunk.text === 'string') {
               if (textIndex === null) {
                 textIndex = partial.content.length
@@ -401,6 +424,54 @@ export default function (pi: ExtensionAPI): void {
               thinkingAcc += chunk.text
               partial.content[thinkingIndex].thinking = thinkingAcc
               stream.push({ type: 'thinking_delta', contentIndex: thinkingIndex, delta: chunk.text, partial })
+            } else if (rawChunk.type === 'block-start' && rawChunk.blockType === 'tool-call') {
+              if (!toolCallIndices.has(rawChunk.index)) {
+                const tcIdx = partial.content.length
+                partial.content.push({ type: 'toolCall', id: '', name: '', arguments: {} })
+                toolCallIndices.set(rawChunk.index, tcIdx)
+                stream.push({ type: 'toolcall_start', contentIndex: tcIdx, partial })
+              }
+            } else if (rawChunk.type === 'block-end' && rawChunk.block && typeof rawChunk.block === 'object') {
+              if (rawChunk.block.type === 'tool-call') {
+                let tcIdx = toolCallIndices.get(rawChunk.index)
+                if (tcIdx === undefined) {
+                  tcIdx = partial.content.length
+                  partial.content.push({ type: 'toolCall', id: '', name: '', arguments: {} })
+                  toolCallIndices.set(rawChunk.index, tcIdx)
+                  stream.push({ type: 'toolcall_start', contentIndex: tcIdx, partial })
+                }
+                const rawArgs = typeof rawChunk.block.arguments === 'string'
+                  ? rawChunk.block.arguments
+                  : JSON.stringify(rawChunk.block.arguments ?? {})
+                let parsedArgs: Record<string, unknown> = {}
+                try {
+                  const candidate = typeof rawChunk.block.arguments === 'string'
+                    ? JSON.parse(rawChunk.block.arguments)
+                    : rawChunk.block.arguments
+                  if (candidate && typeof candidate === 'object' && !Array.isArray(candidate)) {
+                    parsedArgs = candidate as Record<string, unknown>
+                  }
+                } catch {
+                  // Keep empty fallback object when raw arguments fail JSON parse
+                }
+                const toolCall = {
+                  type: 'toolCall' as const,
+                  id: String(rawChunk.block.id || `call_${Date.now()}`),
+                  name: String(rawChunk.block.name || 'agy_tool'),
+                  arguments: parsedArgs,
+                }
+                partial.content[tcIdx] = toolCall
+                stream.push({ type: 'toolcall_delta', contentIndex: tcIdx, delta: rawArgs, partial })
+                stream.push({ type: 'toolcall_end', contentIndex: tcIdx, toolCall: toolCall as any, partial })
+              } else if (rawChunk.block.type === 'reasoning' && thinkingIndex !== null) {
+                stream.push({ type: 'thinking_end', contentIndex: thinkingIndex, content: thinkingAcc, partial })
+                thinkingIndex = null
+                thinkingAcc = ''
+              } else if (rawChunk.block.type === 'text' && textIndex !== null) {
+                stream.push({ type: 'text_end', contentIndex: textIndex, content: textAcc, partial })
+                textIndex = null
+                textAcc = ''
+              }
             } else if (chunk.type === 'usage' && chunk.usage) {
               const u = chunk.usage as TokenUsage
               partial.usage.input = u.inputTokens ?? partial.usage.input
@@ -409,11 +480,17 @@ export default function (pi: ExtensionAPI): void {
               partial.usage.cacheWrite = u.cacheWriteTokens ?? partial.usage.cacheWrite
               partial.usage.totalTokens = u.totalTokens ?? partial.usage.input + partial.usage.output + partial.usage.cacheRead
             } else if (chunk.type === 'finish' && chunk.reason) {
-              if (chunk.reason.kind === 'error') {
+              const reasonAny = chunk.reason as any
+              if (reasonAny.kind === 'error') {
                 finishReason = 'error'
-                partial.errorMessage = chunk.reason.error?.message || 'agy stream error'
-              } else if (chunk.reason.kind === 'length') {
+                partial.errorMessage = reasonAny.failure?.message || reasonAny.error?.message || 'agy stream error'
+              } else if (reasonAny.kind === 'aborted') {
+                finishReason = 'aborted'
+                partial.errorMessage = reasonAny.failure?.message || reasonAny.error?.message || 'agy stream aborted'
+              } else if (reasonAny.kind === 'length') {
                 finishReason = 'length'
+              } else if (reasonAny.kind === 'tool-calls') {
+                finishReason = 'toolUse'
               } else {
                 finishReason = 'stop'
               }
@@ -428,8 +505,8 @@ export default function (pi: ExtensionAPI): void {
           }
 
           partial.stopReason = finishReason
-          if (finishReason === 'error') {
-            stream.push({ type: 'error', reason: 'error', error: partial })
+          if (finishReason === 'error' || finishReason === 'aborted') {
+            stream.push({ type: 'error', reason: finishReason, error: partial })
           } else {
             stream.push({ type: 'done', reason: finishReason, message: partial })
           }
@@ -484,6 +561,31 @@ export default function (pi: ExtensionAPI): void {
 
   pi.on('session_shutdown', async () => {
     lastUiCtx = undefined
+  })
+
+  const mirrorTool = defineAgyMirrorTool({ runs: services.runs })
+  pi.registerTool({
+    name: mirrorTool.name,
+    label: 'Antigravity Tool Mirror',
+    description: mirrorTool.description,
+    parameters: {
+      type: 'object',
+      properties: {
+        run: { type: 'string', description: 'Recording run id.' },
+        step: { type: 'number', description: 'Recorded event index of the tool step.' },
+        tool: { type: 'string', description: 'agy tool name that ran (optional).' },
+        server: { type: 'string', description: 'MCP server name (optional).' },
+        input: { description: 'agy tool arguments as recorded (optional).' },
+      },
+      required: ['run', 'step'],
+    } as any,
+    execute: async (_toolCallId, params: Record<string, unknown>, signal) => {
+      const text = await mirrorTool.execute(params as any, { signal } as any)
+      return {
+        content: [{ type: 'text' as const, text: typeof text === 'string' ? text : String(text ?? '') }],
+        details: {},
+      }
+    },
   })
 
   pi.registerTool({
