@@ -614,7 +614,10 @@ export default function (pi: ExtensionAPI): void {
         services.pool.setActiveAccount(target.id, 'google')
         registerAgyProvider()
         publishAgyUi(ctx, services)
-        void services.catalog.forceRefreshAndNotify(target.id).catch(() => undefined)
+        void services.catalog.forceRefreshAndNotify(target.id).catch(() => undefined).finally(() => {
+          registerAgyProvider()
+          publishAgyUi(lastUiCtx ?? ctx, services)
+        })
         void maybeRefreshActiveQuotaInBackground(true)
         emitOutput(ctx, `Switched active AGY account to ${target.email || target.alias}`)
         return
@@ -857,11 +860,12 @@ export default function (pi: ExtensionAPI): void {
           emitOutput(lastUiCtx, `Google OAuth completed${st.alias ? ` for ${st.alias}` : ''}.`)
         }
         const activeId = services.pool.getActiveAccount()?.id
-        if (activeId) {
-          void services.catalog.forceRefreshAndNotify(activeId).catch(() => undefined)
-        }
-        void services.quota.refreshAllQuotas(true).catch(() => undefined).finally(() => {
+        void Promise.allSettled([
+          activeId ? services.catalog.forceRefreshAndNotify(activeId) : Promise.resolve(),
+          services.quota.refreshAllQuotas(true),
+        ]).finally(() => {
           lastQuotaRefreshAt = Date.now()
+          registerAgyProvider()
           publishAgyUi(lastUiCtx, services)
         })
       } else if (st.phase === 'failed' || st.phase === 'idle' || checks >= 180) {

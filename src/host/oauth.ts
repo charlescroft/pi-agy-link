@@ -233,10 +233,10 @@ export interface CallbackHandle {
   close(): Promise<void>
 }
 
-const CALLBACK_SUCCESS_HTML = `<!doctype html><html><head><meta charset="utf-8"><title>登录成功</title></head>
+const CALLBACK_SUCCESS_HTML = `<!doctype html><html><head><meta charset="utf-8"><title>Authorization Successful</title></head>
 <body style="font-family:system-ui;text-align:center;padding:3rem">
-<h2>✓ 授权成功</h2>
-<p>可以关闭此标签页，返回 PiCrust。</p>
+<h2>&#10003; Authorization Successful</h2>
+<p>You can close this tab and return to PiCrust.</p>
 </body></html>`
 
 /**
