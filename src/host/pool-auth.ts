@@ -45,6 +45,7 @@ export type PoolAuthStatusCode =
   | 'identity_unverified'
   | 'primary_activated'
   | 'account_activated'
+  | 'account_duplicate_updated'
   | 'missing_code'
   | 'request_failed'
 
@@ -415,6 +416,28 @@ export class PoolAuthFlow {
         this.flow = null
         if (flow.listener) void flow.listener.close().catch(() => undefined)
         this.setStatus({ phase: 'done', alias: email, code: 'primary_activated' })
+        this.onUpdate?.()
+        return
+      }
+      const normalizedEmail = email?.toLowerCase()
+      const existing = normalizedEmail
+        ? this.pool.getAccounts().find((a) => !a.systemHome && a.email?.toLowerCase() === normalizedEmail)
+        : undefined
+      if (existing && existing.dir) {
+        const targetDir = join(existing.dir, '.gemini', 'antigravity-cli')
+        mkdirSync(targetDir, { recursive: true })
+        const targetFile = join(targetDir, 'antigravity-oauth-token')
+        renameSync(tokenFile, targetFile)
+        saveCredentialBackup(targetFile)
+        this.pool.clearAuthRequired(existing.id, true)
+        this.pool.clearCooldown(existing.id, undefined, true)
+        this.pool.updateAccountQuotas(existing.id, existing.quotas ?? {}, email)
+        this.pool.cleanupStagingSlot(flow.dir)
+        this.log(`pool auth matched existing account ${existing.id}${email ? ` <${email}>` : ''} — updated credentials instead of duplicating`)
+        void this.quota.refreshAccountQuota(existing).catch(() => undefined)
+        this.flow = null
+        if (flow.listener) void flow.listener.close().catch(() => undefined)
+        this.setStatus({ phase: 'done', alias: email || existing.alias, code: 'account_duplicate_updated' })
         this.onUpdate?.()
         return
       }

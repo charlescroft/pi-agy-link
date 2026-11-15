@@ -857,7 +857,15 @@ export default function (pi: ExtensionAPI): void {
         registerAgyProvider()
         publishAgyUi(lastUiCtx, services)
         if (lastUiCtx) {
-          emitOutput(lastUiCtx, `Google OAuth completed${st.alias ? ` for ${st.alias}` : ''}.`)
+          if (st.code === 'account_duplicate_updated') {
+            emitOutput(
+              lastUiCtx,
+              `Account${st.alias ? ` ${st.alias}` : ''} already exists in the pool — updated its credentials instead of adding a duplicate.`,
+              'warning',
+            )
+          } else {
+            emitOutput(lastUiCtx, `Google OAuth completed${st.alias ? ` for ${st.alias}` : ''}.`)
+          }
         }
         const activeId = services.pool.getActiveAccount()?.id
         void Promise.allSettled([
