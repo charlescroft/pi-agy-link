@@ -213,7 +213,8 @@ export function writeMacKeychainToken(rawDoc: string, email?: string, targetHome
       )
       return true
     }
-  } catch {
+  } catch (err) {
+    console.warn('[agy-link] failed to update macOS login Keychain:', err instanceof Error ? err.message : String(err))
     return false
   }
 }
@@ -447,7 +448,8 @@ export function isCurrentAccountGrant(
   if (account.systemHome || !account.dir) return true
   try {
     return deps.parseCredentialDoc(readFileSync(quotaTokenFilePath(account), 'utf8'))?.refreshToken === refreshToken
-  } catch {
+  } catch (err) {
+    console.warn('[agy-link] failed to update macOS login Keychain:', err instanceof Error ? err.message : String(err))
     return false
   }
 }

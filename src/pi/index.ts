@@ -46,6 +46,8 @@ interface AgyWidgetState {
   activeAccountId?: string | null
   pendingAuthUrl?: string
   accounts: AgyWidgetAccount[]
+  availableModels: string[]
+  settings: Record<string, unknown>
   updatedAt: number
 }
 
@@ -159,7 +161,7 @@ function buildWidgetState(services: ReturnType<typeof createHostServices>): AgyW
 
   const cfg = services.getConfig()
   const availableModels = services.catalog
-    .get(activeId)
+    .get(activeId ?? undefined)
     .models.map((m) => m.id)
 
   const authSt = services.poolAuth.status()
@@ -223,6 +225,12 @@ function publishAgyUi(ctx: ExtensionContext | undefined, services: ReturnType<ty
 
 function convertPiMessagesToDsh(context: { systemPrompt?: string; messages?: Array<{ role: string; content: unknown; sections?: Record<string, string | null>; toolCallId?: string; toolName?: string; isError?: boolean }> }): Message[] {
   const out: Message[] = []
+  if (typeof context.systemPrompt === 'string' && context.systemPrompt.trim() !== '') {
+    const hasLeadingSystem = (context.messages?.[0]?.role ?? '') === 'system'
+    if (!hasLeadingSystem) {
+      out.push({ role: 'system', content: context.systemPrompt })
+    }
+  }
   for (const m of context.messages ?? []) {
     if (m.role === 'user' || m.role === 'assistant' || m.role === 'system') {
       if (typeof m.content === 'string') {
@@ -236,26 +244,22 @@ function convertPiMessagesToDsh(context: { systemPrompt?: string; messages?: Arr
         }
         out.push({ role: m.role, content: text })
       } else if (Array.isArray(m.content)) {
-        const parts = m.content
-          .map((p: any) => {
-            if (!p || typeof p !== 'object') return null
-            if (p.type === 'text' && typeof p.text === 'string') {
-              return { type: 'text', text: p.text }
-            }
-            if (p.type === 'thinking' && typeof p.thinking === 'string') {
-              return { type: 'reasoning', text: p.thinking }
-            }
-            if (p.type === 'toolCall') {
-              return {
-                type: 'tool-call',
-                id: String(p.id || ''),
-                name: String(p.name || ''),
-                arguments: typeof p.arguments === 'string' ? p.arguments : JSON.stringify(p.arguments ?? {}),
-              }
-            }
-            return null
-          })
-          .filter((x): x is Record<string, unknown> => x !== null)
+        const parts: Array<Record<string, unknown>> = []
+        for (const p of m.content as any[]) {
+          if (!p || typeof p !== 'object') continue
+          if (p.type === 'text' && typeof p.text === 'string') {
+            parts.push({ type: 'text', text: p.text })
+          } else if (p.type === 'thinking' && typeof p.thinking === 'string') {
+            parts.push({ type: 'reasoning', text: p.thinking })
+          } else if (p.type === 'toolCall') {
+            parts.push({
+              type: 'tool-call',
+              id: String(p.id || ''),
+              name: String(p.name || ''),
+              arguments: typeof p.arguments === 'string' ? p.arguments : JSON.stringify(p.arguments ?? {}),
+            })
+          }
+        }
         if (parts.length > 0) {
           out.push({ role: m.role, content: parts as any })
         }
@@ -304,12 +308,23 @@ export default function (pi: ExtensionAPI): void {
     },
   }
 
-  const services = createHostServices(mockCtx, {})
+  const services = createHostServices(mockCtx as unknown as Parameters<typeof createHostServices>[0], {})
   runBootHygiene(services)
+
+  const warnTimestamps = new Map<string, number>()
+  const warnThrottled = (key: string, msg: string, err?: unknown): void => {
+    const now = Date.now()
+    const last = warnTimestamps.get(key) ?? 0
+    if (now - last < 60_000) return
+    warnTimestamps.set(key, now)
+    const detail = err instanceof Error ? err.message : err !== undefined ? String(err) : ''
+    console.warn(`[agy-link] ${msg}${detail ? `: ${detail}` : ''}`)
+  }
 
   let lastUiCtx: ExtensionContext | undefined
   let lastQuotaRefreshAt = 0
   let bgQuotaRefreshing = false
+  let bgQuotaTimer: ReturnType<typeof setInterval> | null = null
 
   const maybeRefreshActiveQuotaInBackground = async (force = false) => {
     if (bgQuotaRefreshing) return
@@ -321,7 +336,9 @@ export default function (pi: ExtensionAPI): void {
     if (!activeAcc) return
     bgQuotaRefreshing = true
     try {
-      await services.quota.refreshAccountQuota(activeAcc, force).catch(() => undefined)
+      await services.quota.refreshAccountQuota(activeAcc, force).catch((err) => {
+        warnThrottled('bg-quota', 'background quota refresh failed', err)
+      })
       lastQuotaRefreshAt = Date.now()
       publishAgyUi(lastUiCtx, services)
     } finally {
@@ -329,11 +346,15 @@ export default function (pi: ExtensionAPI): void {
     }
   }
 
-  const bgQuotaTimer = setInterval(() => {
-    if (!lastUiCtx) return
-    void maybeRefreshActiveQuotaInBackground(false)
-  }, 45_000)
-  bgQuotaTimer.unref?.()
+  const startBgQuotaTimer = () => {
+    if (bgQuotaTimer) return
+    bgQuotaTimer = setInterval(() => {
+      if (!lastUiCtx) return
+      void maybeRefreshActiveQuotaInBackground(false)
+    }, 45_000)
+    bgQuotaTimer.unref?.()
+  }
+  startBgQuotaTimer()
 
   const refreshBootState = async () => {
     publishAgyUi(lastUiCtx, services)
@@ -389,10 +410,10 @@ export default function (pi: ExtensionAPI): void {
           const dshMessages = convertPiMessagesToDsh(context)
           const reasoning = typeof options?.reasoning === 'string' && options.reasoning !== 'off' ? options.reasoning : undefined
           const iter = services.adapter.stream({
+            provider: AGY_PROVIDER_ID,
             model: model.id,
-            messages: dshMessages,
-            systemPrompt: context.systemPrompt,
-            sessionId: options?.sessionId ?? 'pi-session',
+            messages: dshMessages as any,
+            sessionId: (options?.sessionId ?? 'pi-session') as any,
             signal: options?.signal,
             reasoningEffort: reasoning,
           })
@@ -407,38 +428,51 @@ export default function (pi: ExtensionAPI): void {
           for await (const chunk of iter as AsyncIterable<StreamChunk>) {
             const rawChunk = chunk as any
             if (chunk.type === 'text-delta' && typeof chunk.text === 'string') {
+              let idx: number
               if (textIndex === null) {
-                textIndex = partial.content.length
+                idx = partial.content.length
+                textIndex = idx
                 partial.content.push({ type: 'text', text: '' })
-                stream.push({ type: 'text_start', contentIndex: textIndex, partial })
+                stream.push({ type: 'text_start', contentIndex: idx, partial })
+              } else {
+                idx = textIndex
               }
               textAcc += chunk.text
-              partial.content[textIndex].text = textAcc
-              stream.push({ type: 'text_delta', contentIndex: textIndex, delta: chunk.text, partial })
+              partial.content[idx].text = textAcc
+              stream.push({ type: 'text_delta', contentIndex: idx, delta: chunk.text, partial })
             } else if (chunk.type === 'reasoning-delta' && typeof chunk.text === 'string') {
+              let idx: number
               if (thinkingIndex === null) {
-                thinkingIndex = partial.content.length
+                idx = partial.content.length
+                thinkingIndex = idx
                 partial.content.push({ type: 'thinking', thinking: '' })
-                stream.push({ type: 'thinking_start', contentIndex: thinkingIndex, partial })
+                stream.push({ type: 'thinking_start', contentIndex: idx, partial })
+              } else {
+                idx = thinkingIndex
               }
               thinkingAcc += chunk.text
-              partial.content[thinkingIndex].thinking = thinkingAcc
-              stream.push({ type: 'thinking_delta', contentIndex: thinkingIndex, delta: chunk.text, partial })
+              partial.content[idx].thinking = thinkingAcc
+              stream.push({ type: 'thinking_delta', contentIndex: idx, delta: chunk.text, partial })
             } else if (rawChunk.type === 'block-start' && rawChunk.blockType === 'tool-call') {
-              if (!toolCallIndices.has(rawChunk.index)) {
+              const blockIdx = typeof rawChunk.index === 'number' ? rawChunk.index : partial.content.length
+              if (!toolCallIndices.has(blockIdx)) {
                 const tcIdx = partial.content.length
                 partial.content.push({ type: 'toolCall', id: '', name: '', arguments: {} })
-                toolCallIndices.set(rawChunk.index, tcIdx)
+                toolCallIndices.set(blockIdx, tcIdx)
                 stream.push({ type: 'toolcall_start', contentIndex: tcIdx, partial })
               }
             } else if (rawChunk.type === 'block-end' && rawChunk.block && typeof rawChunk.block === 'object') {
               if (rawChunk.block.type === 'tool-call') {
-                let tcIdx = toolCallIndices.get(rawChunk.index)
-                if (tcIdx === undefined) {
+                const blockIdx = typeof rawChunk.index === 'number' ? rawChunk.index : -1
+                const existingIdx = blockIdx >= 0 ? toolCallIndices.get(blockIdx) : undefined
+                let tcIdx: number
+                if (existingIdx === undefined) {
                   tcIdx = partial.content.length
                   partial.content.push({ type: 'toolCall', id: '', name: '', arguments: {} })
-                  toolCallIndices.set(rawChunk.index, tcIdx)
+                  if (blockIdx >= 0) toolCallIndices.set(blockIdx, tcIdx)
                   stream.push({ type: 'toolcall_start', contentIndex: tcIdx, partial })
+                } else {
+                  tcIdx = existingIdx
                 }
                 const rawArgs = typeof rawChunk.block.arguments === 'string'
                   ? rawChunk.block.arguments
@@ -550,6 +584,7 @@ export default function (pi: ExtensionAPI): void {
 
   pi.on('session_start', async (_event, ctx) => {
     lastUiCtx = ctx
+    startBgQuotaTimer()
     publishAgyUi(ctx, services)
   })
 
@@ -561,6 +596,14 @@ export default function (pi: ExtensionAPI): void {
 
   pi.on('session_shutdown', async () => {
     lastUiCtx = undefined
+    if (bgQuotaTimer) {
+      clearInterval(bgQuotaTimer)
+      bgQuotaTimer = null
+    }
+    if (authWatchTimer) {
+      clearInterval(authWatchTimer)
+      authWatchTimer = null
+    }
   })
 
   const mirrorTool = defineAgyMirrorTool({ runs: services.runs })
@@ -606,9 +649,10 @@ export default function (pi: ExtensionAPI): void {
       const acc = activeId ? services.pool.getAccount(activeId) : undefined
       let out = ''
       for await (const chunk of services.adapter.stream({
+        provider: AGY_PROVIDER_ID,
         model: params.model || 'gemini-3.6-flash',
-        messages: [{ role: 'user', content: params.prompt }],
-        sessionId: `agy_ask_${Date.now()}`,
+        messages: [{ role: 'user', content: [{ type: 'text', text: params.prompt }] }] as any,
+        sessionId: `agy_ask_${Date.now()}` as any,
       })) {
         if (chunk.type === 'text-delta' && typeof chunk.text === 'string') {
           out += chunk.text
@@ -701,7 +745,7 @@ export default function (pi: ExtensionAPI): void {
           emitOutput(ctx, res.url ? `Opened Google OAuth for ${target.email || target.alias} (${res.url}).` : 'Google OAuth started.')
           watchPoolAuthCompletion()
         } else {
-          emitOutput(ctx, `Failed to start OAuth: ${res.error || res.code || 'unknown'}`, 'error')
+          emitOutput(ctx, `Failed to start OAuth: ${res.code || 'unknown'}`, 'error')
         }
         publishAgyUi(ctx, services)
         return
@@ -716,7 +760,9 @@ export default function (pi: ExtensionAPI): void {
         services.pool.setActiveAccount(target.id, 'google')
         registerAgyProvider()
         publishAgyUi(ctx, services)
-        void services.catalog.forceRefreshAndNotify(target.id).catch(() => undefined).finally(() => {
+        void services.catalog.forceRefreshAndNotify(target.id).catch((err) => {
+          warnThrottled('catalog-refresh', 'catalog refresh after switch failed', err)
+        }).finally(() => {
           registerAgyProvider()
           publishAgyUi(lastUiCtx ?? ctx, services)
         })
@@ -730,7 +776,12 @@ export default function (pi: ExtensionAPI): void {
           emitOutput(ctx, `Account not found: ${rest[0]}`, 'error')
           return
         }
-        services.pool.removeAccount(target.id)
+        const deleted = services.pool.deleteAccount(target.id)
+        if (!deleted) {
+          emitOutput(ctx, `Cannot remove account ${target.email || target.alias} (${target.id}).`, 'error')
+          return
+        }
+        registerAgyProvider()
         publishAgyUi(ctx, services)
         emitOutput(ctx, `Removed AGY account ${target.email || target.alias}`)
         return
@@ -860,7 +911,7 @@ export default function (pi: ExtensionAPI): void {
             ? []
             : raw
                 .split(',')
-                .map((s) => s.trim())
+                .map((s: string) => s.trim())
                 .filter(Boolean)
         services.setOverride('hiddenModels', list)
         registerAgyProvider()
@@ -969,10 +1020,16 @@ export default function (pi: ExtensionAPI): void {
             emitOutput(lastUiCtx, `Google OAuth completed${st.alias ? ` for ${st.alias}` : ''}.`)
           }
         }
-        const activeId = services.pool.getActiveAccount()?.id
+        const activeId = services.pool.getActiveAccountId('google')
         void Promise.allSettled([
-          activeId ? services.catalog.forceRefreshAndNotify(activeId) : Promise.resolve(),
-          services.quota.refreshAllQuotas(true),
+          activeId
+            ? services.catalog.forceRefreshAndNotify(activeId).catch((err) => {
+                warnThrottled('oauth-catalog', 'catalog refresh after OAuth failed', err)
+              })
+            : Promise.resolve(),
+          services.quota.refreshAllQuotas(true).catch((err) => {
+            warnThrottled('oauth-quota', 'quota refresh after OAuth failed', err)
+          }),
         ]).finally(() => {
           lastQuotaRefreshAt = Date.now()
           registerAgyProvider()
@@ -998,7 +1055,7 @@ export default function (pi: ExtensionAPI): void {
       emitOutput(ctx, res.url ? `Opened Google OAuth in browser (${res.url}). Complete sign-in to add account.` : 'Google OAuth started.')
       watchPoolAuthCompletion()
     } else {
-      emitOutput(ctx, `Failed to start OAuth: ${res.error || res.code || 'unknown'}`, 'error')
+      emitOutput(ctx, `Failed to start OAuth: ${res.code || 'unknown'}`, 'error')
     }
     publishAgyUi(ctx, services)
   }
@@ -1009,7 +1066,7 @@ export default function (pi: ExtensionAPI): void {
       emitOutput(ctx, 'Opened Google OAuth for primary account in browser.')
       watchPoolAuthCompletion()
     } else {
-      emitOutput(ctx, `Failed to start primary OAuth: ${res.error || res.code || 'unknown'}`, 'error')
+      emitOutput(ctx, `Failed to start primary OAuth: ${res.code || 'unknown'}`, 'error')
     }
     publishAgyUi(ctx, services)
   }
