@@ -223,6 +223,41 @@ function publishAgyUi(ctx: ExtensionContext | undefined, services: ReturnType<ty
   }
 }
 
+function extractActiveToolsForDsh(context: {
+  tools?: Array<{ name: string; description?: string; parameters?: unknown }>
+  messages?: Array<{
+    role: string
+    toolsAdded?: Array<{ name: string; description?: string; parameters?: unknown }>
+    toolsRemoved?: Array<{ name: string }>
+  }>
+}): Array<{ name: string; description?: string; parameters?: unknown }> | undefined {
+  if (Array.isArray(context.tools)) {
+    return context.tools.map((t) => ({
+      name: t.name,
+      ...(t.description ? { description: t.description } : {}),
+      ...(t.parameters !== undefined ? { parameters: t.parameters } : {}),
+    }))
+  }
+  let sawToolDelta = false
+  const active = new Map<string, { name: string; description?: string; parameters?: unknown }>()
+  for (const m of context.messages ?? []) {
+    if (m.role !== 'system') continue
+    if (Array.isArray(m.toolsAdded)) {
+      sawToolDelta = true
+      for (const t of m.toolsAdded) {
+        if (t?.name) active.set(t.name, { name: t.name, ...(t.description ? { description: t.description } : {}), ...(t.parameters !== undefined ? { parameters: t.parameters } : {}) })
+      }
+    }
+    if (Array.isArray(m.toolsRemoved)) {
+      sawToolDelta = true
+      for (const t of m.toolsRemoved) {
+        if (t?.name) active.delete(t.name)
+      }
+    }
+  }
+  return sawToolDelta ? Array.from(active.values()) : undefined
+}
+
 function convertPiMessagesToDsh(context: { systemPrompt?: string; messages?: Array<{ role: string; content: unknown; sections?: Record<string, string | null>; toolCallId?: string; toolName?: string; isError?: boolean }> }): Message[] {
   const out: Message[] = []
   if (typeof context.systemPrompt === 'string' && context.systemPrompt.trim() !== '') {
@@ -408,11 +443,13 @@ export default function (pi: ExtensionAPI): void {
         try {
           stream.push({ type: 'start', partial })
           const dshMessages = convertPiMessagesToDsh(context)
+          const activeTools = extractActiveToolsForDsh(context)
           const reasoning = typeof options?.reasoning === 'string' && options.reasoning !== 'off' ? options.reasoning : undefined
           const iter = services.adapter.stream({
             provider: AGY_PROVIDER_ID,
             model: model.id,
             messages: dshMessages as any,
+            ...(activeTools !== undefined ? { tools: activeTools as any } : {}),
             sessionId: (options?.sessionId ?? 'pi-session') as any,
             signal: options?.signal,
             reasoningEffort: reasoning,
