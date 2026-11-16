@@ -2,7 +2,7 @@
 // and the agy-shape persistence. Network behaviour and the platform keyring
 // commands are unchanged; the pool/credential seams are injected so
 // QuotaService's overridable methods remain the real boundary.
-import { execFile } from 'node:child_process'
+import { execFile, execFileSync } from 'node:child_process'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -142,6 +142,14 @@ export async function readLinuxSecretToken(): Promise<StoredToken | null> {
   return null
 }
 
+function macLoginKeychainPath(home: string = homedir()): string | undefined {
+  const candidates = [
+    join(home, 'Library', 'Keychains', 'login.keychain-db'),
+    join(home, 'Library', 'Keychains', 'login.keychain'),
+  ]
+  return candidates.find((p) => existsSync(p))
+}
+
 /**
  * Reads the active primary Antigravity OAuth token from the macOS Keychain.
  * agy 1.1.15+ on macOS stores primary credentials via go-keyring in the Keychain
@@ -150,12 +158,7 @@ export async function readLinuxSecretToken(): Promise<StoredToken | null> {
 export async function readMacKeychainToken(): Promise<StoredToken | null> {
   if (process.platform !== 'darwin') return null
   try {
-    const home = homedir()
-    const candidates = [
-      join(home, 'Library', 'Keychains', 'login.keychain-db'),
-      join(home, 'Library', 'Keychains', 'login.keychain'),
-    ]
-    const targetKc = candidates.find((p) => existsSync(p))
+    const targetKc = macLoginKeychainPath()
     const args = ['find-generic-password', '-s', 'gemini', '-a', 'antigravity', '-w']
     if (targetKc) args.push(targetKc)
     const raw = (await execFileT('security', args, 3000)).trim()
@@ -163,6 +166,55 @@ export async function readMacKeychainToken(): Promise<StoredToken | null> {
     return parseGoKeyringPayload(raw)
   } catch {
     return null
+  }
+}
+
+/**
+ * Updates the active primary Antigravity OAuth token in the macOS login Keychain.
+ * Keeps macOS Keychain synchronized with `~/.gemini/antigravity-cli/antigravity-oauth-token`
+ * after OAuth sign-in or token refresh so quota polling never falls back to a stale account.
+ */
+export function writeMacKeychainToken(rawDoc: string, email?: string, targetHome: string = homedir()): boolean {
+  if (process.platform !== 'darwin') return false
+  try {
+    let payloadJson = rawDoc
+    if (email) {
+      try {
+        const parsed = JSON.parse(rawDoc) as Record<string, unknown>
+        if (parsed && typeof parsed === 'object' && !parsed.id_token_email) {
+          parsed.id_token_email = email
+        }
+        payloadJson = JSON.stringify(parsed)
+      } catch {
+        // Keep rawDoc when JSON parse fails
+      }
+    }
+    const targetKc = macLoginKeychainPath(targetHome)
+    const encoded = 'go-keyring-base64:' + Buffer.from(payloadJson, 'utf8').toString('base64')
+    const baseArgs = ['-s', 'gemini', '-a', 'antigravity', '-w', encoded]
+    const updateArgs = ['add-generic-password', '-U', ...baseArgs, ...(targetKc ? [targetKc] : [])]
+    try {
+      execFileSync('security', updateArgs, { stdio: 'ignore', timeout: 3000 })
+      return true
+    } catch {
+      try {
+        execFileSync(
+          'security',
+          ['delete-generic-password', '-s', 'gemini', '-a', 'antigravity', ...(targetKc ? [targetKc] : [])],
+          { stdio: 'ignore', timeout: 3000 },
+        )
+      } catch {
+        // Ignore if entry did not exist
+      }
+      execFileSync(
+        'security',
+        ['add-generic-password', '-T', '/usr/bin/security', ...baseArgs, ...(targetKc ? [targetKc] : [])],
+        { stdio: 'ignore', timeout: 3000 },
+      )
+      return true
+    }
+  } catch {
+    return false
   }
 }
 
@@ -366,6 +418,15 @@ export function persistRefreshedToken(
           { raw: fresh, email: stored?.email, savedAt: Date.now() },
           deps.pool.dir,
         )
+      }
+    } catch {
+      // best-effort
+    }
+  } else if (process.platform === 'darwin' && (account.systemHome || !account.dir)) {
+    try {
+      const fresh = readFileSync(file, 'utf8')
+      if (deps.parseCredentialDoc(fresh)?.refreshToken) {
+        writeMacKeychainToken(fresh, account.email)
       }
     } catch {
       // best-effort

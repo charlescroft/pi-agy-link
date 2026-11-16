@@ -32,6 +32,7 @@ import type { QuotaService } from './quota.ts'
 import { detectSystemProxy, writeWindowsCredentialRaw } from './wincred.ts'
 import { writePrimaryCredential } from './credential-slot.ts'
 import { extractRefreshToken, saveCredentialBackup } from './credential-backup.ts'
+import { writeMacKeychainToken } from '../features/quota/token.ts'
 
 export type PoolAuthPhase = 'idle' | 'waiting' | 'exchanging' | 'done' | 'failed'
 export type PoolAuthStatusCode =
@@ -266,6 +267,14 @@ export class PoolAuthFlow {
           } catch {
             // best effort
           }
+        } else if (process.platform === 'darwin') {
+          try {
+            const { homedir } = await import('node:os')
+            const file = writeAgyTokenFile(homedir(), tokens)
+            writeMacKeychainToken(readFileSync(file, 'utf8'), email, homedir())
+          } catch {
+            // best effort
+          }
         }
         if (alias?.trim()) {
           this.pool.setAccountAlias(existing.id, alias.trim())
@@ -397,6 +406,13 @@ export class PoolAuthFlow {
         } catch {
           // best-effort
         }
+      } else if (flow.primary && process.platform === 'darwin') {
+        try {
+          const raw = readFileSync(tokenFile, 'utf8')
+          writeMacKeychainToken(raw, email, flow.dir)
+        } catch {
+          // best-effort
+        }
       }
       if (flow.primary) {
         // System-HOME login: update the primary account in place, never
@@ -409,8 +425,14 @@ export class PoolAuthFlow {
           if (flow.proxyUrl && !primary.proxyUrl) {
             this.pool.setAccountProxy(primary.id, flow.proxyUrl)
           }
-          this.pool.updateAccountQuotas(primary.id, primary.quotas, email)
-          void this.quota.refreshAccountQuota(primary).catch(() => undefined)
+          this.pool.clearAuthRequired(primary.id, true)
+          this.pool.clearCooldown(primary.id, undefined, true)
+          if (email && primary.email && primary.email !== email) {
+            this.pool.resetAccountIdentity(primary.id, email)
+          } else {
+            this.pool.updateAccountQuotas(primary.id, primary.quotas, email)
+          }
+          void this.quota.refreshAccountQuota(primary, true).catch(() => undefined)
         }
         this.log(`primary account signed in${email ? ` <${email}>` : ''}`)
         this.flow = null
