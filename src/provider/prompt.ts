@@ -177,6 +177,16 @@ export async function buildPromptPlan(input: PromptPlanInput): Promise<PromptPla
       prompt = 'System instructions:\n' + sysInstruction + '\n\n' + prompt
     }
   }
+  if (!isAux && !isTranslateSession && !isImage && cfg.slimPromptRules) {
+    const guardrails = [
+      '[Execution Guardrails]',
+      '- Read target files before referencing or editing; never guess uninspected code.',
+      '- Prefer minimal, targeted edits; include 3-5 unique context lines when editing.',
+      '- Skip filler preambles before tool calls; verify only the affected scope after edits.',
+      '- Ignore irrelevant interactive artifact/knowledge/slash-command flows in headless mode.',
+    ].join('\n')
+    prompt = guardrails + '\n\n' + prompt
+  }
 
   // ---- multimodal staging (v0.2): images ride as staged files ----
   const newlySentImageIds: string[] = []

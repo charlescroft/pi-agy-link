@@ -14,7 +14,12 @@
 // DSH message list alone — retries and replays stay idempotent with no
 // mutable per-stream state.
 import { randomUUID } from 'node:crypto'
+import type { CompactionNotice } from '../common/compaction.ts'
 import type { AgyEvent, RawUsage } from '../common/types.ts'
+
+function rawContextTokens(u: RawUsage): number {
+  return (u.input_tokens ?? 0) + (u.cache_read_tokens ?? 0) + (u.cache_write_tokens ?? 0) + (u.output_tokens ?? 0)
+}
 
 /** Terminal failure recorded when the process ended without a usable result. */
 export interface RecordingFailure {
@@ -51,6 +56,8 @@ export class RunRecording {
   private failure: RecordingFailure | null = null
   private resultConversationId: string | null = null
   private lastStepUsageRaw: RawUsage | null = null
+  private lastInternalCompaction: CompactionNotice | null = null
+  private readonly pendingInternalCompactions: CompactionNotice[] = []
   /**
    * Per-step generation timing for token-speed statistics: stepKey ->
    * { startedAt, lastAt, outputTokens }. The last usage sample of a step wins
@@ -176,7 +183,27 @@ export class RunRecording {
    * result time instead of the cumulative envelope.
    */
   noteStepUsage(raw: RawUsage): void {
+    const prevTokens = this.lastStepUsageRaw ? rawContextTokens(this.lastStepUsageRaw) : 0
+    const curTokens = rawContextTokens(raw)
+    if (prevTokens >= 80_000 && curTokens > 0 && curTokens <= prevTokens * 0.45) {
+      const notice: CompactionNotice = {
+        beforeTokens: prevTokens,
+        afterTokens: curTokens,
+        items: 0,
+        summary: 'agy 内部自动压缩',
+      }
+      this.lastInternalCompaction = notice
+      this.pendingInternalCompactions.push(notice)
+    }
     this.lastStepUsageRaw = raw
+  }
+
+  consumeInternalCompaction(): CompactionNotice | undefined {
+    return this.pendingInternalCompactions.shift()
+  }
+
+  get internalCompaction(): CompactionNotice | null {
+    return this.lastInternalCompaction
   }
 
   get lastUsage(): RawUsage | null {

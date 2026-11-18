@@ -33,6 +33,7 @@ export const COMMAND_REGISTRY: readonly CommandEntry[] = [
       'dispatch', 'dispatch-retries',
       'parallel', 'max-concurrent',
       'workspace',
+      'compact-limit', 'net', 'slim',
     ],
     handle: handleConfig,
   },

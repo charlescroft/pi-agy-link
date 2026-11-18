@@ -48,6 +48,19 @@ export interface PluginConfig {
   contextWindowDefault: number
   maxTokensDefault: number
   /**
+   * Override agy's internal auto-compaction threshold (`AGY_CLI_AUTO_COMPACT_OVERRIDE`).
+   * 0 = do not inject (use agy's own env / settings.json / 256K default).
+   */
+  autoCompactOverride: number
+  /**
+   * Max model API retries passed via `AGY_CLI_MODEL_API_MAX_RETRIES` (0 = agy default).
+   */
+  modelApiMaxRetries: number
+  /**
+   * Prepend concise execution guardrails & disable slash-command expansion in print mode.
+   */
+  slimPromptRules: boolean
+  /**
    * Prepend `options.system` to the agy prompt. Opt-in for ordinary turns,
    * because agy owns its own agent instructions and stacking DSH's rendered
    * prompt on top invites conflicts. Host authorization-review calls (those
@@ -267,6 +280,9 @@ export function defaultConfig(): PluginConfig {
     maxConcurrent: 0,
     contextWindowDefault: 1_048_576,
     maxTokensDefault: 65_536,
+    autoCompactOverride: 0,
+    modelApiMaxRetries: 3,
+    slimPromptRules: true,
     forwardSystemPrompt: false,
     digestMaxChars: 8_000,
     contextTransferMaxChars: 660_000,

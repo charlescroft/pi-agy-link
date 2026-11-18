@@ -1,6 +1,8 @@
 // /agy config: permission mode, effort, dispatch guards, parallelism and workspace.
 import { isAbsolute } from 'node:path'
 import type { CommandResult } from '@deepseek-ai/dsh-commands'
+import { formatTokenCount } from '../../common/compaction.ts'
+import { parseCompactLimitValue, resolveEffectiveCompactLimit } from '../../common/compact-threshold.ts'
 import { credentialSlotMutex, fastPathRunCount } from '../credential-slot.ts'
 import { err, ok, type CommandContext, type CommandDeps } from './shared.ts'
 
@@ -97,6 +99,67 @@ export function handleConfig(deps: CommandDeps, ctx: CommandContext): CommandRes
     if (!isAbsolute(arg)) return err('workspace must be an absolute path (or `default` to clear)')
     deps.setOverride('workspaceRoot', arg)
     return ok('Workspace set to **' + arg + '** — effective next turn.')
+  }
+
+  if (sub === 'compact-limit') {
+    const cfg = deps.cfg()
+    if (arg === '') {
+      const b = resolveEffectiveCompactLimit(cfg)
+      return ok(
+        `当前有效压缩阈值：**${formatTokenCount(b.effectiveLimit)}**（来源：${b.source}；模型物理窗口 ${formatTokenCount(b.physicalWindow)}；agy 默认 ${formatTokenCount(b.defaultLimit)}）\n` +
+          `修改：\`/agy compact-limit <512k|900k|tokens|default>\``,
+      )
+    }
+    if (arg === 'default' || arg === 'off' || arg === '0' || arg === 'clear') {
+      deps.setOverride('autoCompactOverride', 0)
+      const b = resolveEffectiveCompactLimit({ ...cfg, autoCompactOverride: 0 })
+      return ok(`已恢复默认压缩阈值：**${formatTokenCount(b.effectiveLimit)}**（来源：${b.source}）— 下一轮生效。`)
+    }
+    const parsed = parseCompactLimitValue(arg)
+    if (parsed === null) return err('usage: /agy compact-limit <tokens|256k|512k|900k|default> (10k..2m)')
+    deps.setOverride('autoCompactOverride', parsed)
+    return ok(`已设置 agy 自动压缩阈值为 **${formatTokenCount(parsed)}**（${parsed} tokens）— 下一轮生效。`)
+  }
+
+  if (sub === 'net') {
+    const cfg = deps.cfg()
+    if (arg === '') {
+      return ok(
+        `**网络配置**\n- 模型 API 重试（AGY_CLI_MODEL_API_MAX_RETRIES）：**${cfg.modelApiMaxRetries}**\n` +
+          `- 全局代理（proxyUrl）：**${cfg.proxyUrl || '未设置'}**\n` +
+          `- 禁用遥测（disableTelemetry）：**${cfg.disableTelemetry ? '开' : '关'}**\n` +
+          `- 修改：\`/agy net retries <0-10>\` 或 \`/agy net proxy <url|clear>\``,
+      )
+    }
+    const netSub = ctx.parts[1] ?? ''
+    const netVal = ctx.parts.slice(2).join(' ').trim()
+    if (netSub === 'retries') {
+      if (netVal === '') return err('usage: /agy net retries <0-10>')
+      const n = Number(netVal)
+      if (!Number.isInteger(n) || n < 0 || n > 10) return err('usage: /agy net retries <0-10>')
+      deps.setOverride('modelApiMaxRetries', n)
+      return ok(`已设置模型 API 重试次数为 **${n}** — 下一轮生效。`)
+    }
+    if (netSub === 'proxy') {
+      if (netVal === '' || netVal === 'clear' || netVal === 'off') {
+        deps.setOverride('proxyUrl', '')
+        return ok('已清除全局代理设置 — 下一轮生效。')
+      }
+      deps.setOverride('proxyUrl', netVal)
+      return ok(`已设置全局代理为 **${netVal}** — 下一轮生效。`)
+    }
+    return err('usage: /agy net [retries <0-10>|proxy <url|clear>]')
+  }
+
+  if (sub === 'slim') {
+    const cfg = deps.cfg()
+    if (arg === '') {
+      return ok(`精简执行约束（slimPromptRules）：**${cfg.slimPromptRules ? '开' : '关'}**（usage: \`/agy slim <on|off>\`）`)
+    }
+    if (arg !== 'on' && arg !== 'off') return err('usage: /agy slim <on|off>')
+    const on = arg === 'on'
+    deps.setOverride('slimPromptRules', on)
+    return ok(`精简执行约束已**${on ? '开启' : '关闭'}** — 下一轮生效。`)
   }
 
   return err(`Unknown config command \`${sub}\`.`)

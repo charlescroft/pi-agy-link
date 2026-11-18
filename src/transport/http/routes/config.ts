@@ -1,4 +1,5 @@
 import type { HostServices } from '../../../host/services.ts'
+import { parseCompactLimitValue } from '../../../common/compact-threshold.ts'
 import { runRoute, sendJson, readBody, methodOf, type RawRes, type RouteRegistrar } from '../respond.ts'
 
 function handleConfig(services: HostServices, req: unknown, res: unknown): void {
@@ -15,10 +16,32 @@ function handleConfig(services: HostServices, req: unknown, res: unknown): void 
           'autoTranslate', 'translateModel', 'translateEffort', 'translateTargetLanguage', 'translateMaxChars', 'translateSkipSameModel', 'translateBindConversation', 'translateMinIntervalMs',
           'imageModel', 'imageEffort', 'imageTimeoutMs', 'imageMaxBytes', 'imageOutputDir', 'imageRetries',
           'showHeaderBadge', 'showTranslateAction', 'poolWideCatalog',
+          'autoCompactOverride', 'modelApiMaxRetries', 'slimPromptRules', 'proxyUrl', 'disableTelemetry',
         ]
         if (!allowed.includes(key)) {
           sendJson(res as RawRes, 400, { error: 'key not settable' })
           return
+        }
+        let nextValue: unknown = body.value
+        if (key === 'autoCompactOverride') {
+          if (body.value === 0 || body.value === '0' || body.value === 'default' || body.value === 'off' || body.value === '') {
+            nextValue = 0
+          } else {
+            const parsed = parseCompactLimitValue(body.value)
+            if (parsed === null) {
+              sendJson(res as RawRes, 400, { error: 'autoCompactOverride must be 0 or 10000..2000000 (e.g. 512k, 900k)' })
+              return
+            }
+            nextValue = parsed
+          }
+        }
+        if (key === 'modelApiMaxRetries') {
+          const n = Number(body.value)
+          if (!Number.isInteger(n) || n < 0 || n > 10) {
+            sendJson(res as RawRes, 400, { error: 'modelApiMaxRetries must be an integer 0..10' })
+            return
+          }
+          nextValue = n
         }
         if (key === 'hiddenModels' && (!Array.isArray(body.value) || !(body.value as unknown[]).every((x) => typeof x === 'string'))) {
           sendJson(res as RawRes, 400, { error: 'hiddenModels must be an array of model ids' })
@@ -28,18 +51,31 @@ function handleConfig(services: HostServices, req: unknown, res: unknown): void 
           sendJson(res as RawRes, 400, { error: 'warmupModels must be an array of model names' })
           return
         }
-        setOverride(key, body.value)
-        onConfigWritten(key, body.value)
+        setOverride(key, nextValue)
+        onConfigWritten(key, nextValue)
         // Both keys change the model set DSH's picker must display:
         // `hiddenModels` hides ids, `poolWideCatalog` switches between the
         // active account's catalog and the pool-wide union (issue #107/#108).
         // Without this event the cached picker keeps the old list until a
         // restart, so enabling the switch looked like "it did nothing".
-        if (key === 'hiddenModels' || key === 'poolWideCatalog') notifyPicker()
-        sendJson(res as RawRes, 200, { ok: true, key, value: body.value })
+        if (key === 'hiddenModels' || key === 'poolWideCatalog' || key === 'autoCompactOverride') notifyPicker()
+        sendJson(res as RawRes, 200, { ok: true, key, value: nextValue })
       })
 }
 
 export function register(reg: RouteRegistrar, services: HostServices): void {
   reg({ kind: 'exact', path: '/plugins/agy-link/config', handler: (req, res) => handleConfig(services, req, res) })
 }
+
+import { toggleAgyPlugin } from '../../host/agy-plugins.ts';
+
+// Add to config routes... logic to follow
+
+export const registerPluginRoutes = (registrar: RouteRegistrar, services: HostServices) => {
+    registrar.post('/plugins/agy-link/plugin-toggle', runRoute(async (req, res) => {
+        const body = await readBody(req);
+        const { name, enabled } = body as { name: string, enabled: boolean };
+        await toggleAgyPlugin(name, enabled, services);
+        sendJson(res, 200, { ok: true });
+    }));
+};

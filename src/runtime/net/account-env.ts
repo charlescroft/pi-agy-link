@@ -71,6 +71,12 @@ export function buildAgyEnv(input: BuildAgyEnvInput): NodeJS.ProcessEnv {
     ...(input.base === undefined ? {} : { base: input.base }),
     ...(input.sessionId === undefined ? {} : { sessionId: input.sessionId }),
   })
+  if (input.cfg.autoCompactOverride > 0) {
+    env.AGY_CLI_AUTO_COMPACT_OVERRIDE = String(Math.floor(input.cfg.autoCompactOverride))
+  }
+  if (input.cfg.modelApiMaxRetries > 0) {
+    env.AGY_CLI_MODEL_API_MAX_RETRIES = String(Math.floor(input.cfg.modelApiMaxRetries))
+  }
   if (input.telemetryFlags === true && input.cfg.disableTelemetry) {
     env.DO_NOT_TRACK = '1'
     env.DISABLE_TELEMETRY = '1'

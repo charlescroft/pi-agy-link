@@ -105,9 +105,12 @@ export function buildAgyArgs(opts: {
   printTimeoutMinutes?: number
   /** Omit `-p <prompt>` and add `--input-format stream-json` (prompt rides stdin). */
   promptViaStdin?: boolean
+  /** Disable slash-command/skill expansion in print mode. */
+  disableSlashCommands?: boolean
 }): string[] {
   const ptMins = opts.printTimeoutMinutes ?? Math.max(1, Math.ceil(opts.timeoutMs / 60_000))
   const args: string[] = ['--output-format', 'stream-json', '--print-timeout', ptMins + 'm']
+  if (opts.disableSlashCommands) args.push('--disable-slash-commands')
   if (opts.permissionMode === 'skip') args.push('--dangerously-skip-permissions')
   else args.push('--mode', opts.permissionMode)
   const effectiveModel = resolveModelSlug(opts.model)
@@ -164,6 +167,7 @@ export function buildSpawnArgs(
     printTimeoutMinutes,
     extraArgs: input.cfg.extraArgs,
     addDirs: input.addDirs,
+    disableSlashCommands: input.cfg.slimPromptRules,
   }
   const argsBase = buildAgyArgs(base)
   // Decide transport: keep `-p <prompt>` for normal turns; switch to stdin

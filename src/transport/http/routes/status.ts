@@ -2,6 +2,7 @@ import type { HostServices } from '../../../host/services.ts'
 import { runRoute, sendJson, type RawRes, type RouteRegistrar } from '../respond.ts'
 import { sanitizeCatalogEntries } from '../../../host/models.ts'
 import { accountSupportsModel } from '../../../common/pool-types.ts'
+import { resolveEffectiveCompactLimit } from '../../../common/compact-threshold.ts'
 
 function handleStatus(services: HostServices, req: unknown, res: unknown): void {
   const { getConfig, bin, store, pool, catalog, auth, poolAuth, adapter, translation, lastRun } = services
@@ -38,6 +39,11 @@ function handleStatus(services: HostServices, req: unknown, res: unknown): void 
           defaultModel: cfg.defaultModel,
           defaultEffort: cfg.defaultEffort,
           askTool: cfg.askTool,
+          autoCompactOverride: cfg.autoCompactOverride,
+          contextBudget: resolveEffectiveCompactLimit(cfg),
+          modelApiMaxRetries: cfg.modelApiMaxRetries,
+          slimPromptRules: cfg.slimPromptRules,
+          hasProxy: Boolean(cfg.proxyUrl?.trim()),
           auth: auth.status(),
           poolAuth: poolAuth.status(),
           pool: poolData,

@@ -7,6 +7,7 @@ import { defineAgyMirrorTool } from '../provider/mirror/definition.ts'
 import type { Context as CordisContext } from './dsh-shims/cordis.ts'
 import type { Message, StreamChunk, TokenUsage } from './dsh-shims/dsh-llm.ts'
 import type { ManagedAccount, ModelFamily } from '../common/pool-types.ts'
+import { parseCompactLimitValue, resolveEffectiveCompactLimit } from '../common/compact-threshold.ts'
 
 export const AGY_PROVIDER_ID = 'agy-link'
 export const AGY_PROVIDER_NAME = 'Antigravity (agy CLI)'
@@ -75,6 +76,7 @@ function mapCatalogToPiModels(services: ReturnType<typeof createHostServices>) {
   const activeId = services.pool.getActiveAccountId('google') ?? poolData.lastActiveAccountId ?? poolData.primaryAccountId ?? undefined
   const catalog = services.catalog.get(activeId)
   const cfg = services.getConfig()
+  const effectiveContextWindow = resolveEffectiveCompactLimit(cfg).effectiveLimit
   const hidden = new Set(
     (Array.isArray(cfg.hiddenModels) ? cfg.hiddenModels : [])
       .map((s) => s.trim())
@@ -100,7 +102,7 @@ function mapCatalogToPiModels(services: ReturnType<typeof createHostServices>) {
       thinkingLevelMap,
       input: ['text'] as Array<'text' | 'image'>,
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-      contextWindow: 1_000_000,
+      contextWindow: effectiveContextWindow,
       maxTokens: 65_536,
     }
   })
@@ -160,6 +162,7 @@ function buildWidgetState(services: ReturnType<typeof createHostServices>): AgyW
   })
 
   const cfg = services.getConfig()
+  const effectiveContextWindow = resolveEffectiveCompactLimit(cfg).effectiveLimit
   const availableModels = services.catalog
     .get(activeId ?? undefined)
     .models.map((m) => m.id)
@@ -193,6 +196,10 @@ function buildWidgetState(services: ReturnType<typeof createHostServices>): AgyW
       imageTimeoutMs: Number(cfg.imageTimeoutMs ?? 240000),
       imageRetries: Number(cfg.imageRetries ?? 1),
       imageOutputDir: cfg.imageOutputDir || '',
+      autoCompactOverride: Number(cfg.autoCompactOverride ?? 0),
+      effectiveCompactLimit: effectiveContextWindow,
+      modelApiMaxRetries: Number(cfg.modelApiMaxRetries ?? 3),
+      slimPromptRules: cfg.slimPromptRules !== false,
     },
     updatedAt: now,
   }
@@ -477,6 +484,9 @@ export default function (pi: ExtensionAPI): void {
               textAcc += chunk.text
               partial.content[idx].text = textAcc
               stream.push({ type: 'text_delta', contentIndex: idx, delta: chunk.text, partial })
+              if (chunk.text.includes('#agy-compaction-card?') && lastUiCtx?.hasUI) {
+                lastUiCtx.ui.notify('agy 已触发上下文压缩（详情见对话卡片）', 'warning')
+              }
             } else if (chunk.type === 'reasoning-delta' && typeof chunk.text === 'string') {
               let idx: number
               if (thinkingIndex === null) {
@@ -911,6 +921,53 @@ export default function (pi: ExtensionAPI): void {
         services.setOverride('suppressAgyAutoUpdate', on)
         publishAgyUi(ctx, services)
         emitOutput(ctx, `Suppress agy CLI auto-update: ${on ? 'enabled' : 'disabled'}`)
+        return
+      }
+      if (sub === 'compact-limit') {
+        const raw = (rest[0] ?? '').trim().toLowerCase()
+        if (!raw) {
+          const b = resolveEffectiveCompactLimit(services.getConfig())
+          emitOutput(ctx, `Effective compact limit: ${b.effectiveLimit} (${b.source}, physical ${b.physicalWindow})`)
+          return
+        }
+        const next = raw === 'default' || raw === 'off' || raw === '0' || raw === 'clear' ? 0 : parseCompactLimitValue(raw)
+        if (next === null) {
+          emitOutput(ctx, 'Usage: /agy compact-limit <tokens|256k|512k|900k|default>', 'error')
+          return
+        }
+        services.setOverride('autoCompactOverride', next)
+        registerAgyProvider()
+        publishAgyUi(ctx, services)
+        emitOutput(ctx, next === 0 ? 'Auto-compact limit reset to default' : `Auto-compact limit set to ${next}`)
+        return
+      }
+      if (sub === 'net') {
+        const netSub = (rest[0] ?? '').toLowerCase()
+        const netVal = rest.slice(1).join(' ').trim()
+        if (netSub === 'retries' && netVal !== '') {
+          const n = Number(netVal)
+          if (!Number.isInteger(n) || n < 0 || n > 10) {
+            emitOutput(ctx, 'Usage: /agy net retries <0-10>', 'error')
+            return
+          }
+          services.setOverride('modelApiMaxRetries', n)
+          publishAgyUi(ctx, services)
+          emitOutput(ctx, `Model API max retries set to ${n}`)
+          return
+        }
+        if (netSub === 'proxy') {
+          const v = !netVal || netVal === 'clear' || netVal === 'off' ? '' : netVal
+          services.setOverride('proxyUrl', v)
+          publishAgyUi(ctx, services)
+          emitOutput(ctx, v ? `Proxy set to ${v}` : 'Proxy cleared')
+          return
+        }
+      }
+      if (sub === 'slim' && rest[0]) {
+        const on = rest[0].toLowerCase() === 'on' || rest[0].toLowerCase() === 'true'
+        services.setOverride('slimPromptRules', on)
+        publishAgyUi(ctx, services)
+        emitOutput(ctx, `Slim execution guardrails: ${on ? 'enabled' : 'disabled'}`)
         return
       }
       if (sub === 'clear-cooldown') {

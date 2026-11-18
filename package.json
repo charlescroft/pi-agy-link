@@ -106,7 +106,7 @@
     "!docs/archive"
   ],
   "scripts": {
-    "build": "tsdown",
+    "build": "tsdown && node scripts/build-pi.mjs",
     "check": "tsc --noEmit",
     "test": "node --experimental-transform-types --test \"test/**/*.test.ts\"",
     "test:fast": "node scripts/fast-test.mjs",

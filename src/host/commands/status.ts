@@ -1,6 +1,8 @@
 // /agy status — binary, version, auth, mode, catalog and binding overview.
 import type { CommandResult } from '@deepseek-ai/dsh-commands'
 import { classifyToolError } from '../recording.ts'
+import { formatTokenCount } from '../../common/compaction.ts'
+import { resolveEffectiveCompactLimit } from '../../common/compact-threshold.ts'
 import { ok, type CommandDeps } from './shared.ts'
 
 export async function renderStatus(deps: CommandDeps): Promise<string> {
@@ -25,6 +27,7 @@ export async function renderStatus(deps: CommandDeps): Promise<string> {
   const last = deps.lastRun()
   const errorKinds = last?.toolErrors.map(classifyToolError) ?? []
   const hasHeadlessPermissionDenial = errorKinds.includes('approval')
+  const budget = resolveEffectiveCompactLimit(cfg)
   const lines = [
     '**dsh-agy-link status**',
     '- agy binary: ' + (bin ?? 'not found — install via https://antigravity.google/docs/cli/install'),
@@ -34,6 +37,8 @@ export async function renderStatus(deps: CommandDeps): Promise<string> {
     '- workspace: ' + (cfg.workspaceRoot !== '' ? cfg.workspaceRoot : '(session cwd / process cwd)'),
     '- default model: ' + (cfg.defaultModel === '' ? '(agy default)' : cfg.defaultModel),
     '- default effort: ' + (cfg.defaultEffort === '' ? '(model default)' : cfg.defaultEffort),
+    `- context budget: ${formatTokenCount(budget.effectiveLimit)} (${budget.source}, physical ${formatTokenCount(budget.physicalWindow)})`,
+    `- network & slim: apiRetries=${cfg.modelApiMaxRetries}, proxy=${cfg.proxyUrl ? 'configured' : 'none'}, slimGuardrails=${cfg.slimPromptRules ? 'on' : 'off'}`,
     '- catalog: ' + cat.models.length + ' models — ' + cat.source + (cat.lastError === undefined ? '' : ' — last error: ' + cat.lastError),
     '- conversation bindings: ' + bindings,
     '- last run process: ' + (last ? (last.processOk ? 'ok' : last.processCode) + ' — ' + last.model + ' in ' + Math.round(last.durationMs / 100) / 10 + 's' : 'none yet'),

@@ -45,6 +45,7 @@ export interface EventMapperOptions {
   usage?: {
     noteStepUsage(raw: RawUsage): void
     finalUsage(resultRaw: RawUsage): RawUsage
+    consumeInternalCompaction?(): CompactionNotice | undefined
   }
   /**
    * Resolve FULL tool args for a recorded step from the agy conversation DB
@@ -218,7 +219,18 @@ export class EventMapper {
     yield* this.emitCompactionNoticeIfPending()
     yield* this.flushBannerOnlyThoughts()
     if (ev.kind === 'step') {
-      if (ev.usage) this.opts.usage?.noteStepUsage(ev.usage)
+      if (ev.usage) {
+        this.opts.usage?.noteStepUsage(ev.usage)
+        const internalCompact = this.opts.usage?.consumeInternalCompaction?.()
+        if (internalCompact) {
+          yield* this.ensureBlock('text')
+          const marker = renderCompactionMarker(internalCompact)
+          const d = this.appendDelta(marker)
+          if (d) yield d
+          const close = this.closeOpen()
+          if (close) yield close
+        }
+      }
       if (ev.stepKind === 'text') {
         const thoughtTokens = ev.usage?.thinking_tokens ?? 0
         const stepTextEmitted = (this.emittedByKey.get(ev.stepKey) ?? '') !== ''
