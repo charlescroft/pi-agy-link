@@ -1,7 +1,7 @@
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from '@earendil-works/pi-coding-agent'
 import { createAssistantMessageEventStream } from '@earendil-works/pi-ai'
 import { createHostServices } from '../host/services.ts'
-import { listPlugins, toggleAgyPlugin } from '../host/agy-plugins.ts'
+import { listPlugins, manageAgyPlugin } from '../host/agy-plugins.ts'
 import { runBootHygiene } from '../host/boot-hygiene.ts'
 import { MIN_AGY_VERSION, compareVersions, parseVersion, probeProcess } from '../host/runner.ts'
 import { defineAgyMirrorTool } from '../provider/mirror/definition.ts'
@@ -338,13 +338,48 @@ function emitOutput(ctx: ExtensionCommandContext, text: string, type: 'info' | '
 
 export default function (pi: ExtensionAPI): void {
   let onAdaptersUpdated = () => {}
+  const piSessionCwds = new Map<string, string>()
+  const recordSessionCwd = (ctx?: ExtensionContext): void => {
+    const sid = (ctx as any)?.sessionManager?.getSessionId?.()
+    const cwd = (ctx as any)?.cwd || (ctx as any)?.sessionManager?.getCwd?.()
+    if (typeof sid === 'string' && sid.trim() !== '' && typeof cwd === 'string' && cwd.trim() !== '') {
+      piSessionCwds.set(sid, cwd.trim())
+    }
+  }
+  const extractCwdFromPiContext = (context: any): string | undefined => {
+    const fromTag = (raw: unknown): string | undefined => {
+      if (typeof raw !== 'string') return undefined
+      const m = raw.match(/<cwd>\s*([^\n<]+?)\s*<\/cwd>/)
+      return m?.[1]?.trim() || undefined
+    }
+    const sysMatch = fromTag(context?.systemPrompt)
+    if (sysMatch) return sysMatch
+    for (const m of context?.messages ?? []) {
+      if (m?.role !== 'system') continue
+      const secMatch = fromTag(m?.sections?.cwd)
+      if (secMatch) return secMatch
+      const contentMatch = fromTag(m?.content)
+      if (contentMatch) return contentMatch
+    }
+    return undefined
+  }
   const mockCtx: CordisContext = {
     logger: {
       info: (msg: string) => console.log(msg),
       warn: (msg: string) => console.warn(msg),
       error: (msg: string) => console.error(msg),
     },
-    get: () => undefined,
+    get: (name?: string) => {
+      if (name === 'sessions') {
+        return {
+          get: (id: unknown) => {
+            const cwd = typeof id === 'string' ? piSessionCwds.get(id) : undefined
+            return cwd ? { header: { cwd } } : undefined
+          },
+        }
+      }
+      return undefined
+    },
     effect: () => () => {},
     on: () => () => {},
     emit: (event?: string) => {
@@ -456,12 +491,31 @@ export default function (pi: ExtensionAPI): void {
           const dshMessages = convertPiMessagesToDsh(context)
           const activeTools = extractActiveToolsForDsh(context)
           const reasoning = typeof options?.reasoning === 'string' && options.reasoning !== 'off' ? options.reasoning : undefined
+          const hasSessionId = typeof options?.sessionId === 'string' && options.sessionId.trim() !== ''
+          if (hasSessionId) {
+            const resolvedCwd = extractCwdFromPiContext(context) || (lastUiCtx as any)?.cwd
+            if (typeof resolvedCwd === 'string' && resolvedCwd.trim() !== '') {
+              piSessionCwds.set(options.sessionId, resolvedCwd.trim())
+            }
+          }
+          const isCompactionCall =
+            !hasSessionId &&
+            activeTools === undefined &&
+            typeof context?.systemPrompt === 'string' &&
+            /summariz|compaction/i.test(context.systemPrompt)
+          const effectiveTools = isCompactionCall ? [] : activeTools
           const iter = services.adapter.stream({
             provider: AGY_PROVIDER_ID,
             model: model.id,
             messages: dshMessages as any,
-            ...(activeTools !== undefined ? { tools: activeTools as any } : {}),
-            sessionId: (options?.sessionId ?? 'pi-session') as any,
+            ...(effectiveTools !== undefined ? { tools: effectiveTools as any } : {}),
+            ...(hasSessionId ? { sessionId: options.sessionId as any } : {}),
+            ...(isCompactionCall
+              ? {
+                  purpose: 'compaction' as const,
+                  system: context.systemPrompt,
+                }
+              : {}),
             signal: options?.signal,
             reasoningEffort: reasoning,
           })
@@ -635,12 +689,25 @@ export default function (pi: ExtensionAPI): void {
 
   pi.on('session_start', async (_event, ctx) => {
     lastUiCtx = ctx
+    recordSessionCwd(ctx)
     startBgQuotaTimer()
     publishAgyUi(ctx, services)
   })
 
+  pi.on('session_switch', async (_event, ctx) => {
+    lastUiCtx = ctx
+    recordSessionCwd(ctx)
+    publishAgyUi(ctx, services)
+  })
+
+  pi.on('turn_start', async (_event, ctx) => {
+    lastUiCtx = ctx
+    recordSessionCwd(ctx)
+  })
+
   pi.on('turn_end', async (_event, ctx) => {
     lastUiCtx = ctx
+    recordSessionCwd(ctx)
     publishAgyUi(ctx, services)
     void maybeRefreshActiveQuotaInBackground(false)
   })

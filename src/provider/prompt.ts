@@ -167,8 +167,15 @@ export async function buildPromptPlan(input: PromptPlanInput): Promise<PromptPla
 
   // forwardSystemPrompt is opt-in for ordinary turns (agy already owns its
   // own agent instructions). A review/title call always forwards it: the whole
-  // output protocol rides in `options.system`.
-  if (cfg.forwardSystemPrompt || ctx.isReview || ctx.isTitle) {
+  // output protocol rides in `options.system`. Compaction calls from hosts that
+  // supply their own summarization system prompt (e.g. pi-coding-agent) also
+  // forward `options.system`.
+  if (
+    cfg.forwardSystemPrompt ||
+    ctx.isReview ||
+    ctx.isTitle ||
+    (ctx.isCompaction && typeof options.system === 'string' && options.system.trim() !== '')
+  ) {
     const sysInstruction = options.system || (() => {
       const sm = messages.find((m) => m.role === 'system')
       return sm ? textOf(sm).trim() : ''
@@ -253,6 +260,10 @@ function resolvePromptBinding(input: ResolveBindingInput): {
 } {
   const { cfg, ctx, account, activeModel, currentModel, persistBinding, bindingKey, sessionAccountKey, messages, lastAssistantIdx, deps } = input
   const { sessionKey, isAux } = ctx
+
+  if (!persistBinding || bindingKey === '') {
+    return { binding: undefined, compactionNotice: undefined }
+  }
 
   let binding = sessionAccountKey !== '' ? deps.store.get(sessionAccountKey) : undefined
   if (binding === undefined && bindingKey !== '') {
@@ -392,6 +403,16 @@ function buildBranchPrompt(input: BranchPromptInput): { prompt: string; digest: 
     return { prompt, digest: 'none' }
   }
   if (ctx.isAux && options.purpose === 'compaction') {
+    if (typeof options.system === 'string' && options.system.trim() !== '') {
+      const userParts = messages
+        .filter((m) => m.role !== 'system')
+        .map(textOf)
+        .map((s) => s.trim())
+        .filter((s) => s !== '')
+      if (userParts.length > 0) {
+        return { prompt: userParts.join('\n\n'), digest: 'none' }
+      }
+    }
     const cap = cfg.compactionMaxChars > 0 ? cfg.compactionMaxChars : 800_000
     const parts: string[] = []
     let used = 0

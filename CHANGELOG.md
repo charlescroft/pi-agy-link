@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.0.2 (2026-11-18)
+
+### English
+
+- **Fix(pi): resolve each Pi session's workspace `cwd` instead of falling back to the host process cwd.** Implemented `mockCtx.get('sessions')` backed by `piSessionCwds` in `src/pi/index.ts`, populated across `session_start` / `session_switch` / `turn_start` / `turn_end` and `<cwd>` tags in `streamSimpleImpl`. Previously `sessionWorkspace(sessionId)` always returned `undefined` in Pi/PiCrust, causing `agy` to run inside the Sidecar directory instead of the user's project workspace.
+- **Fix(compaction): route stateless summarization calls without `sessionId` as `purpose: 'compaction'` with `tools: []`.** Prevents manual `/compact` and auto-compaction from reusing a stale `'pi-session'` binding, enabling tools, or dropping `pi-coding-agent`'s summarization system prompt.
+- **Fix(agy-tools): support installing plugins from local cloned repo paths.**
+
+### 中文
+
+- **修复(pi)：正确解析每个 Pi 会话的工作区 `cwd`，不再回退到宿主进程目录。** 在 `src/pi/index.ts` 中通过 `piSessionCwds` 实现 `mockCtx.get('sessions')`，并在 `session_start` / `session_switch` / `turn_start` / `turn_end` 及 `streamSimpleImpl` 的 `<cwd>` 标签中记录各会话目录。此前 `sessionWorkspace(sessionId)` 在 Pi/PiCrust 中恒返回 `undefined`，导致 `agy` 在 Sidecar 安装目录而非用户新建子项目目录中运行。
+- **修复(compaction)：将无 `sessionId` 的摘要压缩请求路由为无状态 `purpose: 'compaction'` 并禁用工具（`tools: []`）。** 避免手动 `/compact` 复用过期 `'pi-session'` 绑定或误触发工具调用导致压缩失败。
+- **修复(agy-tools)：支持从本地克隆仓库路径安装插件。**
+
 ## 0.6.28 (2026-11-15)
 
 ### English
