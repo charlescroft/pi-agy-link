@@ -67,15 +67,4 @@ export function register(reg: RouteRegistrar, services: HostServices): void {
   reg({ kind: 'exact', path: '/plugins/agy-link/config', handler: (req, res) => handleConfig(services, req, res) })
 }
 
-import { toggleAgyPlugin } from '../../host/agy-plugins.ts';
 
-// Add to config routes... logic to follow
-
-export const registerPluginRoutes = (registrar: RouteRegistrar, services: HostServices) => {
-    registrar.post('/plugins/agy-link/plugin-toggle', runRoute(async (req, res) => {
-        const body = await readBody(req);
-        const { name, enabled } = body as { name: string, enabled: boolean };
-        await toggleAgyPlugin(name, enabled, services);
-        sendJson(res, 200, { ok: true });
-    }));
-};

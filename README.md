@@ -77,6 +77,10 @@ pi -p --model agy-link/gemini-3.8-flash "Hello"
 | `/agy hidden-models <ids\|clear>` | Hide or restore model IDs in the chat model selector |
 | `/agy pool-wide <on\|off>` | Toggle automatic multi-account rotation/failover across the pool |
 | `/agy effort <level>` | Set default thinking effort (`minimal`, `low`, `medium`, `high`, `xhigh`) |
+| `/agy compact-limit [<tokens\|256k\|512k\|900k\|default>]` | Inspect or override `agy` auto-compact threshold (`AGY_CLI_AUTO_COMPACT_OVERRIDE`) |
+| `/agy net [retries <0-10>\|proxy <url\|clear>]` | Configure model API max retries (`AGY_CLI_MODEL_API_MAX_RETRIES`) or global proxy |
+| `/agy slim [on\|off]` | Toggle `--disable-slash-commands` in print mode and concise execution guardrails |
+| `/agy plugin <enable\|disable> <name>` | Enable or disable `agy` CLI plugins (e.g. `agy-codemode`, `agy-output-guard`, `agy-rehydrate`) |
 | `/agy refresh` / `/agy quota` | Force refresh all account quotas and model catalog |
 
 ### Configuration & Storage Paths
