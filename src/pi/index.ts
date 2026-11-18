@@ -1,7 +1,7 @@
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from '@earendil-works/pi-coding-agent'
 import { createAssistantMessageEventStream } from '@earendil-works/pi-ai'
 import { createHostServices } from '../host/services.ts'
-import { listPlugins } from '../host/agy-plugins.ts'
+import { listPlugins, toggleAgyPlugin } from '../host/agy-plugins.ts'
 import { runBootHygiene } from '../host/boot-hygiene.ts'
 import { MIN_AGY_VERSION, compareVersions, parseVersion, probeProcess } from '../host/runner.ts'
 import { defineAgyMirrorTool } from '../provider/mirror/definition.ts'
@@ -203,6 +203,7 @@ function buildWidgetState(services: ReturnType<typeof createHostServices>): AgyW
       modelApiMaxRetries: Number(cfg.modelApiMaxRetries ?? 3),
       slimPromptRules: cfg.slimPromptRules !== false,
       plugins,
+      agyPluginsEnabled: plugins.filter((p) => p.enabled).map((p) => p.name),
     },
     updatedAt: now,
   }
@@ -971,6 +972,22 @@ export default function (pi: ExtensionAPI): void {
         services.setOverride('slimPromptRules', on)
         publishAgyUi(ctx, services)
         emitOutput(ctx, `Slim execution guardrails: ${on ? 'enabled' : 'disabled'}`)
+        return
+      }
+      if (sub === 'plugin' && rest[0] && rest[1]) {
+        const action = rest[0].toLowerCase()
+        const name = rest[1]
+        if (action !== 'enable' && action !== 'disable') {
+          emitOutput(ctx, 'Usage: /agy plugin <enable|disable> <name>', 'error')
+          return
+        }
+        try {
+          await manageAgyPlugin(name, action === 'enable', services)
+          publishAgyUi(ctx, services)
+          emitOutput(ctx, `Plugin ${name} ${action === 'enable' ? 'installed/enabled' : 'uninstalled'}`)
+        } catch (err) {
+          emitOutput(ctx, `Failed to ${action} plugin ${name}: ${err instanceof Error ? err.message : String(err)}`, 'error')
+        }
         return
       }
       if (sub === 'clear-cooldown') {

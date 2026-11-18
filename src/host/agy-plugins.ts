@@ -1,4 +1,4 @@
-import { spawn, spawnSync } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import { type HostServices } from './services.ts';
 
 export interface PluginInfo {
@@ -19,15 +19,16 @@ export function listPlugins(services: HostServices): PluginInfo[] {
     }
 }
 
-export async function toggleAgyPlugin(name: string, enabled: boolean, services: HostServices): Promise<void> {
-    const action = enabled ? 'enable' : 'disable';
+export async function manageAgyPlugin(name: string, enable: boolean, services: HostServices): Promise<void> {
     const bin = services.bin();
     if (!bin) throw new Error('agy binary not found');
-    return new Promise((resolve, reject) => {
-        const proc = spawn(bin, ['plugin', action, name]);
-        proc.on('close', (code: number | null) => {
-            if (code === 0) resolve();
-            else reject(new Error(`Failed to ${action} plugin ${name} (exit code ${code})`));
-        });
-    });
+    
+    // 如果启用但未安装，先安装
+    if (enable) {
+        spawnSync(bin, ['plugin', 'install', `justhil/agy-tool/plugins/${name}`]);
+        spawnSync(bin, ['plugin', 'enable', name]);
+    } else {
+        // 关闭时直接 uninstall，彻底从 agy-cli 环境中移除
+        spawnSync(bin, ['plugin', 'uninstall', name]);
+    }
 }
