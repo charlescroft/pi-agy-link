@@ -1,6 +1,7 @@
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from '@earendil-works/pi-coding-agent'
 import { createAssistantMessageEventStream } from '@earendil-works/pi-ai'
 import { createHostServices } from '../host/services.ts'
+import { listPlugins } from '../host/agy-plugins.ts'
 import { runBootHygiene } from '../host/boot-hygiene.ts'
 import { MIN_AGY_VERSION, compareVersions, parseVersion, probeProcess } from '../host/runner.ts'
 import { defineAgyMirrorTool } from '../provider/mirror/definition.ts'
@@ -169,6 +170,7 @@ function buildWidgetState(services: ReturnType<typeof createHostServices>): AgyW
 
   const authSt = services.poolAuth.status()
   const pendingAuthUrl = authSt.phase === 'waiting' ? authSt.url : undefined
+  const plugins = listPlugins(services)
 
   return {
     version: services.status.version,
@@ -200,6 +202,7 @@ function buildWidgetState(services: ReturnType<typeof createHostServices>): AgyW
       effectiveCompactLimit: effectiveContextWindow,
       modelApiMaxRetries: Number(cfg.modelApiMaxRetries ?? 3),
       slimPromptRules: cfg.slimPromptRules !== false,
+      plugins,
     },
     updatedAt: now,
   }
