@@ -13,7 +13,17 @@ export interface AccountSelectionDeps {
   pool?: AccountPoolManager
   store: SessionStore
   syncSessionModel?: (sessionId: string, model: string, effort?: string) => void
+  /**
+   * Re-poll quotas (and the model catalog) for the whole pool. Used only as a
+   * self-heal: when EVERY enabled account is denied purely because the model is
+   * missing from its snapshot, that snapshot is far more likely truncated than
+   * the pool is genuinely incapable (issue #125).
+   */
+  refreshQuota?: () => Promise<void>
 }
+
+/** Upper bound on the self-heal refresh so a slow network cannot stall a turn. */
+const MODEL_HEAL_TIMEOUT_MS = 20_000
 
 export interface AccountSelectionInput {
   deps: AccountSelectionDeps
@@ -30,7 +40,7 @@ export interface AccountSelectionResult {
   activeModel: string
 }
 
-/** Session affinity: reuse the account this session last ran on, if eligible. */
+/** Session affinity: reuse the account this session last ran on, if eligible and not superseded by a manual switch. */
 function stickyAccount(
   deps: AccountSelectionDeps,
   family: ModelFamily,
@@ -39,11 +49,15 @@ function stickyAccount(
 ): ManagedAccount | undefined {
   const pool = deps.pool
   if (pool === undefined || sessionKey === '') return undefined
+  const manualPinAt = pool.getPoolData().manualPinAt ?? 0
   const prefix = `${sessionKey}:`
   let mostRecent: ManagedAccount | undefined
   let latestUpdated = -1
   for (const [k, b] of Object.entries(deps.store.all())) {
     if (!k.startsWith(prefix) || b.updatedAt <= latestUpdated) continue
+    // If the user explicitly switched/reordered accounts in the UI or CLI after
+    // this binding was written, honor the user's explicit choice immediately.
+    if (manualPinAt > 0 && b.updatedAt < manualPinAt) continue
     const boundAcc = pool.getAccount(k.slice(prefix.length))
     if (boundAcc !== undefined) {
       mostRecent = boundAcc
@@ -92,6 +106,41 @@ async function waitForShortReset(pool: AccountPoolManager, family: ModelFamily, 
   return pool.selectAccount(family, model) ?? undefined
 }
 
+/**
+ * One self-heal attempt for issue #125: if EVERY enabled account was denied
+ * solely because the requested model is absent from its per-model snapshot,
+ * refresh quotas and retry selection once. A truncated snapshot is the common
+ * cause (the pool demonstrably served the model minutes earlier); a genuinely
+ * unsupported model simply fails the retry and reports as before.
+ */
+async function healStaleModelSnapshot(
+  deps: AccountSelectionDeps,
+  pool: AccountPoolManager,
+  family: ModelFamily,
+  model: string,
+): Promise<ManagedAccount | undefined> {
+  const refresh = deps.refreshQuota
+  if (refresh === undefined || model === '') return undefined
+  const enabled = pool.getAccounts().filter((a) => a.enabled)
+  if (enabled.length === 0) return undefined
+  const reasons = enabled.map((a) => pool.explainIneligibility?.(a, family, Date.now(), model) ?? null)
+  // Only the model-mismatch reason qualifies: quota/auth/cooldown have their own
+  // remedies and must not trigger a network round-trip here.
+  if (!reasons.every((r) => r === 'model-unsupported')) return undefined
+  try {
+    await Promise.race([
+      refresh(),
+      new Promise<void>((resolve) => {
+        const t = setTimeout(resolve, MODEL_HEAL_TIMEOUT_MS)
+        t.unref?.()
+      }),
+    ])
+  } catch {
+    return undefined
+  }
+  return pool.selectAccount(family, model) ?? undefined
+}
+
 /** Build the "all accounts unavailable" error with the real reasons. */
 function unavailableError(pool: AccountPoolManager, family: ModelFamily, model?: string): LlmError {
   const allAccounts = pool.getAccounts()
@@ -105,6 +154,7 @@ function unavailableError(pool: AccountPoolManager, family: ModelFamily, model?:
   const cooling = reasons.filter((r) => r === 'cooldown').length
   const quotaBlocked = reasons.filter((r) => r === 'quota').length
   const unsupported = reasons.filter((r) => r === 'unsupported').length
+  const modelUnsupported = reasons.filter((r) => r === 'model-unsupported').length
   const signedOut = accounts.filter((a) => a.authRequired === true).length
   const countdown = pool.getEarliestAvailableCountdown?.(family) ?? pool.getEarliestResetCountdown(family)
   let why: string
@@ -117,13 +167,16 @@ function unavailableError(pool: AccountPoolManager, family: ModelFamily, model?:
     if (cooling > 0) details.push(`${cooling} in cooldown`)
     if (quotaBlocked > 0) details.push(`${quotaBlocked} quota-exhausted`)
     if (unsupported > 0) details.push(`${unsupported} lack ${family} access`)
+    if (modelUnsupported > 0) details.push(`${modelUnsupported} lack model "${model ?? ''}" in their catalog`)
     if (signedOut > 0) details.push(`${signedOut} signed out`)
     if (disabled > 0) details.push(`${disabled} disabled`)
     why = `no account can serve ${family} right now${details.length > 0 ? ` (${details.join(', ')})` : ''}`
   }
   const waitStr = countdown !== null && countdown > 0 ? ` (earliest reset in ${Math.ceil(countdown / 1000)}s)` : ''
-  const hint = unsupported > 0 && quotaBlocked === 0 && cooling === 0
-    ? `No enabled account has access to ${family} (requires a plan with ${family} enabled).`
+  const hint = modelUnsupported > 0 && unsupported === 0 && quotaBlocked === 0 && cooling === 0
+    ? `Requested model "${model ?? ''}" is not in any enabled account's catalog — refresh the model list (POST /plugins/agy-link/pool/refresh-quota) or pick a listed model. It is NOT a missing ${family} plan.`
+    : unsupported > 0 && quotaBlocked === 0 && cooling === 0
+      ? `No enabled account has access to ${family} (requires a plan with ${family} enabled).`
     : quotaBlocked > 0 && cooling === 0
       ? 'Add an account, wait for the quota reset, or run /agy clear-cooldown to override the current quota snapshot.'
       : 'Add an account, wait for reset, or run /agy clear-cooldown.'
@@ -152,7 +205,13 @@ export async function selectSessionAccount(input: AccountSelectionInput): Promis
     account = pool.selectAccount(family, activeModel) ?? undefined
   }
   if (account !== undefined && pool !== undefined && pool.getPoolData().lastActiveAccountId !== account.id) {
-    pool.setActiveAccount(account.id, family)
+    // Record in-use account without stamping manualPinAt or overwriting global
+    // family pins from an older session's sticky affinity.
+    if (typeof pool.markAccountActive === 'function') {
+      pool.markAccountActive(account.id)
+    } else {
+      pool.setActiveAccount(account.id, family)
+    }
   }
 
   if (account === undefined && pool !== undefined && pool.getAccounts().length > 0) {
@@ -166,6 +225,7 @@ export async function selectSessionAccount(input: AccountSelectionInput): Promis
       }
     }
     if (account === undefined) account = await waitForShortReset(pool, family, activeModel)
+    if (account === undefined) account = await healStaleModelSnapshot(deps, pool, family, activeModel)
     if (account === undefined) throw unavailableError(pool, family, activeModel)
   }
 

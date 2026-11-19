@@ -12,8 +12,11 @@
 /** Status poll: keep the console responsive, never stack polls. */
 export const STATUS_TIMEOUT_MS = 5_000
 
-/** A write (sync / warmup / config / auth): the busy flag must always clear. */
+/** A write (sync / config / auth): the busy flag must always clear. */
 export const WRITE_TIMEOUT_MS = 20_000
+
+/** Manual CLI warmup across one or more accounts (up to 45s per CLI probe). */
+export const WARMUP_WRITE_TIMEOUT_MS = 90_000
 
 /** Host-side hard deadline for any plugin route; the last line of defence. */
 export const ROUTE_TIMEOUT_MS = 30_000
@@ -37,6 +40,33 @@ export function longRouteTimeout(jobTimeoutMs: number): number {
 export const QUOTA_REFRESH_DEDUP_MS = 90_000
 
 /**
+ * How long an endpoint that just failed keeps its "try me LAST" memory.
+ *
+ * Measured 2026-11-19: retrieveUserQuotaSummary on
+ * daily-cloudcode-pa.googleapis.com resets the connection after 5-8s for every
+ * account, while the sandbox endpoint answers. The endpoint list is walked from
+ * the same end on every refresh, so without this memory each account pays that
+ * timeout first — including the hourly background sweep. Short enough that a
+ * recovered endpoint returns on its own.
+ */
+export const QUOTA_ENDPOINT_DOWN_MS = 10 * 60_000
+
+/**
+ * How long a "no valid licence" verdict (403 from the quota summary) keeps the
+ * UNATTENDED probe away from that account. An explicit user refresh ignores it,
+ * so a restored licence is picked up the moment the user asks for it.
+ */
+export const QUOTA_LICENSE_RETRY_MS = 6 * 3600_000
+
+/**
+ * Same-egress parallelism for a user-initiated pool sweep. Antigravity's risk
+ * control correlates accounts by source IP, so this stays deliberately small;
+ * the scheduler still spaces every account start by the organic jitter, and the
+ * unattended sweep always uses 1.
+ */
+export const QUOTA_FORCE_CONCURRENCY = 2
+
+/**
  * Grace the idle watchdog grants before killing a quiet child. libuv runs the
  * timers phase BEFORE the poll phase: when the DSH host's event loop is blocked
  * (a large parse, many parallel workers), an expired watchdog can fire before
@@ -45,3 +75,11 @@ export const QUOTA_REFRESH_DEDUP_MS = 90_000
  * own idle budget so short-budget tests and genuine idle kills stay prompt.
  */
 export const WATCHDOG_GRACE_MS = 5_000
+
+/**
+ * Grace after agy reports `root agent idle; waiting ... for background task(s)`.
+ * The prompt turn's answer is already streamed; a stuck GUI dialog / background
+ * child would otherwise keep print mode alive for hours (issue #119). Short and
+ * fixed so the turn settles promptly instead of hanging DSH's event stream.
+ */
+export const IDLE_BACKGROUND_GRACE_MS = 5_000

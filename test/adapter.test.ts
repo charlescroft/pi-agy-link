@@ -907,6 +907,48 @@ test('issue #67: an `--effort` refusal is learned and the call replayed without 
   }
 })
 
+test('issue #115: a refusal contradicting the live discovered catalog is NOT learned', async () => {
+  // agy's print-mode validation emits "--effort is not supported for model X"
+  // when its model-config fetch fails (TLS timeout), even though `agy models`
+  // lists xhigh. Learning that as a static capability strips the model's whole
+  // effort row and makes DSH reject later turns with UNSUPPORTED_REASONING_EFFORT.
+  const catalog = new ModelCatalog(
+    async () => ({ stdout: 'gemini-4-hydrogen-xhigh\tGemini 4 Hydrogen (Extra)\ngemini-4-hydrogen-high\tGemini 4 Hydrogen (High)', stderr: '' }),
+    DEFAULT_FALLBACK_MODELS,
+    300_000,
+  )
+  await catalog.forceRefresh()
+  const invocations = join(workDir, 'p115-invocations.txt')
+  const argsFile = join(workDir, 'p115-args.json')
+  rmSync(invocations, { force: true })
+  process.env.FAKE_AGY_MODE = 'effort-unsupported'
+  process.env.FAKE_AGY_INVOCATION_FILE = invocations
+  process.env.FAKE_AGY_ARGS_FILE = argsFile
+  try {
+    const { adapter } = makeAdapter({}, { catalog })
+    const chunks = await collect(adapter.stream(opts([msg('user', 'hi')], {
+      model: 'gemini-4-hydrogen', reasoningEffort: 'xhigh',
+    } as Partial<GenerateOptions>)))
+    assert.equal((chunks[chunks.length - 1] as { reason: { kind: string } }).reason.kind, 'stop', 'the replay still ends normally')
+    assert.equal(adapter.isEffortUnsupported('gemini-4-hydrogen'), false, 'never blacklist a model whose catalog lists xhigh')
+    const resolved = (await adapter.resolveModel('antigravity', 'gemini-4-hydrogen')) as { reasoning?: { efforts?: Array<{ id: string }> } }
+    assert.ok(resolved.reasoning?.efforts?.some((e) => e.id === 'xhigh'), 'the effort row stays visible')
+  } finally {
+    delete process.env.FAKE_AGY_INVOCATION_FILE
+    delete process.env.FAKE_AGY_ARGS_FILE
+    process.env.FAKE_AGY_MODE = 'ok'
+  }
+})
+
+test('issue #115: clearing the persisted effort list takes effect without a restart', () => {
+  let list: readonly string[] = ['gemini-4-hydrogen']
+  const { adapter } = makeAdapter({}, { effortUnsupported: () => list })
+  assert.equal(adapter.isEffortUnsupported('gemini-4-hydrogen'), true)
+  list = []
+  assert.equal(adapter.isEffortUnsupported('gemini-4-hydrogen'), false, 'external edits must not require restarting DSH')
+  assert.deepEqual(adapter.effortUnsupportedModels(), [])
+})
+
 test('issue #67: a persisted / seeded refusal is honoured before any spawn', async () => {
   const argsFile = join(workDir, 'seeded-args.json')
   const invocations = join(workDir, 'seeded-invocations.txt')
@@ -1529,6 +1571,30 @@ test('issue #113: DSH plan mode overrides a statically configured skip permissio
   assert.equal(argv.includes('--dangerously-skip-permissions'), false, 'plan mode must not keep skip permissions')
   const idx = argv.indexOf('--mode')
   assert.ok(idx !== -1 && argv[idx + 1] === 'plan', 'agy must run read-only in --mode plan')
+})
+
+test('issue #136: a historical plan-mode mention does not downgrade skip permissions', async () => {
+  // A tool result quoting source code that mentions plan mode used to make
+  // isPlanMode() true forever, forcing `--mode plan` on ordinary turns: every
+  // tool was then denied and the synthesized exit_plan_mode was rejected.
+  const { adapter } = makeAdapter({ permissionMode: 'skip' })
+  process.env.FAKE_AGY_MODE = 'ok'
+  const argsFile = join(workDir, 'args-historical-plan.json')
+  process.env.FAKE_AGY_ARGS_FILE = argsFile
+
+  await collect(adapter.stream(opts(
+    [
+      msg('user', 'read that file'),
+      { role: 'tool', toolCallId: 't1', content: 'const s = "You are in plan mode. Stay in plan mode"' } as never,
+      msg('assistant', 'here it is'),
+      msg('user', 'now run the tests'),
+    ],
+    { sessionId: 'sess-hist-plan' as never, tools: [{ name: 'exit_plan_mode' }] as never },
+  )))
+
+  const argv = JSON.parse(readFileSync(argsFile, 'utf8')) as string[]
+  assert.ok(argv.includes('--dangerously-skip-permissions'), 'skip must survive a historical mention')
+  assert.equal(argv.includes('--mode'), false, 'no plan-mode flag on an ordinary turn')
 })
 
 test('session-title calls forward the system prompt and never force plan mode', async () => {

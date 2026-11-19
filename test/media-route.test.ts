@@ -6,10 +6,12 @@ import {
   handleAssetRequest,
   handleOpenFile,
   executeOpenInSystem,
+  spawnDetachedOpener,
 } from '../src/host/media-route.ts';
 import { existsSync, writeFileSync, mkdirSync, rmSync, symlinkSync, mkdtempSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { EventEmitter } from 'node:events';
 
 test('media-route: resolveLocalMediaPath handles Windows paths, file://, and relative paths', () => {
   const isWin = process.platform === 'win32';
@@ -255,7 +257,59 @@ test('media-route: handleOpenFile validates path and returns JSON', () => {
   writeFileSync(testDoc, '# Report');
 
   try {
-    // 404 for missing file
+    // 405 on GET (prevents markdown image RCE ![x](/plugins/agy-link/open?path=...))
+    let getMethodStatus = 0;
+    const res405 = {
+      writeHead(s: number) { getMethodStatus = s; },
+      end() {},
+    };
+    handleOpenFile(
+      { method: 'GET', url: '/plugins/agy-link/open?path=' + encodeURIComponent(testDoc) },
+      res405 as never,
+      { workspaceRoots: [root] },
+    );
+    assert.equal(getMethodStatus, 405, 'GET must be rejected with 405 to prevent markdown image launch');
+
+    // 403 on cross-origin browser requests and no wildcard CORS
+    let corsStatus = 0;
+    let corsHeaders: Record<string, unknown> = {};
+    const resCors = {
+      writeHead(s: number, h: Record<string, unknown>) { corsStatus = s; corsHeaders = h ?? {}; },
+      end() {},
+    };
+    handleOpenFile(
+      { method: 'POST', headers: { origin: 'https://evil.example' }, url: '/plugins/agy-link/open?path=' + encodeURIComponent(testDoc) },
+      resCors as never,
+      { workspaceRoots: [root] },
+    );
+    assert.equal(corsStatus, 403, 'cross-origin open requests must be denied');
+    assert.equal(corsHeaders['Access-Control-Allow-Origin'], undefined, 'must never emit wildcard CORS');
+
+    // 403 when file is outside workspaceRoots
+    const outsideDir = mkdtempSync(join(tmpdir(), 'agy-open-outside-'));
+    const outsideFile = join(outsideDir, 'outside.png');
+    writeFileSync(outsideFile, Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+    try {
+      let outOpenStatus = 0;
+      handleOpenFile(
+        { method: 'POST', url: '/plugins/agy-link/open?path=' + encodeURIComponent(outsideFile) },
+        { writeHead(s: number) { outOpenStatus = s; }, end() {} } as never,
+        { workspaceRoots: [root] },
+      );
+      assert.equal(outOpenStatus, 403, 'opening file outside allowed workspaceRoots must be denied');
+
+      let outMediaStatus = 0;
+      handleMediaRequest(
+        { url: '/plugins/agy-link/media?path=' + encodeURIComponent(outsideFile) },
+        { writeHead(s: number) { outMediaStatus = s; }, end() {} } as never,
+        { workspaceRoots: [root] },
+      );
+      assert.equal(outMediaStatus, 403, 'reading media outside allowed workspaceRoots must be denied');
+    } finally {
+      rmSync(outsideDir, { recursive: true, force: true });
+    }
+
+    // 404 for missing file on POST
     let notFoundStatus = 0;
     let notFoundBody = '';
     const res404 = {
@@ -263,20 +317,20 @@ test('media-route: handleOpenFile validates path and returns JSON', () => {
       end(b?: unknown) { notFoundBody = String(b ?? ''); },
     };
     handleOpenFile(
-      { url: '/plugins/agy-link/open?path=' + encodeURIComponent('missing_file_xyz.md') },
+      { method: 'POST', url: '/plugins/agy-link/open?path=' + encodeURIComponent('missing_file_xyz.md') },
       res404 as never,
       { workspaceRoots: [root] },
     );
     assert.equal(notFoundStatus, 404);
     assert.ok(notFoundBody.includes('file not found'));
 
-    // Missing path query parameter
+    // Missing path query parameter on POST
     let badStatus = 0;
     const resBad = {
       writeHead(s: number) { badStatus = s; },
       end() {},
     };
-    handleOpenFile({ url: '/plugins/agy-link/open' }, resBad as never);
+    handleOpenFile({ method: 'POST', url: '/plugins/agy-link/open' }, resBad as never);
     assert.equal(badStatus, 400);
 
     // executeOpenInSystem reveal test
@@ -285,4 +339,40 @@ test('media-route: handleOpenFile validates path and returns JSON', () => {
   } finally {
     try { rmSync(root, { recursive: true, force: true }); } catch { /* ignore */ }
   }
+});
+
+// ---- Opener launch failures must never escalate to an uncaughtException ----
+
+test('media-route: a missing OS opener is contained instead of killing the host', () => {
+  // Live incident (2026-11-16 / 2026-11-18): `spawn('xdg-open', ...)` on a
+  // headless Linux host reports ENOENT asynchronously. The old code attached no
+  // 'error' listener, so Node raised an uncaughtException, dsh exited with code 1
+  // and systemd restarted the whole server — four times, once per UI click.
+  let child: (EventEmitter & { unref: () => void }) | undefined;
+  const fakeSpawn = ((command: string, args: readonly string[]) => {
+    assert.equal(command, 'xdg-open');
+    assert.deepEqual([...args], ['/tmp/agent-artifact.md']);
+    child = Object.assign(new EventEmitter(), { unref: () => {} });
+    return child;
+  }) as unknown as Parameters<typeof spawnDetachedOpener>[2];
+
+  assert.equal(
+    spawnDetachedOpener('xdg-open', ['/tmp/agent-artifact.md'], fakeSpawn),
+    true,
+    'a started child is reported as launched',
+  );
+  assert.ok(child, 'the injected spawn must have been called');
+
+  // Emitting the launch error must be swallowed by the helper's listener. An
+  // unhandled 'error' event would throw here and, in production, kill the host.
+  assert.doesNotThrow(() => {
+    child!.emit('error', Object.assign(new Error('spawn xdg-open ENOENT'), { code: 'ENOENT' }));
+  });
+});
+
+test('media-route: a synchronously throwing spawn reports false instead of escaping', () => {
+  const throwingSpawn = (() => {
+    throw new Error('spawn blocked');
+  }) as unknown as Parameters<typeof spawnDetachedOpener>[2];
+  assert.equal(spawnDetachedOpener('xdg-open', ['/tmp/x'], throwingSpawn), false);
 });

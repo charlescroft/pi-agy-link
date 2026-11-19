@@ -90,6 +90,7 @@ const POST_ONLY_ROUTES = [
   '/plugins/agy-link/pool/reorder',
   '/plugins/agy-link/config',
   '/plugins/agy-link/translate',
+  '/plugins/agy-link/open',
 ] as const
 
 type FakeWebServer = {
@@ -491,8 +492,8 @@ test('every POST-only route rejects GET/PUT/DELETE with 405 before touching serv
       assert.deepEqual(captured.json(), { error: 'POST only' }, path + ' ' + method)
     }
   }
-  // 21 POST-only + 10 method-agnostic routes = 31 routes total.
-  assert.equal(POST_ONLY_ROUTES.length + 10, EXPECTED_ROUTES.length)
+  // 22 POST-only + 9 method-agnostic routes = 31 routes total.
+  assert.equal(POST_ONLY_ROUTES.length + 9, EXPECTED_ROUTES.length)
 })
 
 test('GET-style routes do not gate on method (current contract, asserted verbatim)', async (t) => {
@@ -509,7 +510,6 @@ test('GET-style routes do not gate on method (current contract, asserted verbati
     ['/plugins/agy-link/qr', '/', 404],
     ['/plugins/agy-link/mermaid.min.js', '/', 404],
     ['/plugins/agy-link/media', '/', 400],
-    ['/plugins/agy-link/open', '/', 400],
     ['/plugins/agy-link/assets', '/plugins/agy-link/assets/none.js', 404],
   ]
   for (const [path, url, expected] of cases) {
@@ -917,6 +917,58 @@ test('/pool/refresh-quota refreshes one known account and tolerates unknown ids'
   assert.equal(unknown.status(), 200)
   assert.deepEqual(quotaRefreshes, [[acc, true]], 'unknown id refreshes nothing')
   assert.equal(catalogRefreshes, 2)
+})
+
+test('/pool/refresh-quota reports a duplicate click instead of silently doing nothing', async () => {
+  // WHY: the route dedupes by key for up to QUOTA_REFRESH_DEDUP_MS. A click that
+  // lands inside that window used to answer exactly like a fresh start, so a
+  // slow pool looked frozen ("I clicked and the second account never moved").
+  let release: (() => void) | null = null
+  const gate = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  const started: string[] = []
+  const acc = { id: 'inflight-acct' }
+  const pool = poolDouble({ getAccount: (id: unknown) => (id === 'inflight-acct' ? acc : undefined) })
+  const s = setup({
+    pool: pool.pool,
+    quota: {
+      refreshAccountQuota: async () => {
+        started.push('pipeline')
+        await gate
+      },
+      refreshAllQuotas: async () => undefined,
+    },
+    catalog: {
+      get: () => ({ source: 'fallback', models: [], lastError: null }),
+      getAllKnownModels: () => [],
+      forceRefresh: async () => undefined,
+    },
+  })
+
+  const first = await invoke(s.route('/plugins/agy-link/pool/refresh-quota'), fakeReq('POST', '/', { id: 'inflight-acct' }))
+  const second = await invoke(s.route('/plugins/agy-link/pool/refresh-quota'), fakeReq('POST', '/', { id: 'inflight-acct' }))
+  assert.equal(first.status(), 200)
+  assert.equal((first.json() as Record<string, unknown>).alreadyRunning, false)
+  assert.equal((second.json() as Record<string, unknown>).alreadyRunning, true, 'the duplicate click must be reported as such')
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.deepEqual(started, ['pipeline'], 'a duplicate click must never stack a second pipeline')
+  release!()
+})
+
+test('/status forwards the account ids the host is refreshing right now', async () => {
+  const withIds = fakeServices({ quota: { refreshingAccounts: () => ['a1', 'a2'] } })
+  const webServer = fakeWebServer()
+  registerRoutes(webServer, withIds)
+  const captured = await invoke(routeFor(webServer.routes, '/plugins/agy-link/status'), fakeReq('GET'))
+  assert.deepEqual((captured.json() as Record<string, unknown>).quotaRefreshing, ['a1', 'a2'])
+
+  // A host double without the method must degrade to an empty list, not throw.
+  const withoutMethod = fakeServices({ quota: {} })
+  const ws2 = fakeWebServer()
+  registerRoutes(ws2, withoutMethod)
+  const second = await invoke(routeFor(ws2.routes, '/plugins/agy-link/status'), fakeReq('GET'))
+  assert.deepEqual((second.json() as Record<string, unknown>).quotaRefreshing, [])
 })
 
 test('/pool/warmup is strict about JSON and required selectors', async () => {

@@ -33,6 +33,7 @@ import { detectSystemProxy, writeWindowsCredentialRaw } from './wincred.ts'
 import { writePrimaryCredential } from './credential-slot.ts'
 import { extractRefreshToken, saveCredentialBackup } from './credential-backup.ts'
 import { writeMacKeychainToken } from '../features/quota/token.ts'
+import { writeSystemKeyringRaw } from '../runtime/agy/keychain.ts'
 
 export type PoolAuthPhase = 'idle' | 'waiting' | 'exchanging' | 'done' | 'failed'
 export type PoolAuthStatusCode =
@@ -86,6 +87,7 @@ export interface PoolAuthFlowDeps {
   fetchUserEmail?: typeof fetchUserEmail
   refreshTokens?: typeof refreshTokens
   onUpdate?: () => void
+  onIsolatedAccountCommitted?: (account: ManagedAccount) => void
 }
 
 export class PoolAuthFlow {
@@ -97,6 +99,7 @@ export class PoolAuthFlow {
   private readonly userEmail: typeof fetchUserEmail
   private readonly refresh: typeof refreshTokens
   private readonly onUpdate?: () => void
+  private readonly onIsolatedAccountCommitted?: (account: ManagedAccount) => void
 
   constructor(
     private readonly pool: AccountPoolManager,
@@ -109,6 +112,7 @@ export class PoolAuthFlow {
     this.userEmail = deps.fetchUserEmail ?? fetchUserEmail
     this.refresh = deps.refreshTokens ?? refreshTokens
     this.onUpdate = deps.onUpdate
+    this.onIsolatedAccountCommitted = deps.onIsolatedAccountCommitted
   }
 
   status(): PoolAuthStatus {
@@ -263,7 +267,16 @@ export class PoolAuthFlow {
             // `expiry`, so a missing field cannot be read as "valid forever".
             const docStr = buildAgyCredentialDoc(tokens)
             writeWindowsCredentialRaw(docStr, 'gemini:antigravity')
-            writePrimaryCredential({ raw: docStr, email, savedAt: Date.now() })
+            writePrimaryCredential({ raw: docStr, email, savedAt: Date.now() }, this.pool.dir)
+          } catch {
+            // best effort
+          }
+        } else if (process.env.NODE_TEST_CONTEXT === undefined) {
+          try {
+            const { homedir } = await import('node:os')
+            const primaryFile = writeAgyTokenFile(homedir(), tokens)
+            saveCredentialBackup(primaryFile)
+            writeSystemKeyringRaw(readFileSync(primaryFile, 'utf8'), homedir())
           } catch {
             // best effort
           }
@@ -300,6 +313,7 @@ export class PoolAuthFlow {
       const targetAcc = this.pool.commitStagingAccount(staging.id, staging.dir, alias, email, proxyUrl)
       const accountFile = join(targetAcc.dir, '.gemini', 'antigravity-cli', 'antigravity-oauth-token')
       saveCredentialBackup(accountFile)
+      this.onIsolatedAccountCommitted?.(targetAcc)
       void this.quota.refreshAccountQuota(targetAcc).catch(() => undefined)
       this.log(`imported refresh token as new account ${targetAcc.id}${email ? ` <${email}>` : ''}`)
       this.setStatus({ phase: 'done', alias: targetAcc.alias || email, code: 'account_activated' })
@@ -379,8 +393,9 @@ export class PoolAuthFlow {
         // A completed OAuth login is an explicit user action (unlike an
         // automatic quota refresh), so it may lift a terminal quarantine.
         this.pool.clearAuthRequired(account.id, true)
+        this.pool.clearCooldown(account.id, undefined, true)
         this.pool.cleanupStagingSlot(flow.dir)
-        void this.quota.refreshAccountQuota(account).catch(() => undefined)
+        void this.quota.refreshAccountQuota(account, true).catch(() => undefined)
         this.flow = null
         if (flow.listener) void flow.listener.close().catch(() => undefined)
         this.setStatus({ phase: 'done', alias: account.alias, code: 'account_activated' })
@@ -388,10 +403,19 @@ export class PoolAuthFlow {
         return
       }
       const tokenFile = writeAgyTokenFile(flow.dir, tokens)
+      if (flow.primary) {
+        saveCredentialBackup(tokenFile)
+      }
       if (flow.primary && process.platform === 'win32') {
         try {
           const raw = readFileSync(tokenFile, 'utf8')
           writeWindowsCredentialRaw(raw, 'gemini:antigravity')
+        } catch {
+          // best-effort
+        }
+      } else if (flow.primary) {
+        try {
+          writeSystemKeyringRaw(readFileSync(tokenFile, 'utf8'), flow.dir)
         } catch {
           // best-effort
         }
@@ -402,7 +426,7 @@ export class PoolAuthFlow {
           // Record the freshly verified primary credential so every later slot
           // handoff restores THIS login instead of "whatever the slot held".
           const raw = readFileSync(tokenFile, 'utf8')
-          writePrimaryCredential({ raw, email, savedAt: Date.now() })
+          writePrimaryCredential({ raw, email, savedAt: Date.now() }, this.pool.dir)
         } catch {
           // best-effort
         }
@@ -466,9 +490,10 @@ export class PoolAuthFlow {
       const acc = this.pool.commitStagingAccount(flow.stagingId, flow.dir, flow.alias, email, flow.proxyUrl)
       const accountFile = join(acc.dir, '.gemini', 'antigravity-cli', 'antigravity-oauth-token')
       saveCredentialBackup(accountFile)
+      this.onIsolatedAccountCommitted?.(acc)
       this.log(`pool auth committed account ${acc.id}${email ? ` <${email}>` : ''}`)
       // Quota refresh is best-effort; the account is usable regardless.
-      void this.quota.refreshAccountQuota(acc).catch(() => undefined)
+      void this.quota.refreshAccountQuota(acc, true).catch(() => undefined)
       this.flow = null
       if (flow.listener) void flow.listener.close().catch(() => undefined)
       this.setStatus({ phase: 'done', alias: acc.alias, code: 'account_activated' })

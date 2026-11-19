@@ -6,6 +6,7 @@ import { chmodSync, mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { stateDir } from '../common/config.ts'
 import type { PluginConfig } from '../common/types.ts'
+import { agyBinDiagnostics } from '../runtime/agy/bin.ts'
 import { describeAgyAutoUpdate } from './auto-updater.ts'
 import type { ModelCatalog } from './models.ts'
 import type { SessionStore } from './sessions.ts'
@@ -44,7 +45,8 @@ export function redactProxyUrl(url: string): string {
 export function redactLine(line: string): string {
   let out = line
   out = out.replace(/https:\/\/accounts\.google\.com\/\S+/g, '<auth-url-redacted>')
-  out = out.replace(/\b[0-9]{4,}\//g, '4/<code-redacted>')
+  // Google authorization codes look like "4/0Af..." or "4/1Af..." (single leading 4/).
+  out = out.replace(/\b4\/[0-9A-Za-z._-]{16,}/g, '4/<code-redacted>')
   out = out.replace(/ya29\.[A-Za-z0-9._-]+/g, '<oauth-token-redacted>')
   out = out.replace(/Bearer\s+\S+/gi, 'Bearer <redacted>')
   // Google OAuth refresh tokens ("1//0…") and AIza API keys did not match any
@@ -75,6 +77,16 @@ export function writeDoctorReport(deps: DoctorDeps): string {
   lines.push('- generated: ' + new Date().toISOString())
   lines.push('- agy binary: ' + (deps.bin() ?? 'NOT FOUND'))
   lines.push('- agy version: ' + (deps.version() ?? 'unknown'))
+  // A missing binary is the most common support case: list every probed
+  // location so the report shows where the plugin looked, and how to point it
+  // at a binary installed outside those locations.
+  if (deps.bin() === null) {
+    const diag = agyBinDiagnostics(cfg)
+    lines.push('- agy lookup: NOT FOUND — probed ' + diag.probed.length + ' location(s)')
+    for (const p of diag.probed) lines.push('  - ' + p)
+    lines.push('- agy lookup: install hint — ' + diag.installHint)
+    lines.push('- agy lookup: override — set plugin config agyBin, or the DSH_AGY_BIN environment variable')
+  }
   // Issue #49: whether spawns pre-empt agy's `--bg-updater` console flash.
   lines.push(
     '- agy auto-updater: ' +

@@ -4,8 +4,17 @@
 // family rows come from the pure parsers in src/domain/quota/parse.ts.
 import { existsSync, readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import type { FamilyQuotaInfo, ManagedAccount, ModelFamily } from '../../common/pool-types.ts'
+import type {
+  FamilyQuotaInfo,
+  ManagedAccount,
+  ModelFamily,
+  QuotaUnavailableReason,
+  QuotaUnavailableState,
+} from '../../common/pool-types.ts'
+import { quotaSummarySuppressed } from '../../common/pool-types.ts'
+import { QUOTA_LICENSE_RETRY_MS } from '../../common/timeouts.ts'
 import { shouldReleaseOrphanedCooldown, summaryHasArgonGroup } from '../../domain/quota/buckets.ts'
+import type { QuotaSummaryFailure } from './http.ts'
 import {
   buildFamilyQuotas,
   buildModelsCatalog,
@@ -35,6 +44,10 @@ export interface QuotaRefreshPool {
   resetAccountIdentity(id: string, email: string): void
   updateAccountQuotas(id: string, quotas: Partial<Record<ModelFamily, FamilyQuotaInfo>>, email?: string): void
   setSubscriptionTier?(id: string, tier: string): void
+  /** Records why authoritative quota data is missing (drives the console note). */
+  noteQuotaUnavailable(id: string, state: QuotaUnavailableState): void
+  /** Clears that marker once an authoritative snapshot arrives. */
+  clearQuotaUnavailable(id: string): void
 }
 
 /**
@@ -59,6 +72,17 @@ export interface QuotaRefreshDeps {
   readPrimaryCredential(baseDir: string): PrimaryCredentialLike | null
   writePrimaryCredential(cred: PrimaryCredentialLike, baseDir: string): boolean
   credentialFingerprint(raw: string | null | undefined): string | null
+  /** The refusal behind the last empty summary (undefined when not tracked). */
+  summaryFailure?(): QuotaSummaryFailure | null
+}
+
+/** Map the HTTP verdict onto the account-level marker. */
+function unavailableReason(failure: QuotaSummaryFailure | null, hasModelData: boolean): QuotaUnavailableReason {
+  if (failure === null) return hasModelData ? 'partial' : 'unreachable'
+  if (failure.kind === 'no_license') return 'no_license'
+  if (failure.kind === 'auth') return 'auth'
+  if (failure.kind === 'network') return 'unreachable'
+  return hasModelData ? 'partial' : 'unreachable'
 }
 
 /**
@@ -210,15 +234,39 @@ export async function refreshAccountQuotaPipeline(
     deps.pool.resetAccountIdentity(account.id, email)
   }
 
-  const [summary, discovered, userQuota, subTier] = await Promise.all([
-    deps.fetchQuotaSummary(accessToken, deps.proxyFor(account)),
-    deps.fetchAvailableModels(accessToken, deps.proxyFor(account)),
-    deps.fetchUserQuota(accessToken, deps.proxyFor(account)).catch(() => null),
-    deps.fetchSubscriptionTier ? deps.fetchSubscriptionTier(accessToken, deps.proxyFor(account)).catch(() => null) : Promise.resolve(null),
-  ])
-  if (subTier && deps.pool.setSubscriptionTier) {
-    deps.pool.setSubscriptionTier(account.id, subTier)
+  const suppressSummary = !force && quotaSummarySuppressed(account, now)
+  let summary: QuotaSummaryResponse | null = null
+  let discovered: DiscoveredModelsResponse | null = null
+  const tierPromise = deps.fetchSubscriptionTier
+    ? deps.fetchSubscriptionTier(accessToken, deps.proxyFor(account)).catch(() => null)
+    : Promise.resolve(null)
+  if (suppressSummary) {
+    const [fetchedModels, subTier] = await Promise.all([
+      deps.fetchAvailableModels(accessToken, deps.proxyFor(account)),
+      tierPromise,
+    ])
+    discovered = fetchedModels
+    if (subTier && deps.pool.setSubscriptionTier) {
+      deps.pool.setSubscriptionTier(account.id, subTier)
+    }
+  } else {
+    const [fetchedSummary, fetchedModels, subTier] = await Promise.all([
+      deps.fetchQuotaSummary(accessToken, deps.proxyFor(account)),
+      deps.fetchAvailableModels(accessToken, deps.proxyFor(account)),
+      tierPromise,
+    ])
+    summary = fetchedSummary
+    discovered = fetchedModels
+    if (subTier && deps.pool.setSubscriptionTier) {
+      deps.pool.setSubscriptionTier(account.id, subTier)
+    }
   }
+  const hasModelQuotas = Boolean(
+    discovered?.models && Object.values(discovered.models).some((m) => m?.quotaInfo !== undefined),
+  )
+  const userQuota = !hasModelQuotas
+    ? await deps.fetchUserQuota(accessToken, deps.proxyFor(account)).catch(() => null)
+    : null
 
   // Query the userinfo endpoint ONLY when the email is still unknown.
   // Account switching on systemHome accounts is already caught locally by
@@ -230,6 +278,27 @@ export async function refreshAccountQuotaPipeline(
   }
 
   const modelsCatalog = buildModelsCatalog(discovered, userQuota)
+
+  // Record WHY the authoritative snapshot is missing. buildFamilyQuotas keeps
+  // the previous complete value on a failed summary (a partial fallback must
+  // never overwrite good data), so without this marker an account whose
+  // summary is refused shows yesterday's percentages forever with no error.
+  if (!suppressSummary) {
+    const summaryAuthoritative = (summary?.groups?.length ?? 0) > 0 || (summary?.buckets?.length ?? 0) > 0
+    if (summaryAuthoritative) {
+      deps.pool.clearQuotaUnavailable(account.id)
+    } else {
+      const failure = deps.summaryFailure?.() ?? null
+      const reason = unavailableReason(failure, Object.keys(modelsCatalog).length > 0)
+      const previous = account.quotaUnavailable
+      deps.pool.noteQuotaUnavailable(account.id, {
+        reason,
+        since: previous?.reason === reason ? previous.since : now,
+        retryAfter: now + QUOTA_LICENSE_RETRY_MS,
+        ...(failure?.detail === undefined ? {} : { detail: failure.detail }),
+      })
+    }
+  }
 
   if (!summary && Object.keys(modelsCatalog).length === 0) {
     return null

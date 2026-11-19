@@ -20,6 +20,30 @@ export interface DiscoveredModelEntry {
 
 export interface DiscoveredModelsResponse {
   models?: Record<string, DiscoveredModelEntry>
+  agentModelSorts?: Array<{ groups?: Array<{ modelIds?: string[] }> }>
+}
+
+/**
+ * Normalize a server quota fraction in [0, 1].
+ * Proto3 JSON serialization omits `0.0` numeric fields: when `remainingFraction`
+ * is absent (`undefined`) while a `resetTime` or `remainingAmount === 0` is
+ * present, the bucket/model is exhausted (`0`), NOT `undefined` / `100%`.
+ */
+function parseBucketFraction(
+  rawRemaining: unknown,
+  resetTime?: string,
+  remainingAmount?: unknown,
+): number | undefined {
+  if (typeof rawRemaining === 'number' && Number.isFinite(rawRemaining)) {
+    return Math.min(1, Math.max(0, rawRemaining))
+  }
+  if (
+    rawRemaining === undefined &&
+    ((typeof resetTime === 'string' && resetTime.trim() !== '') || remainingAmount === 0)
+  ) {
+    return 0
+  }
+  return undefined
 }
 
 export interface QuotaSummaryBucket {
@@ -76,9 +100,7 @@ export function buildModelsCatalog(
   if (userQuota && Array.isArray(userQuota.buckets)) {
     for (const b of userQuota.buckets) {
       if (!b.modelId) continue
-      const frac = typeof b.remainingFraction === 'number' && Number.isFinite(b.remainingFraction)
-        ? Math.min(1, Math.max(0, b.remainingFraction))
-        : undefined
+      const frac = parseBucketFraction(b.remainingFraction, b.resetTime, b.remainingAmount)
       if (frac !== undefined) {
         const existing = modelsCatalog[b.modelId]
         modelsCatalog[b.modelId] = {
@@ -131,8 +153,14 @@ function ingestSummaryGroups(
     // separate weekly bucket, but its display name still contains "gemini"
     // ("Gemini 4 Argon"). Detect argon BEFORE the generic gemini gate or
     // the group folds into — and overwrites — the plain Gemini family.
+    //
+    // Only the GROUP NAME and the BUCKET ids may prove a dedicated pool. The
+    // description must not: since agy 1.5.12 the plain `Gemini Models` group
+    // enumerates its members ("Models within this group: Gemini 4 Neon, Gemini 4
+    // Carbon, Gemini 4 Argon, …"), so a description match filed the SHARED pool
+    // under `argon` and left `google` without its weekly numbers (2026-11-19).
     const hasArgonBucket = Array.isArray(group.buckets) && group.buckets.some((b) => (b.bucketId || '').toLowerCase().includes('argon') || (b.displayName || '').toLowerCase().includes('argon'))
-    const isArgon = dName.includes('argon') || desc.includes('argon') || hasArgonBucket
+    const isArgon = dName.includes('argon') || hasArgonBucket
     const isGoogle = !isArgon && (dName.includes('gemini') || desc.includes('gemini'))
     const is3P = dName.includes('claude') || dName.includes('gpt') || desc.includes('claude') || desc.includes('gpt')
 
@@ -151,12 +179,7 @@ function ingestSummaryGroups(
 
     for (const b of group.buckets || []) {
       const w = (b.window || b.bucketId || '').toLowerCase()
-      // Server fractions are clamped to [0,1] and NaN rejected: a bogus
-      // remainingFraction (NaN/negative/>1) used to flow straight into
-      // isAccountEligible and the UI ("NaN%" rows, permanently ineligible).
-      const frac = typeof b.remainingFraction === 'number' && Number.isFinite(b.remainingFraction)
-        ? Math.min(1, Math.max(0, b.remainingFraction))
-        : undefined
+      const frac = parseBucketFraction(b.remainingFraction, b.resetTime, b.remainingAmount)
       if (w.includes('5h') || w.includes('five_hour') || w.includes('5-hour')) {
         fiveHourFrac = frac
         fiveHourReset = b.resetTime
@@ -213,13 +236,8 @@ function ingestModelCatalog(params: {
     const argonSharesGemini =
       quotaFamily === 'argon' && !argonGroupPresent && summaryAuthoritative
     const fam: ModelFamily = argonSharesGemini ? 'google' : quotaFamily
-    const rawRemaining = entry.quotaInfo?.remainingFraction
-    // Clamp to [0,1]; non-numeric entries are skipped (same contract as
-    // the summary path above).
-    const remaining = typeof rawRemaining === 'number' && Number.isFinite(rawRemaining)
-      ? Math.min(1, Math.max(0, rawRemaining))
-      : undefined
     const resetTime = entry.quotaInfo?.resetTime
+    const remaining = parseBucketFraction(entry.quotaInfo?.remainingFraction, resetTime)
 
     if (remaining === undefined) continue
 

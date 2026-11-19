@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.1.0 (2026-11-18)
+
+### English
+
+- **Sync upstream `dsh-agy-link` (`v0.6.28` → `v0.6.41`)**:
+  - **Fix(models/quota): split `model-unsupported` from `unsupported` and auto-heal stale snapshots after idle (issues #115, #120, #122, #124, #125).** When all enabled accounts appear missing a model after a long idle period, `selectSessionAccount` now runs a bounded `healStaleModelSnapshot` quota & catalog refresh automatically before failing, eliminating the false `All Antigravity accounts are unavailable: ... (1 lack google access)` error that previously required manual plugin refresh.
+  - **Fix(provider): idle-grace reply recovery, lingering background process termination, and plan-mode turn-scoping (issues #119, #127, #128, #136).**
+  - **Fix(db/quota/open): bounded protobuf varint parsing, sticky terminal TOS quarantine, dedicated Argon group detection, and non-fatal opener launch containment (issues #112, #114, #131, #132, #133).**
+  - **Perf & Features: anti-ban quota pacing, instant model sync, 1-click reauth, and modularized locales/services.**
+- **Fix(pi/spawn): validate session `cwd` and fallback on virtual `(none)` directories.** Prevents `spawn agy ENOENT` in standalone/temporary chats where `<cwd>` is `(none)`.
+
+### 中文
+
+- **跟进上游 `dsh-agy-link`（`v0.6.28` → `v0.6.41`）**：
+  - **修复(models/quota)：区分模型目录缺失（`model-unsupported`）与套餐权限不足（`unsupported`），并支持闲置后过期快照自愈（issues #115, #120, #122, #124, #125）。** 长时间闲置后若所有启用账号因快照陈旧误报缺少模型，将在选号阶段自动触发一次带超时保护的配额与模型目录刷新，彻底解决此前必须手动刷新插件才能恢复使用的 `1 lack google access` 误报问题。
+  - **修复(provider)：闲置宽限期最终回复恢复、后台残留进程清理与 plan 模式按当前轮次判定（issues #119, #127, #128, #136）。**
+  - **修复(db/quota/open)：protobuf varint 长度边界保护、TOS 封禁持久隔离、Argon 独立配额组判定及外部打开失败隔离（issues #112, #114, #131, #132, #133）。**
+  - **性能与特性：防风控配额轮询节流、模型即时同步、一键重新授权及多语言/服务模块化重构。**
+- **修复(pi/spawn)：校验会话 `cwd` 真实目录并在虚拟 `(none)` 目录时回退**，解决独立/临时对话触发 `spawn agy ENOENT` 的问题。
+
 ## 1.0.2 (2026-11-18)
 
 ### English

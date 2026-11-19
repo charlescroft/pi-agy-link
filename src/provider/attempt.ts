@@ -12,6 +12,7 @@
 // credential-slot dispatch); the adapter calls runAgyAttempt from there.
 import { LlmError, type Message } from '@deepseek-ai/dsh-llm'
 import type { AgyEvent, PluginConfig } from '../common/types.ts'
+import { createToolWatchdog, type ToolWatchdog } from './tool-watchdog.ts'
 import { Err } from '../common/types.ts'
 import type { ManagedAccount, ModelFamily } from '../common/pool-types.ts'
 import type { AccountPoolManager } from '../host/pool.ts'
@@ -27,9 +28,10 @@ import {
   startAgyProcess,
   stripNulBytes,
 } from '../host/runner.ts'
-import { agyHomeDirFor, snapshotAgyLogs } from '../host/agy-log.ts'
+import { agyHomeDirFor, snapshotAgyLogs, type AgyLogSnapshot } from '../host/agy-log.ts'
 import { acquireCredentialSlot, armSlotHandoff, type SlotHandoff } from '../host/credential-slot.ts'
-import { buildAgyEnv } from '../runtime/net/account-env.ts'
+import { buildAgyEnv, pickProxy } from '../runtime/net/account-env.ts'
+import type { SpawnLimiter } from './spawn-limiter.ts'
 import { resolveModelSlug } from '../host/models.ts'
 import type { RunTelemetry } from './finalize.ts'
 import { SubagentTracker } from '../features/subagent/tracker.ts'
@@ -64,6 +66,7 @@ export interface AttemptDeps {
   /** Per-account burst spacing throttle state (adapter-owned). */
   lastAccountSpawnTime: Map<string, number>
   minSpawnIntervalMs: number
+  spawnLimiter?: SpawnLimiter
 }
 
 /** Everything one attempt needs. Values are produced by streamAttempt. */
@@ -178,110 +181,6 @@ export function buildSpawnArgs(
   return { prompt, args, stdinPayload }
 }
 
-export interface ToolWatchdog {
-  printTimeoutMinutes: number
-  attach: (proc: RunningProcess | null) => void
-  markEvent: () => void
-  trackStep: (ev: AgyEvent) => void
-  stop: () => void
-}
-
-/**
- * Idle-budget + long-tool heartbeat state. While an agy tool step is ACTIVE the
- * child is legitimately silent on stdout (maven compile, language-server
- * build, …) — issue #33 — so the watchdog raises the idle budget; bare
- * generation gets a bounded floor so a hung SSE stream can fail and rotate.
- */
-function createToolWatchdog(log: ((msg: string) => void) | undefined, cfg: PluginConfig): ToolWatchdog {
-  const openToolKeys = new Set<string>()
-  const openToolSince = new Map<string, number>()
-  const longToolIdleMinutes = cfg.longToolIdleMinutes > 0 ? cfg.longToolIdleMinutes : 0
-  const printTimeoutMinutes = Math.max(
-    longToolIdleMinutes > 0 ? longToolIdleMinutes : 240,
-    Math.ceil(cfg.timeoutMs / 60_000),
-  )
-  const longToolIdleMs = longToolIdleMinutes > 0 ? longToolIdleMinutes * 60_000 : cfg.timeoutMs
-  const generationIdleMs = Math.max(cfg.timeoutMs, 15 * 60_000)
-  let runningProc: RunningProcess | null = null
-  let sawAnyEvent = false
-  let lastOutputAt = 0
-  const TOOL_HEARTBEAT_MS = 5 * 60_000
-  let toolHeartbeat: NodeJS.Timeout | null = null
-  const apply = (): void => {
-    runningProc?.noteActivity(openToolKeys.size > 0 ? longToolIdleMs : generationIdleMs)
-  }
-  const stop = (): void => {
-    if (toolHeartbeat !== null) {
-      clearInterval(toolHeartbeat)
-      toolHeartbeat = null
-    }
-  }
-  const start = (): void => {
-    if (toolHeartbeat !== null) return
-    toolHeartbeat = setInterval(() => {
-      if (openToolKeys.size === 0 && !sawAnyEvent) {
-        stop()
-        return
-      }
-      let oldest = Date.now()
-      for (const startedAt of openToolSince.values()) {
-        if (startedAt < oldest) oldest = startedAt
-      }
-      // With no tool step open the interesting number is time since the LAST
-      // output, not since a tool start.
-      if (openToolKeys.size === 0 && lastOutputAt > 0) oldest = lastOutputAt
-      const mins = Math.max(1, Math.round((Date.now() - oldest) / 60_000))
-      log?.(
-        openToolKeys.size > 0
-          ? 'agy tool step still running: ' + openToolKeys.size + ' open, oldest ' + mins +
-            'm (idle budget ' + Math.round(longToolIdleMs / 60_000) + 'm) — the turn is waiting on agy'
-          : 'agy run still working: no new output for ' + mins + 'm (idle budget ' +
-            Math.round(longToolIdleMs / 60_000) + 'm) — the turn is waiting on agy; press Stop to cancel',
-      )
-    }, TOOL_HEARTBEAT_MS)
-    toolHeartbeat.unref?.()
-  }
-  return {
-    printTimeoutMinutes,
-    attach: (proc) => {
-      runningProc = proc
-      apply()
-    },
-    markEvent: () => {
-      sawAnyEvent = true
-      lastOutputAt = Date.now()
-      start()
-      apply()
-    },
-    trackStep: (ev) => {
-      if (ev.kind !== 'step' || ev.stepKind !== 'tool' || ev.tool === undefined) return
-      // Mirror mapper's completion rule: DONE/ERROR state, or legacy events
-      // that carry output/error without an explicit state.
-      const completed =
-        ev.state === 'DONE' ||
-        ev.state === 'ERROR' ||
-        (ev.state === undefined && (ev.tool.output !== undefined || ev.tool.error !== undefined))
-      if (!completed) {
-        if (!openToolKeys.has(ev.stepKey)) {
-          openToolKeys.add(ev.stepKey)
-          openToolSince.set(ev.stepKey, Date.now())
-          apply()
-          start()
-        }
-      } else if (openToolKeys.delete(ev.stepKey)) {
-        openToolSince.delete(ev.stepKey)
-        apply()
-        if (openToolKeys.size === 0) stop()
-      }
-    },
-    stop: () => {
-      stop()
-      openToolKeys.clear()
-      openToolSince.clear()
-    },
-  }
-}
-
 export interface AttemptRecorder {
   rec: RunRecording
   parser: StreamJsonParser
@@ -310,6 +209,7 @@ export function createAttemptRecorder(deps: AttemptDeps, cfg: PluginConfig, acco
   const watchdog = createToolWatchdog(deps.log, cfg)
   const tracker = new SubagentTracker({
     conversationId: initialConversationId,
+    resumed: Boolean(initialConversationId),
     accountHome: rec.accountHome,
     log: deps.log,
     onEvent: (ev) => {
@@ -463,7 +363,7 @@ export async function waitForRunSettle(run: { isSettled: boolean }, timeoutMs: n
 export interface SpawnedAttempt {
   proc: RunningProcess
   runLogHome: string
-  runLogsBefore: Set<string>
+  runLogsBefore: AgyLogSnapshot
 }
 
 /**
@@ -515,13 +415,15 @@ export async function startAttemptProcess(
     // high-frequency flood to Google endpoints). Suspension point INSIDE the
     // slot-owning window: a generator abandoned here must still give the slot
     // back — the finally below owns that.
+    // TAT per-account + shared-egress burst spacing throttle (reserves slot
+    // synchronously BEFORE await so parallel sessions never wake together).
     if (account) {
-      const lastSpawn = deps.lastAccountSpawnTime.get(account.id) ?? 0
-      const elapsed = Date.now() - lastSpawn
-      const jitter = Math.floor(Math.random() * 300) // 100~400ms organic jitter
-      const targetInterval = deps.minSpawnIntervalMs + jitter
-      if (elapsed < targetInterval) {
-        await abortableDelay(targetInterval - elapsed, signal, 'request aborted before the agy process was spawned')
+      const egressKey = pickProxy(account.proxyUrl, cfg.proxyUrl) || '__direct__'
+      const delayMs = deps.spawnLimiter
+        ? deps.spawnLimiter.reserveSpawnDelay(account.id, egressKey, deps.minSpawnIntervalMs)
+        : Math.max(0, deps.minSpawnIntervalMs + Math.floor(Math.random() * 300) - (Date.now() - (deps.lastAccountSpawnTime.get(account.id) ?? 0)))
+      if (delayMs > 0) {
+        await abortableDelay(delayMs, signal, 'request aborted before the agy process was spawned')
       }
       deps.lastAccountSpawnTime.set(account.id, Date.now())
     }

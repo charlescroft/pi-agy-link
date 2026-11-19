@@ -111,6 +111,52 @@ export interface ManagedAccount {
   dedicatedGroups?: ModelFamily[]
   /** Subscription tier reported by loadCodeAssist (`ULTRA`, `PRO`, `FREE`). */
   subscriptionTier?: string
+  /**
+   * Why the last quota refresh produced no authoritative snapshot, and when it
+   * may be probed again.
+   *
+   * WHY: a failed refresh used to be invisible. `buildFamilyQuotas` keeps the
+   * previous complete snapshot when the summary is unavailable (correct — a
+   * partial fallback must never overwrite good data), so an account whose
+   * summary endpoint answers 403 "not a valid license" showed yesterday's
+   * percentages forever with no error anywhere (live 2026-11-19). Recording the
+   * reason lets the console say "quota unavailable" and lets the background
+   * sweep stop re-probing an account that cannot answer.
+   */
+  quotaUnavailable?: QuotaUnavailableState
+}
+
+/**
+ * `no_license` — the backend refused the summary as unlicensed (403).
+ * `auth` — the summary was refused as unauthenticated (401).
+ * `unreachable` — every endpoint failed at the network layer.
+ * `partial` — the summary was missing but per-model fallback data arrived.
+ */
+export type QuotaUnavailableReason = 'no_license' | 'auth' | 'unreachable' | 'partial'
+
+export interface QuotaUnavailableState {
+  reason: QuotaUnavailableReason
+  /** When this state was first observed (not re-stamped by skipped probes). */
+  since: number
+  /** Epoch ms after which an unattended probe may try again. */
+  retryAfter: number
+  /** Short, non-sensitive detail (HTTP status family / PERMISSION_DENIED…). */
+  detail?: string
+}
+
+/**
+ * True when the unattended quota probe must skip this account's summary call.
+ *
+ * Only a licence refusal suppresses: it is the one verdict the network cannot
+ * fix on its own, and re-probing it every hour is pure risk-control exposure.
+ * `auth` stays on the existing authRequired lifecycle, and network faults must
+ * be retried normally.
+ */
+export function quotaSummarySuppressed(account: ManagedAccount, now = Date.now()): boolean {
+  const state = account.quotaUnavailable
+  if (state === undefined) return false
+  if (state.reason !== 'no_license') return false
+  return state.retryAfter > now
 }
 
 /**
@@ -195,9 +241,16 @@ export function accountSupportsModel(
     return accountHasArgon(acc, pool, catalog)
   }
 
-  // If the account has an authoritative discovered catalog from `agy models`:
+  // A discovered catalog is authoritative when it AFFIRMS the model. A
+  // NEGATIVE answer is weaker: `agy models` silently prints a stale/fallback
+  // snapshot when auth was unavailable, and that snapshot used to veto the
+  // account's own quota groups forever (issue #122). Let explicit quota
+  // evidence win over a negative catalog entry.
   if (catalog && catalog.source === 'discovered' && Array.isArray(catalog.models) && catalog.models.length > 0) {
-    return catalog.models.some((m) => modelMatches(clean, m.id))
+    if (catalog.models.some((m) => modelMatches(clean, m.id))) return true
+    const familyQuotaModels = acc.quotas?.[modelFamilyOf(clean)]?.models
+    if (Array.isArray(familyQuotaModels) && familyQuotaModels.some((m) => modelMatches(clean, m.modelId))) return true
+    return false
   }
 
   const family = modelFamilyOf(clean)
@@ -236,6 +289,9 @@ export function shouldPollAccount(account: ManagedAccount): boolean {
   if (!account.enabled) return false
   if (account.authRequired) return false
   const now = Date.now()
+  // An account whose summary endpoint refuses it as unlicensed cannot produce
+  // quota data; probing it every hour only repeats the refusal.
+  if (quotaSummarySuppressed(account, now)) return false
   for (const cd of Object.values(account.cooldowns ?? {})) {
     if (cd && cd.cooldownUntil > now) return false
   }
@@ -268,7 +324,7 @@ export const AUTH_REVERIFY_DELAY_MS = 10 * 60_000
  */
 /** A terminal account ban (Google TOS_VIOLATION) is not a transient auth error. */
 export function isTerminalAuthError(message?: string): boolean {
-  return typeof message === 'string' && /TOS_VIOLATION/i.test(message)
+  return typeof message === 'string' && /\bTOS_VIOLATION\b|violation of Terms of Service/i.test(message)
 }
 
 export function needsAuthReverify(account: ManagedAccount, now = Date.now()): boolean {
@@ -312,6 +368,8 @@ export interface AccountPoolData {
    * are not running anything (that badge showed two accounts at once).
    */
   lastActiveAccountId?: string
+  /** Timestamp of the most recent explicit user account switch/pin (overrides older session stickiness) */
+  manualPinAt?: number
   /** Authoritative currently active account ID computed by the pool scheduler */
   activeAccountId?: string
   /** Detected system-wide or plugin-configured default proxy URL */
