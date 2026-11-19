@@ -6,6 +6,8 @@
 // are unchanged. The only difference is that the single 170-line
 // `startAgyProcess` is organised into small helpers that share one RunState.
 import { spawn, type ChildProcess } from 'node:child_process'
+import { existsSync, statSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { WATCHDOG_GRACE_MS } from '../../common/timeouts.ts'
 import { preemptAgyAutoUpdate } from '../../host/auto-updater.ts'
 import { isCmdShim, windowsQuote } from './bin.ts'
@@ -188,10 +190,28 @@ function createRunState(opts: RunOptions): RunState {
   }
 }
 
+function resolveSpawnCwd(cwd: string | undefined): string {
+  if (cwd) {
+    try {
+      if (existsSync(cwd) && statSync(cwd).isDirectory()) return cwd
+    } catch {
+      // fall through
+    }
+  }
+  const procCwd = process.cwd()
+  try {
+    if (existsSync(procCwd) && statSync(procCwd).isDirectory()) return procCwd
+  } catch {
+    // fall through
+  }
+  return tmpdir()
+}
+
 function spawnAgyChild(opts: RunOptions, env: NodeJS.ProcessEnv, viaCmd: boolean, isNode: boolean): ChildProcess {
+  const spawnCwd = resolveSpawnCwd(opts.cwd)
   return viaCmd
     ? spawn(process.env.ComSpec ?? 'cmd.exe', ['/d', '/s', '/c', [opts.bin, ...opts.args].map(windowsQuote).join(' ')], {
-        cwd: opts.cwd,
+        cwd: spawnCwd,
         env,
         stdio: ['pipe', 'pipe', 'pipe'],
         windowsVerbatimArguments: true,
@@ -199,13 +219,13 @@ function spawnAgyChild(opts: RunOptions, env: NodeJS.ProcessEnv, viaCmd: boolean
       })
     : isNode
       ? spawn(process.execPath, [opts.bin, ...opts.args], {
-          cwd: opts.cwd,
+          cwd: spawnCwd,
           env: nodeScriptEnv(env),
           stdio: ['pipe', 'pipe', 'pipe'],
           windowsHide: true,
         })
       : spawn(opts.bin, opts.args, {
-          cwd: opts.cwd,
+          cwd: spawnCwd,
           env,
           detached: !IS_WIN,
           stdio: ['pipe', 'pipe', 'pipe'],

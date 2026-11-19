@@ -1,3 +1,4 @@
+import { existsSync, statSync } from 'node:fs'
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from '@earendil-works/pi-coding-agent'
 import { createAssistantMessageEventStream } from '@earendil-works/pi-ai'
 import { createHostServices } from '../host/services.ts'
@@ -339,10 +340,20 @@ function emitOutput(ctx: ExtensionCommandContext, text: string, type: 'info' | '
 export default function (pi: ExtensionAPI): void {
   let onAdaptersUpdated = () => {}
   const piSessionCwds = new Map<string, string>()
+  const isExistingDir = (raw: unknown): raw is string => {
+    if (typeof raw !== 'string') return false
+    const trimmed = raw.trim()
+    if (!trimmed || trimmed === '(none)' || trimmed === 'none') return false
+    try {
+      return existsSync(trimmed) && statSync(trimmed).isDirectory()
+    } catch {
+      return false
+    }
+  }
   const recordSessionCwd = (ctx?: ExtensionContext): void => {
     const sid = (ctx as any)?.sessionManager?.getSessionId?.()
     const cwd = (ctx as any)?.cwd || (ctx as any)?.sessionManager?.getCwd?.()
-    if (typeof sid === 'string' && sid.trim() !== '' && typeof cwd === 'string' && cwd.trim() !== '') {
+    if (typeof sid === 'string' && sid.trim() !== '' && isExistingDir(cwd)) {
       piSessionCwds.set(sid, cwd.trim())
     }
   }
@@ -350,7 +361,8 @@ export default function (pi: ExtensionAPI): void {
     const fromTag = (raw: unknown): string | undefined => {
       if (typeof raw !== 'string') return undefined
       const m = raw.match(/<cwd>\s*([^\n<]+?)\s*<\/cwd>/)
-      return m?.[1]?.trim() || undefined
+      const candidate = m?.[1]?.trim()
+      return isExistingDir(candidate) ? candidate : undefined
     }
     const sysMatch = fromTag(context?.systemPrompt)
     if (sysMatch) return sysMatch
@@ -493,9 +505,10 @@ export default function (pi: ExtensionAPI): void {
           const reasoning = typeof options?.reasoning === 'string' && options.reasoning !== 'off' ? options.reasoning : undefined
           const hasSessionId = typeof options?.sessionId === 'string' && options.sessionId.trim() !== ''
           if (hasSessionId) {
-            const resolvedCwd = extractCwdFromPiContext(context) || (lastUiCtx as any)?.cwd
-            if (typeof resolvedCwd === 'string' && resolvedCwd.trim() !== '') {
-              piSessionCwds.set(options.sessionId, resolvedCwd.trim())
+            const uiCwd = (lastUiCtx as any)?.cwd
+            const resolvedCwd = extractCwdFromPiContext(context) || (isExistingDir(uiCwd) ? uiCwd.trim() : undefined)
+            if (resolvedCwd) {
+              piSessionCwds.set(options.sessionId, resolvedCwd)
             }
           }
           const isCompactionCall =
