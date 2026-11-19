@@ -418,6 +418,7 @@ export default function (pi: ExtensionAPI): void {
   let lastQuotaRefreshAt = 0
   let bgQuotaRefreshing = false
   let bgQuotaTimer: ReturnType<typeof setInterval> | null = null
+  let lastPoolSweepAt = 0
 
   const maybeRefreshActiveQuotaInBackground = async (force = false) => {
     if (bgQuotaRefreshing) return
@@ -429,9 +430,16 @@ export default function (pi: ExtensionAPI): void {
     if (!activeAcc) return
     bgQuotaRefreshing = true
     try {
-      await services.quota.refreshAccountQuota(activeAcc, force).catch((err) => {
-        warnThrottled('bg-quota', 'background quota refresh failed', err)
-      })
+      if (!force && now - lastPoolSweepAt >= 180_000) {
+        await services.quota.refreshAllQuotas(false).catch((err) => {
+          warnThrottled('bg-quota', 'background pool quota refresh failed', err)
+        })
+        lastPoolSweepAt = Date.now()
+      } else {
+        await services.quota.refreshAccountQuota(activeAcc, force).catch((err) => {
+          warnThrottled('bg-quota', 'background quota refresh failed', err)
+        })
+      }
       lastQuotaRefreshAt = Date.now()
       publishAgyUi(lastUiCtx, services)
     } finally {
@@ -512,17 +520,16 @@ export default function (pi: ExtensionAPI): void {
             }
           }
           const isCompactionCall =
-            !hasSessionId &&
             activeTools === undefined &&
             typeof context?.systemPrompt === 'string' &&
-            /summariz|compaction/i.test(context.systemPrompt)
+            /context summarization assistant|ONLY output the structured summary|summariz|compaction/i.test(context.systemPrompt)
           const effectiveTools = isCompactionCall ? [] : activeTools
           const iter = services.adapter.stream({
             provider: AGY_PROVIDER_ID,
             model: model.id,
             messages: dshMessages as any,
             ...(effectiveTools !== undefined ? { tools: effectiveTools as any } : {}),
-            ...(hasSessionId ? { sessionId: options.sessionId as any } : {}),
+            ...(hasSessionId && !isCompactionCall ? { sessionId: options.sessionId as any } : {}),
             ...(isCompactionCall
               ? {
                   purpose: 'compaction' as const,
@@ -888,7 +895,9 @@ export default function (pi: ExtensionAPI): void {
           emitOutput(ctx, `Account not found: ${rest[0]}`, 'error')
           return
         }
-        services.pool.setActiveAccount(target.id, 'google')
+        for (const fam of ['google', 'anthropic', 'openai', 'argon'] as const) {
+          services.pool.setActiveAccount(target.id, fam)
+        }
         registerAgyProvider()
         publishAgyUi(ctx, services)
         void services.catalog.forceRefreshAndNotify(target.id).catch((err) => {
