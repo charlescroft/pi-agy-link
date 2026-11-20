@@ -386,3 +386,66 @@ test('constructing does not spawn agy and stays inside the temp HOME', (t) => {
   assert.equal(existsSync(marker), false, 'agy was not spawned during construction or bin resolution')
   assert.deepEqual(services.bridgeState, { bridge: null, restores: [] })
 })
+
+test('issue #139: activeCwds reads the session store list() (DSH has no values())', (t) => {
+  sandbox(t)
+  // DSH's SessionStore exposes list()/get(id); `values()` never existed, so the
+  // old cast made this always empty and every workspace file was refused by
+  // /open and /media with "path outside allowed workspace roots".
+  const sessions = {
+    get: () => undefined,
+    list: () => [
+      { header: { cwd: 'C:\\work\\alpha' } },
+      { header: { cwd: 'C:\\work\\beta' } },
+      { header: { cwd: 'C:\\work\\alpha' } },
+      { header: {} },
+    ],
+  }
+  const services = createHostServices(asCtx({ get: (k: string) => (k === 'sessions' ? sessions : undefined) }), {})
+  assert.deepEqual(services.activeCwds(), ['C:\\work\\alpha', 'C:\\work\\beta'])
+})
+
+test('issue #139: activeCwds still works when a host only exposes values()', (t) => {
+  sandbox(t)
+  const sessions = { get: () => undefined, values: () => [{ header: { cwd: '/work/legacy' } }] }
+  const services = createHostServices(asCtx({ get: (k: string) => (k === 'sessions' ? sessions : undefined) }), {})
+  assert.deepEqual(services.activeCwds(), ['/work/legacy'])
+})
+
+test('issue #139: activeCwds degrades to empty when the sessions service is unusable', (t) => {
+  sandbox(t)
+  const throwing = { get: () => undefined, list: () => { throw new Error('boom') } }
+  const services = createHostServices(asCtx({ get: (k: string) => (k === 'sessions' ? throwing : undefined) }), {})
+  assert.deepEqual(services.activeCwds(), [])
+})
+
+test('global ModelCatalog discovery skips disabled primaryAccountId and rejects when all accounts are disabled', async (t) => {
+  const root = sandbox(t)
+  const fakeBin = join(root, 'agy')
+  writeFileSync(fakeBin, [
+    '#!/bin/sh',
+    'echo "home=$HOME" >> "' + join(root, 'probe-homes.log') + '"',
+    'echo "gemini-3.8-flash-low\tGemini 3.8 Flash (Low)"',
+    'echo "gemini-3.8-flash-high\tGemini 3.8 Flash (High)"',
+  ].join('\n'))
+  chmodSync(fakeBin, 0o755)
+  process.env.DSH_AGY_BIN = fakeBin
+
+  const services = createHostServices(asCtx({}), {})
+  const primary = services.pool.getAccounts().find((a) => a.systemHome)!
+  const secondary = services.pool.createAccountSlot('sec')
+  services.pool.setAccountEnabled(primary.id, false)
+
+  await services.catalog.forceRefresh()
+  const logged = readFileSync(join(root, 'probe-homes.log'), 'utf8').trim().split('\n')
+  assert.equal(logged.at(-1), `home=${secondary.dir}`, 'disabled primary must be skipped in favor of enabled secondary')
+  assert.equal(
+    services.catalog.getAccountCatalog(secondary.id)?.models.some((m) => m.id === 'gemini-3.8-flash'),
+    true,
+    'global discovery must also populate the probed account catalog so accountSupportsModel sees it immediately',
+  )
+
+  services.pool.setAccountEnabled(secondary.id, false)
+  await services.catalog.forceRefresh()
+  assert.match(services.catalog.get().lastError ?? '', /no enabled account available/)
+})

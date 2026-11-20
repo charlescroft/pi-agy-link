@@ -35,6 +35,17 @@ export interface PluginConfig {
    * loop that keeps printing can run unbounded (issue #92).
    */
   maxTurnMinutes: number
+  /**
+   * Grace (minutes) before the `root agent idle; waiting for N background
+   * task(s)` reaper kills the agy process tree. agy prints that line while it
+   * legitimately waits for a build, integration test or Docker job it launched;
+   * the former hard-coded 5 s killed those turns and surfaced as
+   * `agy stream ended without a result event` (issue #144). Default 10 minutes,
+   * which stays below the normal generation idle budget (`timeoutMs`, at least
+   * 15 min) so a real orphan is still reclaimed. 0 disables the reaper: the
+   * activity watchdog and `maxTurnMinutes` then bound the turn alone.
+   */
+  idleGraceMinutes: number
   /** Hard cap (minutes) on the credential-slot wait before release+retry; 0 = unlimited. */
   dispatchTimeoutMinutes: number
   /** Extra dispatch attempts after a credential-slot hard-cap timeout. */
@@ -252,6 +263,7 @@ export function defaultConfig(): PluginConfig {
     timeoutMs: 600_000,
     longToolIdleMinutes: 240,
     maxTurnMinutes: 0,
+    idleGraceMinutes: 10,
     /**
      * Hard cap (minutes) on waiting for the Windows credential slot before the
      * dispatch releases, backs off and retries (dispatchRetries). Each attempt
@@ -323,10 +335,10 @@ export function defaultConfig(): PluginConfig {
     // turn, so the default must never silently start billing a user.
     autoTranslate: false,
     translateModel: PREFERRED_GEMINI_FLASH,
-    // Medium is the speed/quality compromise measured on real agy: low ≈ 12s,
-    // medium ≈ 33s, high ≈ 45s for the same 964-char reply (most of the low
-    // figure is agy's own ~9s startup). high made a frequent action feel broken.
-    translateEffort: 'medium',
+    // Default to 'low': real agy measurements give ~12s cold / ~4-9s warm at low
+    // vs ~33s at medium and ~45s at high, and plain-language rewriting needs
+    // conversational clarity rather than multi-step chain-of-thought reasoning.
+    translateEffort: 'low',
     translateTargetLanguage: '中文（简体）',
     translateMaxChars: 8_000,
     translateMaxTokens: 4_096,

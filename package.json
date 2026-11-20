@@ -1,6 +1,6 @@
 {
   "name": "pi-agy-link",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Google Antigravity (agy CLI) provider & multi-account pool extension for Pi Coding Agent and PiCrust.",
   "type": "module",
   "license": "MIT",

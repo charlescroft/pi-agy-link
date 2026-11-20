@@ -7,15 +7,16 @@ import { classifyEvent } from '../src/host/parser.ts'
 import { resolveConfig } from '../src/common/config.ts'
 
 test('startAgyProcess terminates on root agent idle grace period and sets idleGraceTerminated', async () => {
-  // Simulate agy child that prints root agent idle on stderr and then sits blocked
+  // Simulate agy child that prints root agent idle (0 remaining tasks) on stderr and then sits blocked
   const script = `
-    process.stderr.write('root agent idle; waiting up to 240m0s for 1 background task(s)\\n');
+    process.stderr.write('root agent idle; waiting up to 240m0s for 0 background task(s)\\n');
     setTimeout(() => {}, 60000);
   `
   const proc = startAgyProcess({
     bin: process.execPath,
     args: ['-e', script],
     timeoutMs: 30_000,
+    idleGraceMs: 60,
   })
   const outcome = await proc.outcome
   assert.equal(outcome.idleGraceTerminated, true)
@@ -23,8 +24,11 @@ test('startAgyProcess terminates on root agent idle grace period and sets idleGr
 })
 
 test('startAgyProcess also matches root agent idle waiting without up to duration', async () => {
+  // The count decides: 0 means nothing is left, so the reaper reclaims the
+  // child after its grace. (A positive count must NOT be reaped — that is
+  // issue #144 and is covered in test/issue144-idle-grace.test.ts.)
   const script = `
-    process.stderr.write('root agent idle; waiting for 1 background task(s) to finish\\n');
+    process.stderr.write('root agent idle; waiting for 0 background tasks to finish\\n');
     setTimeout(() => {}, 60000);
   `
   const proc = startAgyProcess({
@@ -113,5 +117,19 @@ test('startAgyProcess does not reset watchdog on background stderr noise', async
   })
   const outcome = await proc.outcome
   assert.equal(outcome.timedOut, true, 'background noise must not prevent timeout')
+})
+
+test('RunRecording.hasConsumableResultFrom ignores bare error results so idleGraceTerminated and continuation retry recover cleanly', async () => {
+  const { RunRecording } = await import('../src/host/recording.ts')
+  const rec = new RunRecording('run-bare-err')
+  rec.append({ kind: 'init', conversationId: 'c1', model: 'gemini-4-neon', raw: {} })
+  rec.append({ kind: 'result', conversationId: 'c1', ok: false, response: '', error: 'signal: terminated', usage: {}, raw: {} })
+  assert.equal(rec.hasResult, true)
+  assert.equal(rec.hasConsumableResultFrom(0), false, 'bare error result is NOT consumable by EventMapper')
+
+  rec.append({ kind: 'result', conversationId: 'c1', ok: true, response: 'recovered reply', usage: {}, raw: {} })
+  assert.equal(rec.hasConsumableResultFrom(0), true)
+  assert.equal(rec.hasConsumableResultFrom(2), true)
+  assert.equal(rec.hasConsumableResultFrom(3), false)
 })
 

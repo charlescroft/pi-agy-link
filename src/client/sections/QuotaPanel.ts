@@ -4,6 +4,7 @@
 // quota visuals from one implementation.
 
 import type { ManagedAccount } from '../../common/pool-types.ts';
+import { is5hQuotaBenched, isWeeklyQuotaBenched } from '../../common/quota-bench.ts';
 import { computeQuotaPacing } from '../../common/quota-pacing.ts';
 import type { AgyLocaleKey } from '../locales.ts';
 import { h } from '../react.ts';
@@ -126,7 +127,10 @@ const renderLine = (
 	rawReset?: string,
 	isRefreshing = false,
 ): unknown => {
-	const isShimmer = percent < 0 || isRefreshing;
+	// Only animate shimmer while an active quota refresh is running — never pin
+	// infinite animations on every static `—` (unreported) bar, which caused
+	// Chromium/Electron scroll flicker across multi-account lists.
+	const isShimmer = isRefreshing;
 	const { pacing, tooltipText, showTimeMarker, markerLeftPct } = describePacing(t, windowDurationMs, resetStr, rawFraction, rawReset);
 	return h('div', { className: 'agy-quota-line', style: { display: 'flex', alignItems: 'center', fontSize: '11.5px', margin: '2px 0' } },
 		h('span', { style: { width: '64px', color: 'var(--agy-text-window-label)', fontSize: '11px', fontWeight: 600, flexShrink: 0, whiteSpace: 'nowrap' } }, windowName),
@@ -209,26 +213,31 @@ export function renderFamilyQuotaBar(
 ): unknown {
 	const info = acc.quotas[familyKey];
 	const cd = acc.cooldowns[familyKey];
-	const inCooldown = cd && cd.cooldownUntil > Date.now();
+	const now = Date.now();
+	const inCooldown = Boolean(cd && cd.cooldownUntil > now);
+	const clearedAt = acc.quotaGateClearedAt?.[familyKey];
+	const benched5h = !inCooldown && is5hQuotaBenched(info, clearedAt, now);
+	const benchedWeekly = !inCooldown && isWeeklyQuotaBenched(info, clearedAt, now);
 
 	// 5-Hour limit
 	const has5h = typeof info?.remainingFraction === 'number' && Number.isFinite(info.remainingFraction);
 	const pct5h = has5h ? Math.max(0, Math.min(100, Math.round(info!.remainingFraction! * 100))) : -1;
-	const cdNote = inCooldown ? t('account.localCooldown') : '';
+	const cdNote5h = inCooldown ? t('account.localCooldown') : benched5h ? t('account.quotaLimitedNote') : '';
 	const w5h = formatQuotaWindow(t, info?.resetTime);
 	const expiredFull5h = w5h.expired && has5h && pct5h >= 100;
 
 	// Weekly limit
 	const hasWeekly = typeof info?.weeklyFraction === 'number' && Number.isFinite(info.weeklyFraction);
 	const pctWeekly = hasWeekly ? Math.max(0, Math.min(100, Math.round(info!.weeklyFraction! * 100))) : -1;
+	const cdNoteWeekly = benchedWeekly ? t('account.quotaLimitedNote') : '';
 	const wWeekly = formatQuotaWindow(t, info?.weeklyResetTime);
 	const expiredFullWeekly = wWeekly.expired && hasWeekly && pctWeekly >= 100;
 
 	const c5h = getQuotaColors(pct5h);
 	const cWeekly = getQuotaColors(pctWeekly);
 
-	const note5h = w5h.resetText ? w5h.resetText + cdNote : expiredFull5h ? t('quota.windowReset') + cdNote : cdNote.replace(/^ · /, '');
-	const noteWeekly = wWeekly.resetText ? wWeekly.resetText : expiredFullWeekly ? t('quota.windowReset') : '';
+	const note5h = w5h.resetText ? w5h.resetText + cdNote5h : expiredFull5h ? t('quota.windowReset') + cdNote5h : cdNote5h.replace(/^ · /, '');
+	const noteWeekly = wWeekly.resetText ? wWeekly.resetText + cdNoteWeekly : expiredFullWeekly ? t('quota.windowReset') + cdNoteWeekly : cdNoteWeekly.replace(/^ · /, '');
 
 	return h('div', { style: { margin: '4px 0', padding: '5px 8px', background: 'var(--agy-bg-subbox)', borderRadius: '6px', border: '1px solid var(--agy-border-box)' } },
 		h('div', { style: { display: 'flex', alignItems: 'center', gap: '5px', fontWeight: 700, fontSize: '12px', marginBottom: '3px', color: 'var(--agy-text-primary)' } },
@@ -265,28 +274,43 @@ export function renderQuotaUnavailableNote(
 ): unknown {
 	const state = acc.quotaUnavailable;
 	if (!state) return null;
-	const newest = Math.max(0, ...Object.values(acc.quotas).map((q) => q?.updatedAt ?? 0));
+	const stamps = Object.values(acc.quotas).map((q) => q?.updatedAt ?? 0).filter((ts) => ts > 0);
+	const oldest = stamps.length > 0 ? Math.min(...stamps) : 0;
 	const reason = t(`quota.unavailable.${state.reason}` as AgyLocaleKey);
+	const isCritical = state.reason === 'validation_required' || state.reason === 'tos_violation';
+	const toneText = isCritical ? 'var(--agy-quota-low-text)' : 'var(--agy-quota-med-text)';
+	const toneBg = isCritical ? 'var(--agy-quota-low-bg)' : 'var(--agy-quota-med-bg)';
+	const toneBorder = isCritical ? 'var(--agy-quota-low-border)' : 'var(--agy-quota-med-border)';
+	const actionUrl = typeof state.actionUrl === 'string' && state.actionUrl.startsWith('https://') ? state.actionUrl : undefined;
 	return h('div', {
 		key: 'agy-quota-unavailable',
 		style: {
 			display: 'flex',
 			alignItems: 'center',
+			flexWrap: 'wrap',
 			gap: '5px',
 			margin: '2px 0 5px 0',
 			padding: '3px 7px',
 			borderRadius: '6px',
 			fontSize: '11px',
 			fontWeight: 600,
-			color: 'var(--agy-quota-med-text)',
-			background: 'var(--agy-quota-med-bg)',
-			border: '1px solid var(--agy-quota-med-border)',
+			color: toneText,
+			background: toneBg,
+			border: `1px solid ${toneBorder}`,
 		},
 	},
-		uiIcon('alert', 10, 'var(--agy-quota-med-text)'),
+		uiIcon('alert', 10, toneText),
 		h('span', null, `${t('quota.unavailableTitle')} · ${reason}`),
-		newest > 0
-			? h('span', { style: { fontWeight: 500, opacity: 0.85 } }, t('quota.unavailableSince', { time: formatSnapshotStamp(newest) }))
+		actionUrl
+			? h('a', {
+				href: actionUrl,
+				target: '_blank',
+				rel: 'noopener noreferrer',
+				style: { color: toneText, textDecoration: 'underline', fontWeight: 700 },
+			}, t('quota.verifyNow'))
+			: null,
+		oldest > 0
+			? h('span', { style: { fontWeight: 500, opacity: 0.85 } }, t('quota.unavailableSince', { time: formatSnapshotStamp(oldest) }))
 			: null,
 	);
 }

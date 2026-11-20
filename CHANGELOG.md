@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.2.0 (2026-11-20)
+
+### English
+
+- **Sync upstream `dsh-agy-link` (`v0.6.41` → `v0.6.49`)**:
+  - **Fix(quota): single source of truth for quota admission across scheduler and UI (`v0.6.49`)**, and suppress refused summaries on free-tier accounts by API status instead of retrying hourly (issues #137, #141).
+  - **Fix(idle-grace): configurable tool-aware background-wait grace, trusting agy's own background-task count, handling waiting-up-to counts, empty error results, and dead continuations (PR #146, #147; issue #144).**
+  - **Features & Perf: warm translation worker pool, 0-redundancy account models (`common/account-models.ts`), verification banner, scroll-flicker fixes, and Node stdio bridge on Electron hosts (issue #140).**
+
+### 中文
+
+- **跟进上游 `dsh-agy-link`（`v0.6.41` → `v0.6.49`）**：
+  - **修复(quota)：统一调度器与 UI 的配额准入单一数据源（`v0.6.49`）**，并依据 API 状态抑制免费版账号被拒摘要的无效小时级重试（issues #137, #141）。
+  - **修复(idle-grace)：支持可配置且感知工具的后台等待宽限期、信任 agy 自身后台任务计数、正确处理 `waiting up to` 计数、空错误结果与失效续传（PR #146, #147; issue #144）。**
+  - **特性与性能：预热翻译工作池、零冗余账号模型存储（`common/account-models.ts`）、验证提示横幅、滚动闪烁修复及 Electron 宿主上的 Node stdio 桥接（issue #140）。**
+
 ## 1.1.0 (2026-11-18)
 
 ### English

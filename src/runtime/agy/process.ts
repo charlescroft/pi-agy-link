@@ -11,6 +11,7 @@ import { tmpdir } from 'node:os'
 import { WATCHDOG_GRACE_MS, IDLE_BACKGROUND_GRACE_MS } from '../../common/timeouts.ts'
 import { preemptAgyAutoUpdate } from '../../host/auto-updater.ts'
 import { isCmdShim, windowsQuote } from './bin.ts'
+import { backgroundTasksFrom } from './idle-line.ts'
 import { makeLineDecoder, consoleOutputEncoding } from './console.ts'
 import { nodeScriptEnv, withAgyQuietEnv } from './env.ts'
 
@@ -190,6 +191,8 @@ interface RunState {
   idleGraceExempt: boolean
   /** Last observed state was the idle line; cleared by new stdout. */
   idleObserved: boolean
+  /** agy's own count of background tasks it is still waiting on (issue #144). */
+  idleBackgroundTasks: number | null
 }
 
 function createRunState(opts: RunOptions): RunState {
@@ -209,6 +212,7 @@ function createRunState(opts: RunOptions): RunState {
     idleGraceTerminated: false,
     idleGraceExempt: false,
     idleObserved: false,
+    idleBackgroundTasks: null,
   }
 }
 
@@ -343,7 +347,15 @@ function clearIdleGrace(state: RunState): void {
  */
 function armIdleGrace(child: ChildProcess, opts: RunOptions, state: RunState): void {
   if (state.idleGraceTimer !== null || state.settled) return
+  // agy reports how many pieces of work it is still waiting on. A positive count
+  // is proof the wait is legitimate, so terminating after ANY grace would kill a
+  // healthy turn (issue #144). The activity watchdog and maxTurnMinutes still
+  // bound a genuinely orphaned wait.
+  if ((state.idleBackgroundTasks ?? 0) > 0) return
   const graceMs = opts.idleGraceMs ?? IDLE_BACKGROUND_GRACE_MS
+  // `idleGraceMinutes: 0` disables the reaper; the activity watchdog and
+  // maxTurnMs still bound the turn.
+  if (graceMs <= 0) return
   state.idleGraceTimer = setTimeout(() => {
     state.idleGraceTimer = null
     if (state.settled) return
@@ -393,9 +405,10 @@ function attachOutputStreams(
       if (/root agent idle;\s*waiting/i.test(text)) {
         // agy finished its prompt turn and root agent is now idle, waiting up
         // to hours for background tasks (e.g. dev servers or stuck GUI dialogs).
-        // Give background tasks a brief grace period to finish, then terminate
-        // so the turn flushes and settles instead of hanging indefinitely.
+        // The count it prints says whether that wait is legitimate (issue #144).
         state.idleObserved = true
+        const waiting = backgroundTasksFrom(text)
+        if (waiting !== null) state.idleBackgroundTasks = waiting
         armIdleGrace(child, opts, state)
       } else if (opts.stderrKeepalive && !isBackgroundStderrNoise(text)) {
         refreshWatchdog()
