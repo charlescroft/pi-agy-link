@@ -3,27 +3,103 @@ import { isAbsolute } from 'node:path'
 import type { CommandResult } from '@deepseek-ai/dsh-commands'
 import { formatTokenCount } from '../../common/compaction.ts'
 import { parseCompactLimitValue, resolveEffectiveCompactLimit } from '../../common/compact-threshold.ts'
+import { isEffortId, REASONING_EFFORTS } from '../../common/reasoning.ts'
 import { credentialSlotMutex, fastPathRunCount } from '../credential-slot.ts'
 import { err, ok, type CommandContext, type CommandDeps } from './shared.ts'
 
 export function handleConfig(deps: CommandDeps, ctx: CommandContext): CommandResult {
-  const { sub, arg } = ctx
+  const { sub, arg, raw } = ctx
 
   if (sub === 'mode') {
-    if (!['skip', 'plan', 'accept-edits'].includes(arg)) {
-      return err('usage: /agy mode <skip|plan|accept-edits>')
+    if (arg === '') {
+      return ok(`Current permission mode: **${deps.cfg().permissionMode}** (usage: /agy mode <skip|auto|plan|accept-edits>)`)
+    }
+    if (!['skip', 'auto', 'plan', 'accept-edits'].includes(arg)) {
+      return err('usage: /agy mode <skip|auto|plan|accept-edits>')
     }
     deps.setOverride('permissionMode', arg)
     return ok('Permission mode set to **' + arg + '** — effective next turn.')
   }
 
-  if (sub === 'effort') {
-    if (!['low', 'medium', 'high', 'xhigh', 'default'].includes(arg)) {
-      return err('usage: /agy effort <low|medium|high|xhigh|default>')
+  if (sub === 'sandbox') {
+    if (arg === '') {
+      return ok(`Current terminal sandbox: **${deps.cfg().sandbox ? 'on' : 'off'}** (usage: /agy sandbox <on|off>)`)
     }
-    deps.setOverride('defaultEffort', arg === 'default' ? '' : arg)
+    if (arg !== 'on' && arg !== 'off') {
+      return err('usage: /agy sandbox <on|off>')
+    }
+    const on = arg === 'on'
+    deps.setOverride('sandbox', on)
+    return ok(`Terminal sandbox set to **${arg}** — effective next turn.`)
+  }
+
+  if (sub === 'agent') {
+    const rawAgent = (raw ?? '').trim().replace(/^(?:\/agy\s+)?agent\s*/i, '').trim()
+    const target = rawAgent !== '' ? rawAgent : arg
+    if (target === '') {
+      const cur = deps.cfg().agent.trim()
+      return ok('Current custom agent: **' + (cur !== '' ? cur : '(default)') + '** (usage: /agy agent <name|off>)')
+    }
+    if (target === 'off' || target === 'clear' || target === 'default') {
+      deps.setOverride('agent', '')
+      return ok('Custom agent cleared (back to default agy agent) — effective next turn.')
+    }
+    deps.setOverride('agent', target)
+    return ok(`Custom agent set to **${target}** — effective next turn.`)
+  }
+
+  if (sub === 'settings') {
+    const rawVal = (raw ?? '').trim().replace(/^(?:\/agy\s+)?settings\s*/i, '').trim()
+    const target = rawVal !== '' ? rawVal : arg
+    if (target === '' || target === 'show') {
+      const cur = deps.cfg().agySettings.trim()
+      return ok('Current `--settings` override: ' + (cur !== '' ? '`' + cur + '`' : '*(none)*'))
+    }
+    if (target === 'off' || target === 'clear') {
+      deps.setOverride('agySettings', '')
+      return ok('Cleared `--settings` override.')
+    }
+    if (target.startsWith('{')) {
+      try {
+        const parsed = JSON.parse(target)
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+          return err('inline --settings JSON must be a plain object')
+        }
+      } catch (e) {
+        return err('invalid inline JSON for --settings: ' + (e instanceof Error ? e.message : String(e)))
+      }
+    }
+    deps.setOverride('agySettings', target)
+    return ok('`--settings` override updated — effective next turn.')
+  }
+
+  if (sub === 'transport') {
+    const cur = deps.cfg().transport
+    if (arg === '' || arg === 'status') {
+      const st = deps.acpStatus?.()
+      const extra = st ? ` (ACP active processes: ${st.activeProcesses}, sessions: ${st.sessions})` : ''
+      return ok(`Current transport: **${cur}**${extra} (usage: /agy transport <cli|acp>)`)
+    }
+    const mode = arg.toLowerCase()
+    if (mode !== 'cli' && mode !== 'acp') {
+      return err('usage: /agy transport <cli|acp|status>')
+    }
+    deps.setOverride('transport', mode)
+    return ok(`Transport set to **${mode}** — effective next turn.`)
+  }
+
+  if (sub === 'effort') {
+    if (arg === '') {
+      const cur = deps.cfg().defaultEffort || 'model default'
+      return ok(`Current default effort: **${cur}** (usage: /agy effort <${REASONING_EFFORTS.join('|')}|default>)`)
+    }
+    const normalized = arg.toLowerCase()
+    if (normalized !== 'default' && !isEffortId(normalized)) {
+      return err(`usage: /agy effort <${REASONING_EFFORTS.join('|')}|default>`)
+    }
+    deps.setOverride('defaultEffort', normalized === 'default' ? '' : normalized)
     deps.notifyPicker?.()
-    return ok('Default effort set to **' + (arg === 'default' ? 'model default' : arg) + '**.')
+    return ok('Default effort set to **' + (normalized === 'default' ? 'model default' : normalized) + '**.')
   }
 
   if (sub === 'dispatch' || sub === 'dispatch-retries') {
@@ -92,14 +168,16 @@ export function handleConfig(deps: CommandDeps, ctx: CommandContext): CommandRes
   }
 
   if (sub === 'workspace') {
-    if (arg === '') return ok('Current workspace: ' + (deps.cfg().workspaceRoot !== '' ? deps.cfg().workspaceRoot : '(session cwd / process cwd)'))
-    if (arg === 'default' || arg === 'clear') {
+    const rawPath = (raw ?? '').trim().replace(/^(?:\/agy\s+)?workspace\s*/i, '').trim()
+    const target = rawPath !== '' ? rawPath : arg
+    if (target === '') return ok('Current workspace: ' + (deps.cfg().workspaceRoot !== '' ? deps.cfg().workspaceRoot : '(session cwd / process cwd)'))
+    if (target === 'default' || target === 'clear') {
       deps.setOverride('workspaceRoot', '')
       return ok('Workspace reset to session cwd / process cwd.')
     }
-    if (!isAbsolute(arg)) return err('workspace must be an absolute path (or `default` to clear)')
-    deps.setOverride('workspaceRoot', arg)
-    return ok('Workspace set to **' + arg + '** — effective next turn.')
+    if (!isAbsolute(target)) return err('workspace must be an absolute path (or `default` to clear)')
+    deps.setOverride('workspaceRoot', target)
+    return ok('Workspace set to **' + target + '** — effective next turn.')
   }
 
   if (sub === 'compact-limit') {

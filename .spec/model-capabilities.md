@@ -50,9 +50,14 @@ DSH 前端 `ModelCatalogDirectory.load()` 在首次加载（`status === 'ready'`
    - **OAuth 登录 / 重登 / 导入必刷新**：`PoolAuthFlow.finishWithCode`（全部三个分支：新账号、重认证、主账号）与 `importRefreshToken` 完成后均触发目录刷新与 `notifyPicker()`。
    - **配置与 CLI 命令同步**：`/config` 修改影响可见模型集合的键（`hiddenModels`、`poolWideCatalog`、`enabled`，其中 `enabled` 通过 `AdapterRegistrationHandle.replace()` 动态挂载/卸载路由）以及 `/agy` 账号管理子命令（含 `/agy use <id>`、`/agy effort`）均同步调用 `notifyPicker()`；不影响 `listModels()` 列表集合的键（如 `defaultEffort`、`translateModel`）保持静默（遵循 `test/http-contract.test.ts` 与 `test/lifecycle.test.ts` 契约）。
 
-### 4.3 手动切号优先于旧会话粘性（`manualPinAt`）
-- `AccountPoolData.manualPinAt` 记录用户显式切号（UI「设为当前使用」、设为主账号、重排、`/agy use`）的时间戳。
-- `selectSessionAccount()` 中：若用户显式切号发生在旧会话绑定更新时间之后（`manualPinAt > binding.updatedAt`），该会话**立即跟随用户新选账号**，而不再被 `stickyAccount` 拉回旧账号；且 `stickyAccount` 命中旧会话亲和时**绝不反向覆写全局 `activeAccountIds`**（仅调用 `markAccountActive`）。
+### 4.3 按模型族作用域与手动切号优先于同族旧会话粘性（`manualPinAtByFamily`）
+- 账号池活跃指针、冷却与预热严格按**模型族**（`google` Gemini / `argon` Argon / `anthropic` Claude / `openai` GPT-OSS）隔离：
+  - `setActiveAccount(id, family)` 与 `/pool/set-active` 仅修改目标模型族指针（并更新 `AccountPoolData.manualPinAtByFamily[family]`），绝不越界覆盖其他模型族的当前账号；`/agy use <id> [family]` 支持指定模型族（默认 `google`）。
+  - `recordFailure()` / `advanceAccount()` / `updateAccountQuotas()` 对主动指针的轮换或自愈均按模型族边界校验（`lastActiveAccountId` 仅服务 `google` 族兜底，绝不跨族劫持 `argon` / `anthropic` / `openai`）。
+  - `getPoolData().resolvedActiveAccountIds` 预计算每个模型族当前真正命中的可用账号 ID，UI 将「当前使用」「设为当前」「冷却中」「清除冷却」直接嵌入对应模型族分组内，消除账号级冗余状态标签与横幅。
+- `selectSessionAccount()` 中：
+  - `stickyAccount()` 仅在会话上次绑定模型属于同一 `modelFamilyOf(b.model)` 时复用同族粘性账号（例如会话 A 选 `gemini-pro-orchestrator-neon` 在 `google` 池内轮换，会话 B 选 `gemini-4-argon` 在 `argon` 池内独立轮换，互不串扰）。
+  - 若用户对该模型族显式切号发生在旧会话绑定更新时间之后（`Math.max(manualPinAt, manualPinAtByFamily[family]) > binding.updatedAt`），该同族会话**立即跟随用户新选账号**，不再被旧会话亲和拉回；且 `stickyAccount` 命中旧会话亲和时**绝不反向覆写全局其他族的 `activeAccountIds`**（`lastActiveAccountId` 亦受 `family === 'google' || !lastActiveAccountId` 守卫）。
 - `syncSessionModel()` 兼容 `dsh-agent` 真实接口 `(await ctx.agents.resolve(sessionId))?.model?.select(...)` 与持久事件追加。
 
 ## 5. `--effort` 档位拒绝自愈（issue #67 / #115）
@@ -64,3 +69,15 @@ DSH 前端 `ModelCatalogDirectory.load()` 在首次加载（`status === 'ready'`
 
 - `test/models.test.ts`：折叠规则、按账号独立 single-flight 并发刷新、`name`/`efforts` 变更广播、`agy models` 未登录兜底输出不误标 `discovered`、`accountHasArgon` 目录优先于折叠 REST 列表。
 - `test/pool.test.ts` / `test/pool-auth.test.ts` / `test/http-contract.test.ts`：切号单次触发不双倍 spawn、429 自动切号广播、OAuth `finishWithCode` 广播、`manualPinAt` 优先于旧会话 `stickyAccount`、`/config` 修改 `defaultEffort`/`enabled` 同步刷新选择器。
+
+## 模型可见性是允许清单 + 拒绝清单两层（PR #149 / #131）
+
+选择器展示哪些模型，由三层共同决定，顺序不可颠倒：
+
+1. **目录来源**：`agy models` 发现的目录（顺序与命名权威）+ 从账号配额快照折叠出的模型（`src/domain/models/quota-catalog.ts`，纯函数）。配额行只**补充**目录里没有的模型，绝不覆盖 CLI 的结论——没有 CLI 的宿主正是靠它才有可用列表。
+2. **允许清单 `selectedModels`**：空数组 = 无限制（默认，保证升级不破坏）；非空 = 只显示这些 id。
+3. **拒绝清单 `hiddenModels`**：最后应用，**永远胜出**，让运维不必修改勾选状态就能临时隐藏某个模型。
+
+- **解析（`resolveModel`）不受可见性过滤**：只有 `listModels`（选择器）过滤。用户取消勾选一个正在被会话使用的模型，该会话必须继续工作——把可见性当成可用性会打断进行中的任务。
+- 作用域：默认按**活跃账号**的配额快照合并（与它显示的 `agy models` 目录同源，避免两个来源互相矛盾）；`poolWideCatalog` 开启时按整池枚举。
+- 锚点：`test/quota-catalog.test.ts`、`test/models-panel.test.ts`、`test/models.test.ts`、`test/config-precedence.test.ts`。

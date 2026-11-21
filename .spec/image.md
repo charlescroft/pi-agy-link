@@ -4,9 +4,11 @@
 
 ## 1. 目标与边界
 
-- 目标：headless 用户不进交互式会话，也能用 `dsh-agy-image` 生成图片，并拿到**经过校验**的产物与元数据。
-- **不提供 HTTP API**：DSH 已有 agent/工具面；再开一个 `/plugins/agy-link/image` 只是多一份暴露面。CLI 是唯一新增入口。
-- **不另写 spawn/选号**：CLI 实例化插件真实的 `AgyAdapter`（`purpose:'image'`），账号选择、额度冷却、换号、代理、失败分类、`--effort` 被拒重放全部复用主流程。
+- 目标：
+  1. headless 用户不进交互式会话，也能用 `dsh-agy-image` 生成图片，并拿到**经过校验**的产物与元数据；
+  2. 对话内通过 `agy_image` DSH 工具（受 `imageTool` 开关控制）与 `/agy image`（别名 `/agy img`）斜杠命令提供同等生图/改图能力，并适配新版 `image-generator` 子代理卡片预览（`src/client/toolview/card-model.ts`）。
+- **不提供 HTTP API**：不再另开 `/plugins/agy-link/image` 路由；CLI（`dsh-agy-image`）、工具（`agy_image`）与斜杠命令（`/agy image`）全部共享同一个 `ImageService`。
+- **不另写 spawn/选号**：全部通过 `ImageService` + `runViaAdapter`（`src/features/image/adapter-runner.ts`）驱动真实的 `AgyAdapter`（`purpose:'image'`），账号选择、额度冷却、换号、代理、失败分类、`--effort` 被拒重放全部复用主流程。
 - 形态：agy CLI 没有「直接调某个工具」的 RPC，只能**桥接 + 提示词**让模型调用 `generate_image`；提示词负责“让工具被调用且参数不被改写”，代码负责“产物必须真的是图、尺寸能读、比例对得上”。
 - 不做：文生视频 / 音乐 / 音频（agy 无内置工具）；像素级尺寸（图片模型只按比例出图）。
 
@@ -86,10 +88,10 @@ agy 1.5.4 把生成图写到：
 `agyOnEvent` 从 `init` 事件拿 `conversation_id`；`agyOnAccount` 给出本次使用的 HOME（主账号=系统 HOME，隔离账号=`account.dir`）。候选顺序：
 
 1. 回复里的 `IMAGE_PATH=`
-2. 文本 / 工具输出中提取的绝对图片路径（含 `file://`）
+2. 文本 / 工具输出中提取的绝对图片路径（含 POSIX `/`、`~/`、Windows `C:\...`、WSL `\\wsl...` 及 `file://`，支持 `.png/.jpg/.jpeg/.webp/.gif/.bmp`）
 3. 扫描上述 brain 目录中本次运行开始后新增的图片（`mtime >= start - 2s`），按时间倒序
 
-逐个校验，第一个通过者胜出。
+逐个校验，第一个通过者胜出（`copyArtifact` 在 `source === target` 时保持幂等）。
 
 ## 7. 产物校验（硬门槛）
 
@@ -113,8 +115,9 @@ agy 1.5.4 把生成图写到：
 
 | 键 | 默认 | env |
 | --- | --- | --- |
-| `imageModel` | `''`（→ defaultModel → gemini-3.8-flash） | `DSH_AGY_IMAGE_MODEL` |
-| `imageEffort` | `low` | `DSH_AGY_IMAGE_EFFORT` |
+| `imageTool` | `true`（注册 `agy_image` 对话工具） | `DSH_AGY_IMAGE_TOOL` |
+| `imageModel` | `''`（→ defaultModel → 已发现 `gemini-4-hydrogen` 时优先选它，否则回退 `gemini-3.8-flash`） | `DSH_AGY_IMAGE_MODEL` |
+| `imageEffort` | `medium` | `DSH_AGY_IMAGE_EFFORT` |
 | `imageTimeoutMs` | `240000` | `DSH_AGY_IMAGE_TIMEOUT_MS` |
 | `imageMaxBytes` | `20971520` | `DSH_AGY_IMAGE_MAX_BYTES` |
 | `imageOutputDir` | `''` | `DSH_AGY_IMAGE_OUTPUT_DIR` |
@@ -122,7 +125,8 @@ agy 1.5.4 把生成图写到：
 
 ## 10. 测试锚点
 
-- `test/image.test.ts`：比例解析、文件名规整、提示词参数与回执契约、`IMAGE_PATH/IMAGE_ERROR` 解析、文本路径提取（不误抓 URL）、PNG/JPEG/GIF/WebP 头解析、比例容差、brain 目录发现、显式路径优先、`--out` 复制、地区错误→重试→`IMAGE_REGION_UNSUPPORTED`、比例不符、非图片产物、缺产物、参数先校验不 spawn、`--effort` 被拒后降级、CLI argv。
+- `test/image.test.ts`：比例解析、文件名规整、提示词参数与回执契约、`IMAGE_PATH/IMAGE_ERROR` 解析、文本路径提取（不误抓 URL）、PNG/JPEG/GIF/WebP 头解析、比例容差、brain 目录发现、显式路径优先、`--out` 复制、地区错误→重试→`IMAGE_REGION_UNSUPPORTED`、比例不符、非图片产物、缺产物、参数先校验不 spawn、`--effort` 被拒后降级、CLI argv、`resolveImageTarget` 默认优先 `gemini-4-hydrogen` + `medium`。
+- `test/slash-bridge-and-image-tool.test.ts`：`agy_image` 工具执行与校验失败抛出、`/agy image` 命令引号/参数分词与错误提示。
 - `test/adapter.test.ts`：`purpose:'image'` 的 prompt 原样、权限模式不被强制 plan、`agyOnEvent/agyOnAccount` 回调。
 - 真机：`node dist/cli-image.mjs -p … -a 16:9 -o /tmp/x.jpg`（会花额度）。
 

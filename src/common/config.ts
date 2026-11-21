@@ -2,7 +2,7 @@
 // entry config > defaults (spec ADR-13). The overrides file backs /agy
 // hot changes and survives restarts; the env is read per call so a changed
 // process environment is honored without reload.
-import { defaultConfig, type PermissionMode, type PluginConfig } from './types.ts'
+import { defaultConfig, type AgyTransportMode, type PermissionMode, type PluginConfig } from './types.ts'
 import { readFileSync, existsSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
@@ -81,12 +81,18 @@ function asStringArray(v: unknown): string[] | undefined {
   return out
 }
 
-const MODES: readonly PermissionMode[] = ['skip', 'plan', 'accept-edits']
+const MODES: readonly PermissionMode[] = ['skip', 'auto', 'plan', 'accept-edits']
 
 function asMode(v: unknown): PermissionMode | undefined {
   return typeof v === 'string' && (MODES as readonly string[]).includes(v)
     ? (v as PermissionMode)
     : undefined
+}
+
+function asTransport(v: unknown): AgyTransportMode | undefined {
+  if (typeof v !== 'string') return undefined
+  const s = v.trim().toLowerCase()
+  return s === 'cli' || s === 'acp' ? s : undefined
 }
 
 /** Layered config read; cheap enough to call per request (thunk pattern). */
@@ -110,6 +116,13 @@ export function resolveConfig(
       ? (get('extraArgs') as unknown[]).filter((x): x is string => typeof x === 'string')
       : base.extraArgs,
     permissionMode: asMode(get('permissionMode')) ?? base.permissionMode,
+    sandbox: asBool(get('sandbox')) ?? base.sandbox,
+    agent: asString(get('agent')) ?? base.agent,
+    agySettings: asString(get('agySettings')) ?? base.agySettings,
+    transport: asTransport(get('transport')) ?? base.transport,
+    imageTool: asBool(get('imageTool')) ?? base.imageTool,
+    syncAccountCustomizations: asBool(get('syncAccountCustomizations')) ?? base.syncAccountCustomizations,
+    mediaMaxFileBytes: asNum(get('mediaMaxFileBytes')) ?? base.mediaMaxFileBytes,
     defaultModel: asString(get('defaultModel')) ?? base.defaultModel,
     defaultEffort: asString(get('defaultEffort')) ?? base.defaultEffort,
     timeoutMs: asNum(get('timeoutMs')) ?? base.timeoutMs,
@@ -139,6 +152,7 @@ export function resolveConfig(
         )
       : base.fallbackModels,
     hiddenModels: asStringArray(get('hiddenModels')) ?? base.hiddenModels,
+    selectedModels: asStringArray(get('selectedModels')) ?? base.selectedModels,
     askTool: asBool(get('askTool')) ?? base.askTool,
     mediaDir: asString(get('mediaDir')) ?? base.mediaDir,
     mediaTtlMs: asNum(get('mediaTtlMs')) ?? base.mediaTtlMs,
@@ -190,6 +204,28 @@ export function resolveConfig(
     const skip = asBool(env.DSH_AGY_SKIP_PERMISSIONS)
     if (skip !== undefined) cfg.permissionMode = skip ? 'skip' : 'plan'
   }
+  if (env.DSH_AGY_SANDBOX !== undefined) {
+    const sb = asBool(env.DSH_AGY_SANDBOX)
+    if (sb !== undefined) cfg.sandbox = sb
+  }
+  if (env.DSH_AGY_AGENT !== undefined) cfg.agent = env.DSH_AGY_AGENT
+  if (env.DSH_AGY_SETTINGS !== undefined) cfg.agySettings = env.DSH_AGY_SETTINGS
+  if (env.DSH_AGY_TRANSPORT) {
+    const t = asTransport(env.DSH_AGY_TRANSPORT)
+    if (t) cfg.transport = t
+  }
+  if (env.DSH_AGY_IMAGE_TOOL !== undefined) {
+    const it = asBool(env.DSH_AGY_IMAGE_TOOL)
+    if (it !== undefined) cfg.imageTool = it
+  }
+  if (env.DSH_AGY_SYNC_CUSTOMIZATIONS !== undefined) {
+    const sc = asBool(env.DSH_AGY_SYNC_CUSTOMIZATIONS)
+    if (sc !== undefined) cfg.syncAccountCustomizations = sc
+  }
+  if (env.DSH_AGY_MEDIA_MAX_FILE_BYTES) {
+    const v = asNum(env.DSH_AGY_MEDIA_MAX_FILE_BYTES)
+    if (v !== undefined && v > 0) cfg.mediaMaxFileBytes = v
+  }
   if (env.DSH_AGY_DEFAULT_MODEL) cfg.defaultModel = env.DSH_AGY_DEFAULT_MODEL
   if (env.DSH_AGY_DEFAULT_EFFORT) cfg.defaultEffort = env.DSH_AGY_DEFAULT_EFFORT
   if (env.DSH_AGY_TIMEOUT_MS) {
@@ -225,6 +261,13 @@ export function resolveConfig(
   if (env.DSH_AGY_HIDDEN_MODELS) {
     const list = asStringArray(env.DSH_AGY_HIDDEN_MODELS.split(','))
     if (list) cfg.hiddenModels = list
+  }
+  // Empty env value means "no allow-list" (show everything), which is also the
+  // default — assigning [] would otherwise be indistinguishable from a user
+  // deliberately ticking nothing off.
+  if (env.DSH_AGY_SELECTED_MODELS) {
+    const list = asStringArray(env.DSH_AGY_SELECTED_MODELS.split(','))
+    if (list && list.length > 0) cfg.selectedModels = list
   }
   if (env.DSH_AGY_WORKSPACE_ROOT) cfg.workspaceRoot = env.DSH_AGY_WORKSPACE_ROOT
   if (env.DSH_AGY_MEDIA_DIR) cfg.mediaDir = env.DSH_AGY_MEDIA_DIR

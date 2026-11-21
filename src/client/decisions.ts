@@ -1,3 +1,4 @@
+import { translateOr } from './i18n-bridge.ts';
 import { isInteractionLocked, onScrollSettle } from './scroll-guard.ts';
 
 // Interactive User Decision & Choice Quick-Actions for dsh-agy-link.
@@ -238,7 +239,9 @@ export function scanAndEnhanceDecisions(): void {
 
       const header = document.createElement('div');
       header.className = 'agy-decision-header';
-      header.innerHTML = '<span>💬 点击选项快速填入：</span>';
+      const headerLabel = document.createElement('span');
+      headerLabel.textContent = COPY.quickFill();
+      header.appendChild(headerLabel);
       box.appendChild(header);
 
       const chips = document.createElement('div');
@@ -248,7 +251,7 @@ export function scanAndEnhanceDecisions(): void {
         const chip = document.createElement('button');
         chip.type = 'button';
         chip.className = 'agy-decision-chip';
-        chip.title = `点击填入: ${opt.fullText}`;
+        chip.title = COPY.insertTooltip(opt.fullText);
 
         const numSpan = document.createElement('span');
         numSpan.className = 'agy-decision-chip-num';
@@ -264,7 +267,7 @@ export function scanAndEnhanceDecisions(): void {
         chip.onclick = (e) => {
           e.stopPropagation();
           const cleanText = opt.fullText.replace(/^[0-9]+[、.．:]\s*/, '').trim();
-          const insertPayload = `我选择 ${opt.num ? opt.num + ' ' : ''}${cleanText}`;
+          const insertPayload = COPY.insertPayload((opt.num ? opt.num + ' ' : '') + cleanText);
           insertTextIntoChatComposer(insertPayload);
 
           chip.classList.add('selected');
@@ -292,6 +295,13 @@ function scheduleDecisionScan(): void {
     if (isInteractionLocked()) return;
     scanAndEnhanceDecisions();
   }, 100);
+}
+
+/** Chip copy: localized through the shared bridge (issue #153). */
+const COPY = {
+  quickFill: () => translateOr('decision.quickFill', '💬 Click an option to fill it in:'),
+  insertTooltip: (text: string) => translateOr('decision.insertTooltip', 'Insert: {text}', { text }),
+  insertPayload: (choice: string) => translateOr('decision.insertPayload', 'I choose {choice}', { choice }),
 }
 
 export function installDecisionChips(): () => void {

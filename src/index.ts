@@ -13,15 +13,18 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { PROVIDER_ID } from './common/types.ts'
 import { defineAgyAskTool } from './host/ask-tool.ts'
+import { defineAgyImageTool } from './host/image-tool.ts'
 import { agyCommandDefinition } from './host/commands.ts'
 import { tslCommandDefinition } from './host/tsl-command.ts'
 import { writeDoctorReport } from './host/diagnostics.ts'
 import { defineAgyMirrorTool } from './host/mirror-tool.ts'
+import { runAgyOnce } from './host/oneshot.ts'
 import type { ToolExecution, PreToolDecision } from '@deepseek-ai/dsh-tools'
 import { MIN_AGY_VERSION, compareVersions, isolatedHomeEnv, parseVersion, probeProcess } from './host/runner.ts'
 import { agyNotInstalledMessage } from './provider/call-context.ts'
 import { sweepDir } from './host/media.ts'
-import { agyMcpConfigPath, startMcpBridge, writeMcpConfig, type ToolsServiceLike } from './host/mcp-bridge.ts'
+import { agyMcpConfigPath, registerBridgeMcpConfig, startMcpBridge, teardownBridgeState, type ToolsServiceLike } from './host/mcp-bridge.ts'
+import type { GoalServiceLike } from './host/commands/shared.ts'
 import { runBootHygiene } from './host/boot-hygiene.ts'
 import { closeProxyAgents } from './host/net.ts'
 import { setRuntimeAgyVersion } from './host/oauth.ts'
@@ -36,7 +39,7 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
   const services = createHostServices(ctx, entryConfig)
   const {
     getConfig, log, bin, version, store, pool, quota, warmup, catalog, auth, poolAuth, runs,
-    adapter, translation, setOverride, notifyPicker, readEffortUnsupported, rememberEffortUnsupported,
+    adapter, acpPool, ecosystem, imageService, translation, setOverride, notifyPicker, readEffortUnsupported, rememberEffortUnsupported,
     sessionsSvc, sessionAuto, mediaDir, bridgeState, webServerPort,
   } = services
 
@@ -149,9 +152,23 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
       poolAuth: () => poolAuth,
       quota: () => quota,
       lastRun: () => services.lastRun,
+      imageService: () => imageService,
+      acpStatus: () => acpPool.status(),
+      ecosystem: () => ecosystem,
+      runOnce: (req) => runAgyOnce({
+        cfg: getConfig,
+        bin,
+        pool: () => pool,
+        acquire: (sig) => services.semaphore.acquire(sig),
+        log,
+        effortUnsupported: () => readEffortUnsupported(),
+        onEffortUnsupported: (model) => rememberEffortUnsupported(model),
+      }, req),
       setOverride,
       notifyPicker,
       sessions: () => sessionsSvc(),
+      goals: () => (ctx.get('goals') as GoalServiceLike | undefined) ?? ((ctx as unknown as { goals?: GoalServiceLike }).goals),
+      agents: () => (ctx.get('agents') as { get(id: unknown): unknown } | undefined) ?? ((ctx as unknown as { agents?: { get(id: unknown): unknown } }).agents),
       runDoctor: async () => {
         return writeDoctorReport({
           cfg: getConfig,
@@ -222,6 +239,7 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
   // failing with `unknown tool "agy_tool"`.
   const toolsSvcRef: { current: { register: (t: unknown) => unknown } | null } = { current: null }
   const askToolDispose = { current: null as null | (() => void) }
+  const imageToolDispose = { current: null as null | (() => void) }
   const mirrorToolDispose = { current: null as null | (() => void) }
   const preExecuteDispose = { current: null as null | (() => void) }
   const syncAskTool = (): void => {
@@ -245,6 +263,21 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
       askToolDispose.current = null
     }
   }
+  const syncImageTool = (): void => {
+    const want = getConfig().enabled && getConfig().imageTool && bin() !== null
+    if (want && imageToolDispose.current === null && toolsSvcRef.current) {
+      const reg = toolsSvcRef.current.register(
+        defineAgyImageTool({
+          imageService: () => imageService,
+          log,
+        }),
+      ) as unknown as () => void
+      imageToolDispose.current = typeof reg === 'function' ? reg : null
+    } else if (!want && imageToolDispose.current !== null) {
+      imageToolDispose.current()
+      imageToolDispose.current = null
+    }
+  }
   // The mirror rides the agent loop for native tool-card rendering: the
   // adapter's spans cut on completed agy tool steps with finish:tool-calls
   // addressed here, and the loop's dispatch writes the real tool/call +
@@ -263,6 +296,7 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
   ctx.inject(['tools'], (sub) => {
     toolsSvcRef.current = sub.get('tools') as { register: (t: unknown) => unknown }
     syncAskTool()
+    syncImageTool()
     syncMirrorTool()
     // Bypass auto-review and permission prompt gates for the synthetic agy_tool mirror:
     // agy_tool only replays in-memory stdout already executed by agy in the previous step.
@@ -285,6 +319,8 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
       preExecuteDispose.current = null
       if (askToolDispose.current !== null) askToolDispose.current()
       askToolDispose.current = null
+      if (imageToolDispose.current !== null) imageToolDispose.current()
+      imageToolDispose.current = null
       if (mirrorToolDispose.current !== null) mirrorToolDispose.current()
       mirrorToolDispose.current = null
       toolsSvcRef.current = null
@@ -298,6 +334,7 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
     void value
     syncAdapterRegistration()
     syncAskTool()
+    syncImageTool()
     syncMirrorTool()
     syncMcpBridge()
   }
@@ -430,23 +467,17 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
             targets.push(join(root, '.mcp.json'))
           }
           const uniqueTargets = Array.from(new Set(targets))
-          bridgeState.restores = uniqueTargets.map((file) => writeMcpConfig(file, bridge))
+          for (const file of uniqueTargets) registerBridgeMcpConfig(bridgeState, file)
           log('mcp bridge ready at ' + bridge.url + ' (registries: ' + uniqueTargets.join(', ') + ')' + (toolsSvc ? '' : ' (tools service not yet available)'))
         } catch (e) {
-          for (const undo of bridgeState.restores) undo()
-          await bridgeState.bridge?.close()
-          bridgeState.bridge = null
-          bridgeState.restores = []
+          await teardownBridgeState(bridgeState)
           log('mcp bridge failed to start: ' + String(e))
         } finally {
           bridgeStarting = false
         }
       })()
     } else if (!want && bridgeState.bridge !== null) {
-      for (const undo of bridgeState.restores) undo()
-      void bridgeState.bridge.close()
-      bridgeState.bridge = null
-      bridgeState.restores = []
+      void teardownBridgeState(bridgeState)
     }
   }
   syncMcpBridge()
@@ -455,12 +486,13 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
     return () => {
       bridgeDisposed = true
       services.translationWorkers?.dispose()
+      acpPool.dispose()
       auth.dispose()
       void poolAuth.cancel()
       if (askToolDispose.current !== null) askToolDispose.current()
+      if (imageToolDispose.current !== null) imageToolDispose.current()
       if (mirrorToolDispose.current !== null) mirrorToolDispose.current()
-      for (const undo of bridgeState.restores) undo()
-      void bridgeState.bridge?.close()
+      void teardownBridgeState(bridgeState)
       void closeProxyAgents()
     }
   })

@@ -58,4 +58,18 @@ agy 在等待自己派发的工作时会打印 `root agent idle; waiting for N b
 - **两种措辞都要解析**：`waiting for N background task(s)` 与 `waiting up to <duration> for N background task(s)`（agy 两种都会输出）。只匹配前者会让后者返回 `null`、从而在正数计数下仍然武装收割器（PR #147）。
 - **被收割的轮次必须留下可消费的收尾**：SIGTERM 时 agy 可能刷出 `{ ok: false, response: '' }` 空结果。判据是 `hasConsumableResult`（`ok` 或非空 `response`），不是裸 `hasResult`——否则恢复逻辑被跳过、而 `EventMapper` 又忽略空结果，最终仍是 `INVALID_OUTPUT`。
 - **死续接不得被重放**：settled recording 在续接点之后既无可消费 result、也无可切割工具步骤时，每次重试都会重驱同一份 recording（毫秒级失败直到耗尽）。`hasFinishableEventFrom(from, cutOnTool)` 让适配器遗忘它并新起尝试；注意判据必须包含**工具步骤**维度，只看 result 会把「工具步骤中途被切断」误判为死 recording 并重跑已完成的工作。
-- 锚点：`test/issue144-idle-grace.test.ts`（默认值/配置/环境变量/0 语义/工具挂起/正数不收割/up-to 措辞）、`test/background-task-hang.test.ts`（0 计数仍收割）、`test/idle-grace-empty-result-and-dead-continuation.test.ts`（空结果恢复 + 死续接遗忘）。
+- **豁免必须撑过「等待前的状态回复」**（#148）：agy 要求模型在转后台后先发一句 text/thinking，之后才打印 idle 行。因此 `text`/`thinking` 只能恢复正常空闲**预算**，不得取消「后台等待」豁免；`state === 'RUNNING'` 对 `schedule` 类确定性等待意味着「仍在等」，需登记到终态。
+- **`run_command` 不得整体豁免**（#119/#124）：它同样用于守护进程（dev server、watcher），回收它们正是 #119 的目的。后台构建靠 agy 自报的 `N > 0` 保护即可——**用协议信号，而不是给工具开后门**。
+- 锚点：`test/issue148-background-wait.test.ts`、`test/issue124-125-regressions.test.ts`、`test/issue144-idle-grace.test.ts`（默认值/配置/环境变量/0 语义/工具挂起/正数不收割/up-to 措辞）、`test/background-task-hang.test.ts`（0 计数仍收割）、`test/idle-grace-empty-result-and-dead-continuation.test.ts`（空结果恢复 + 死续接遗忘）。
+
+## 5. 常驻 `agy acp` 传输通道与 CLI 参数透传
+
+- **传输通道（`transport: 'cli' | 'acp'`，默认 `'cli'`）**：
+  - `'cli'` 为每轮短生命周期 `agy -p` 子进程；`'acp'` 通过 `AcpSessionPool` + `AcpProcess`（`src/features/acp/`）复用常驻 `agy acp` stdio JSON-RPC 进程，保持会话并降低冷启动开销。
+  - **惰性清扫定时器**：`AcpSessionPool` 在构造函数中**绝不创建**后台 `setInterval`，仅在首次 `acquireProcess()` 时启动，并在进程全部退出/驱逐或 `dispose()` 时立刻清理，防止空闲定时器泄漏。
+  - **前置失败自动回退**：当 `runAcpAttempt()` 在流式启动前失败（未配置、进程拉起失败或 `openSession` 失败）时返回 `null` 并保留并发/凭据槽位，由 `runAgyAttempt()` 无缝回退至 CLI `-p` 路径；若进入 `runAcpAttempt()` 成功路径，须先调用 `recorder.stop()` 释放未使用的 CLI 录制器资源；当存在 `--json-schema`、`--settings` 或 `isAux` 辅助调用时自动走 CLI 通道。
+  - **Windows 凭据槽安全**：在 Windows 下切号时，`AcpSessionPool.acquireProcess()` 会主动 `evictOtherAccounts()` 关闭旧账号常驻进程，避免并发凭据槽冲突。
+  - **ACP 轮内超时对齐**：`AcpProcess.prompt()` 同样遵循 `timeoutMs` 空闲看门狗、工具进行中切换至 `longToolIdleMs`、`maxTurnMs` 硬上限以及 `AbortSignal` 触发 `session/cancel`。
+- **CLI 参数透传（`src/provider/attempt.ts`, `src/host/oneshot.ts`）**：
+  - 支持结构化透传 `--agent`（`agent` / `agyAgent`）、`--settings`（`agySettings`）、`--json-schema`（`agyJsonSchema` / `schemaArgs()` 自动写临时 schema 并清理）与 `--sandbox`。
+- **锚点**：`test/acp.test.ts`、`test/mcp-ready-disposal.test.ts`、`test/http-contract.test.ts`。

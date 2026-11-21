@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.3.0 (2026-11-21)
+
+### English
+
+- **Sync upstream `dsh-agy-link` (`v0.6.49` → `v0.6.55`)**:
+  - **Features (`v0.6.55`): ACP persistent transport mode (`cli` / `acp`), ecosystem discovery & account customization sync (`/agy sync-ecosystem`, `plugins`/`agents`/`skills`), image tool integration, sandbox/custom agent/settings CLI flags, and per-account model allow-list (`selectedModels`) + quota-derived catalog (`v0.6.53`).**
+  - **Fix (`v0.6.50`–`v0.6.54`): idempotent DSH goal/plan/command state machines (`v0.6.52`), schedule-wait idle-grace exemption (issue #148), stale quota marker clearing on CLI refresh (issue #151), and client DOM/decision localization hardening (issue #153).**
+
+### 中文
+
+- **跟进上游 `dsh-agy-link`（`v0.6.49` → `v0.6.55`）**：
+  - **特性（`v0.6.55`）：新增 ACP 持久会话传输模式（`cli` / `acp`）、生态发现与跨账号自定义同步（`/agy sync-ecosystem`、`plugins`/`agents`/`skills`）、图像工具集成、sandbox/agent/settings 参数支持，以及按账号模型白名单（`selectedModels`）与基于配额推导的模型目录（`v0.6.53`）。**
+  - **修复（`v0.6.50`–`v0.6.54`）：幂等化的 DSH goal/plan/command 状态机（`v0.6.52`）、调度等待空闲宽限期豁免（issue #148）、CLI 刷新时清理过期配额标记（issue #151）以及前端 DOM 与决策卡片本地化完善（issue #153）。**
+
 ## 1.2.0 (2026-11-20)
 
 ### English

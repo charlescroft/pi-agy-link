@@ -6,7 +6,7 @@ import { existsSync, readFileSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { createUserMessage, type GenerateOptions, type StreamChunk } from '@deepseek-ai/dsh-llm'
 import { Err, PROVIDER_ID, type PluginConfig } from '../common/types.ts'
-import type { ImageRefLike } from './media.ts'
+import type { MediaRefLike } from './media.ts'
 import type { TranslationRunnerRequest, TranslationRunnerResult } from '../features/translation/types.ts'
 import type { TranslationWorkerPool } from '../features/translation/worker.ts'
 
@@ -98,25 +98,37 @@ export function resolveSessionGoal(
   for (let i = evs.length - 1; i >= 0; i--) {
     const ev = evs[i]
     if (ev?.type !== 'goal/change' || !ev.data || typeof ev.data !== 'object') continue
-    const d = ev.data as { operation?: string; goal?: { id?: string; revision?: number } }
-    switch (d.operation) {
-      case 'clear':
-      case 'pause':
-      case 'block':
-      case 'complete':
-        return null
-      case 'create':
-      case 'resume':
-        return d.goal?.id
-          ? { goalId: d.goal.id, revision: typeof d.goal.revision === 'number' ? d.goal.revision : 1 }
-          : null
-      case 'edit':
-        continue
-      default:
-        return null
+    const d = ev.data as { operation?: string; goal?: { id?: string; revision?: number; phase?: string } }
+    if (d.operation === 'clear') return null
+    if (d.goal?.id && d.goal.phase === 'active') {
+      return { goalId: d.goal.id, revision: typeof d.goal.revision === 'number' ? d.goal.revision : 1 }
     }
+    return null
   }
   return null
+}
+
+/**
+ * Resolve the authoritative live DSH plan-mode flag (`pending ?? active`) for a session.
+ * Returns `undefined` when `ctx.planMode` or the live agent is unavailable so callers
+ * can fall back to `options.system` and current-turn message signals.
+ */
+export function resolveSessionPlanMode(ctx: Context, sessionId: string): boolean | undefined {
+  if (sessionId === '') return undefined
+  try {
+    const agents = (ctx.get('agents') as { get(id: unknown): unknown } | undefined)
+      ?? (ctx as unknown as { agents?: { get(id: unknown): unknown } }).agents
+    const planMode = (ctx.get('planMode') as { get(agent: unknown): { active?: boolean; pending?: boolean } | undefined } | undefined)
+      ?? (ctx as unknown as { planMode?: { get(agent: unknown): { active?: boolean; pending?: boolean } | undefined } }).planMode
+    const agent = agents?.get(sessionId)
+    if (!agent || !planMode || typeof planMode.get !== 'function') return undefined
+    const state = planMode.get(agent)
+    if (!state || typeof state !== 'object') return undefined
+    if (typeof state.pending === 'boolean') return state.pending
+    return typeof state.active === 'boolean' ? state.active : undefined
+  } catch {
+    return undefined
+  }
 }
 
 export function syncSessionModelSelection(
@@ -172,15 +184,24 @@ export function syncSessionModelSelection(
   }
 }
 
-export async function readSessionImage(ctx: Context, dshHomeDir: string, ref: ImageRefLike): Promise<Uint8Array | null> {
-  const svc = (ctx.get('attachments') as { readImage?: (r: ImageRefLike) => Promise<{ data?: Uint8Array } | null> } | undefined)
-    ?? (ctx as unknown as { attachments?: { readImage?: (r: ImageRefLike) => Promise<{ data?: Uint8Array } | null> } }).attachments
-  if (svc && typeof svc.readImage === 'function') {
-    try {
-      const stored = await svc.readImage(ref)
-      if (stored?.data) return stored.data
-    } catch {
-      // fall through to disk read fallback
+export async function readSessionImage(ctx: Context, dshHomeDir: string, ref: MediaRefLike): Promise<Uint8Array | null> {
+  type AttachmentsSvc = {
+    readImage?: (r: MediaRefLike) => Promise<{ data?: Uint8Array } | null>
+    readAttachment?: (r: MediaRefLike) => Promise<{ data?: Uint8Array } | Uint8Array | null>
+    read?: (idOrRef: unknown) => Promise<{ data?: Uint8Array } | Uint8Array | null>
+  }
+  const svc = (ctx.get('attachments') as AttachmentsSvc | undefined)
+    ?? (ctx as unknown as { attachments?: AttachmentsSvc }).attachments
+  if (svc) {
+    for (const fn of [svc.readImage, svc.readAttachment, svc.read]) {
+      if (typeof fn !== 'function') continue
+      try {
+        const stored = await fn.call(svc, ref)
+        if (stored instanceof Uint8Array) return stored
+        if (stored && typeof stored === 'object' && stored.data) return stored.data
+      } catch {
+        // try next reader / disk fallback
+      }
     }
   }
   try {
@@ -188,6 +209,9 @@ export async function readSessionImage(ctx: Context, dshHomeDir: string, ref: Im
     if (id && typeof id === 'string') {
       const diskPath = join(dshHomeDir, 'attachments', 'v1', 'objects', id.slice(0, 2), id)
       if (existsSync(diskPath)) return readFileSync(diskPath)
+    }
+    if (typeof ref.path === 'string' && ref.path !== '' && existsSync(ref.path)) {
+      return readFileSync(ref.path)
     }
   } catch {
     return null

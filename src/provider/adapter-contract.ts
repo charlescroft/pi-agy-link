@@ -10,6 +10,7 @@ import type { AccountPoolManager } from '../host/pool.ts'
 import type { RunRecording, RunRegistry } from '../host/recording.ts'
 import type { StreamJsonParser } from '../host/parser.ts'
 import type { ImageRefLike } from '../host/media.ts'
+import type { AttemptDeps, AttemptInput, AttemptSlot } from './attempt.ts'
 
 export interface AgyAdapterDeps {
   getConfig: () => PluginConfig
@@ -40,6 +41,12 @@ export interface AgyAdapterDeps {
    * live goal service is unavailable and history detection may be used instead.
    */
   sessionGoal?: (sessionId: string) => { goalId: string; revision: number } | null | undefined
+  /**
+   * Resolve the live DSH plan-mode flag for this session (`true` = active/pending,
+   * `false` = inactive, `undefined` = plan-mode service unavailable so prompt/message
+   * signals decide).
+   */
+  sessionPlanMode?: (sessionId: string) => boolean | undefined
   /** Last-run telemetry surfaced by /agy status. Process completion and tool failures are distinct. */
   onRun?: (info: {
     processOk: boolean
@@ -68,4 +75,6 @@ export interface AgyAdapterDeps {
    * capabilities it advertises (its effort row must disappear).
    */
   onEffortUnsupported?: (model: string) => void
+  /** Optional persistent ACP attempt runner wired from host services. */
+  runAcp?: (deps: AttemptDeps, input: AttemptInput, slot: AttemptSlot) => Promise<RunRecording | null>
 }

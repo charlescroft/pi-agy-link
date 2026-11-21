@@ -61,3 +61,16 @@
 - `normalizeLocalPath()` 必须**先**拆掉 `?#` 后缀再 `decodeURIComponent`（否则名字里的 `%3F` 会被当作查询串），解码失败保留原值；随后统一 `\` → `/`。否则被编码的 href 与会话 cwd 对不上，地址还会被二次编码。
 - 客户端测试的 mock 必须模拟真实契约（`get(kind)` + `entries()` 带 id）。用 id 键 mock `get()` 会让这段 bug 通过 CI。
 - 锚点：`test/issue141-sidebar-preview.test.ts`、`test/client-dom.test.ts`。
+
+## 客户端文案必须走 locale，注入文本尤其（issue #153）
+
+插件的客户端模块（decision chips、toolview、mermaid、compaction、lightbox、账号面板…）面向用户的所有文案都必须来自 `locale` 服务，**不得硬编码**。
+
+- 最严重的一类不是标题而是**写进用户输入框的文本**：决策芯片点击后会把选中项插入 composer，硬编码中文会让英文宿主把中文前缀当作**用户自己写的 prompt** 发给模型。
+- 形态：模块级 `activeTranslate`（`install*` 时由 `ctx.locale.bind(NS)` 注入），并提供英文兜底，使无 locale 服务的宿主（SSR/测试）仍可用。
+- 新增键必须四个语言齐全（`en`/`zh`/`es`/`ptBR`），英文值不得含中日韩字符。
+- 测试要锁两件事：源码里不再出现该文案的字面量；四个 locale 都定义了对应键。
+- **统一入口**：`src/client/i18n-bridge.ts` 的 `translateOr(key, englishFallback, params)`。客户端 DOM 增强器（图片 chip、灯箱、mermaid、压缩卡片、问题卡片、决策芯片）不是 React 组件，多数没有自己的 `ctx`，全部读 `index.ts` 里一次性 `bindTranslator(ctx)` 建立的绑定；没有绑定（SSR/测试）时输出英文兜底，**绝不输出裸 key**。
+- **不要翻译用于「识别」的文本**：例如 mermaid 里 `代码块` 是 DSH 的占位 banner 文案，用来判断 banner 是否携带真实语言标签；翻译它等于破坏检测逻辑。
+- **不要用 `document.documentElement.lang` 代替 locale 绑定**：那是 DSH 页面语言，与插件 locale 可能不一致。
+- 锚点：`test/issue153-decision-locale.test.ts`、`test/issue153-client-locale.test.ts`（源码无中文字面量 + 四语言键齐全 + 兜底语义）、`test/client-dom.test.ts`（插入 payload 已本地化）。

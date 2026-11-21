@@ -1,11 +1,29 @@
 import type { HostServices } from '../../../host/services.ts'
 import { runRoute, sendJsonWithEtag, type RawRes, type RouteRegistrar } from '../respond.ts'
 import { sanitizeCatalogEntries } from '../../../host/models.ts'
-import { accountSupportsModel } from '../../../common/pool-types.ts'
 import { resolveEffectiveCompactLimit } from '../../../common/compact-threshold.ts'
+import { mergeCatalogWithQuotaModels, quotaCatalogForAccount } from '../../../domain/models/quota-catalog.ts'
+import type { ManagedAccount } from '../../../common/pool-types.ts'
+
+/**
+ * The selectable universe the Settings ticks describe.
+ *
+ * Deliberately UNFILTERED by `selectedModels`/`hiddenModels`: unticking a model
+ * must stay reversible, so the panel always receives the full set and knows the
+ * current selection separately. Quota-derived models are merged in because a
+ * host without the agy CLI has only the static fallback catalog while the
+ * account's own quota snapshot already lists the real models (issue #131).
+ */
+function selectableModels(
+  supportedModels: Parameters<typeof sanitizeCatalogEntries>[0],
+  quotaScope: readonly ManagedAccount[],
+): Array<{ id: string; name: string; efforts: string[] }> {
+  const quota = quotaScope.flatMap((acc) => quotaCatalogForAccount(acc))
+  return sanitizeCatalogEntries(mergeCatalogWithQuotaModels(sanitizeCatalogEntries(supportedModels).entries, quota)).entries
+}
 
 function handleStatus(services: HostServices, req: unknown, res: unknown): void {
-  const { getConfig, bin, store, pool, quota, catalog, auth, poolAuth, adapter, translation, lastRun } = services
+  const { getConfig, bin, store, pool, quota, warmup, catalog, auth, poolAuth, adapter, acpPool, translation, lastRun } = services
   const { version: versionCache, dormantReason } = services.status
       runRoute(res, async () => {
         const cfg = getConfig()
@@ -28,7 +46,11 @@ function handleStatus(services: HostServices, req: unknown, res: unknown): void 
         } else {
           supportedModels = catalog.getModelsForAccount(activeAcc, pool)
         }
-        const sanitizedCatalogModels = sanitizeCatalogEntries(supportedModels).entries
+        // Same account scope the picker merges quota rows for, so the panel and
+        // the picker never disagree about which models exist.
+        const allAccounts = typeof pool?.getAccounts === 'function' ? pool.getAccounts() : []
+        const quotaScope = cfg.poolWideCatalog ? allAccounts : (activeAcc ? [activeAcc] : allAccounts.slice(0, 1))
+        const sanitizedCatalogModels = selectableModels(supportedModels, quotaScope)
         const activeCat = (!cfg.poolWideCatalog && activeAcc && typeof catalog.getAccountCatalog === 'function')
           ? (catalog.getAccountCatalog(activeAcc.id) ?? cat)
           : cat
@@ -51,6 +73,13 @@ function handleStatus(services: HostServices, req: unknown, res: unknown): void 
           dormantReason,
           enabled: cfg.enabled,
           permissionMode: cfg.permissionMode,
+          sandbox: cfg.sandbox,
+          agent: cfg.agent,
+          agySettings: cfg.agySettings,
+          transport: cfg.transport,
+          acpStatus: typeof acpPool?.status === 'function' ? acpPool.status() : null,
+          imageTool: cfg.imageTool,
+          syncAccountCustomizations: cfg.syncAccountCustomizations,
           workspaceRoot: cfg.workspaceRoot,
           defaultModel: cfg.defaultModel,
           defaultEffort: cfg.defaultEffort,
@@ -67,11 +96,13 @@ function handleStatus(services: HostServices, req: unknown, res: unknown): void 
           // its own click, which cleared the moment the route answered — so a
           // ~55s serial cascade showed no progress at all.
           quotaRefreshing: typeof quota?.refreshingAccounts === 'function' ? quota.refreshingAccounts() : [],
+          warmupState: typeof warmup?.status === 'function' ? warmup.status() : null,
           catalog: { source: activeCat.source, count: catalogCount, lastError: activeCat.lastError ?? cat.lastError ?? null },
           // Dynamically reflects models supported by the currently active account (e.g. hides Argon when active lacks Argon)
           catalogModels: sanitizedCatalogModels,
           accountModels,
           hiddenModels: cfg.hiddenModels,
+          selectedModels: cfg.selectedModels,
           autoWarmup: cfg.autoWarmup,
           warmupModels: cfg.warmupModels,
           autoTranslate: cfg.autoTranslate,

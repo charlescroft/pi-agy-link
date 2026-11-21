@@ -3,8 +3,8 @@
 import { homedir } from 'node:os'
 import { isAbsolute, join } from 'node:path'
 import type { PluginConfig } from '../../common/types.ts'
-import { SUPPORTED_ASPECT_RATIOS, type ImageTarget } from './types.ts'
-import { PREFERRED_GEMINI_FLASH } from '../../common/model-lineup.ts'
+import { SUPPORTED_ASPECT_RATIOS, type ImageCatalogLike, type ImageTarget } from './types.ts'
+import { PREFERRED_GEMINI_FLASH, PREFERRED_GEMINI_HYDROGEN } from '../../common/model-lineup.ts'
 
 /** Accept `16:9`, `16x9`, `16/9`, `16-9`; return the canonical `w:h` or null. */
 export function normalizeAspectRatio(value: string | undefined): string | null {
@@ -31,10 +31,18 @@ export function normalizeImageName(value: string | undefined, now: number): stri
   return ascii === '' ? fallback : ascii
 }
 
-export function resolveImageTarget(cfg: PluginConfig, override?: { model?: string; effort?: string }): ImageTarget {
+export function resolveImageTarget(
+  cfg: PluginConfig,
+  override?: { model?: string; effort?: string },
+  catalog?: ImageCatalogLike,
+): ImageTarget {
+  const autoModel =
+    catalog?.source === 'discovered' && catalog.models.some((m) => m.id === PREFERRED_GEMINI_HYDROGEN)
+      ? PREFERRED_GEMINI_HYDROGEN
+      : PREFERRED_GEMINI_FLASH
   const model = (override?.model ?? cfg.imageModel ?? '').trim() ||
     (cfg.defaultModel ?? '').trim() ||
-    PREFERRED_GEMINI_FLASH
+    autoModel
   const effort = (override?.effort ?? cfg.imageEffort ?? '').trim()
   return { model, effort }
 }
@@ -92,14 +100,18 @@ export function parseImageReply(text: string): { path?: string; error?: string }
   return out
 }
 
-const IMAGE_PATH_RE = /(?<![\w:/])(?:file:\/\/)?(?:\/|~\/)[^\s"'`<>|]+?\.(?:png|jpe?g|webp|gif)\b/gi
+const IMAGE_PATH_RE = /(?<![\w:/])(?:file:\/\/\/?)?(?:[A-Za-z]:[\\/]|\\\\wsl\.localhost\\|\/|~\/)[^\s"'`<>|]+?\.(?:png|jpe?g|webp|gif|bmp)\b/gi
 
 /** Every image path mentioned in free text (absolute or `file://`). */
 export function extractImagePaths(text: string): string[] {
   const found: string[] = []
   const seen = new Set<string>()
   for (const m of text.matchAll(IMAGE_PATH_RE)) {
-    let p = m[0].trim().replace(/^file:\/\//, '')
+    let p = m[0].trim()
+    if (p.startsWith('file://')) {
+      p = p.slice(7)
+      if (/^\/[A-Za-z]:/.test(p)) p = p.slice(1)
+    }
     if (p.startsWith('~/')) p = join(homedir(), p.slice(2))
     if (!isAbsolute(p)) continue
     if (seen.has(p)) continue

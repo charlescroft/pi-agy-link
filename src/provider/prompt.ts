@@ -12,14 +12,15 @@ import { Err, type PluginConfig } from '../common/types.ts'
 import type { AgyGenerateOptions } from '../common/protocol.ts'
 import type { ManagedAccount } from '../common/pool-types.ts'
 import type { SessionBinding, SessionStore } from '../host/sessions.ts'
-import { defaultMediaDir, stageImages, type ImageRefLike } from '../host/media.ts'
+import { defaultMediaDir, stageMedia, type ImageRefLike } from '../host/media.ts'
 import { stateDir } from '../common/config.ts'
 import type { CompactionNotice } from '../common/compaction.ts'
 import type { CallContext } from './call-context.ts'
+import { toolCallIdOf } from './continuation.ts'
 import type { PurposePolicy } from './purpose-policy.ts'
 import {
   buildDigest,
-  collectUnsentImageRefs,
+  collectUnsentMediaRefs,
   isForeignAssistant,
   isSyntheticHarnessMessage,
   isToolResultMessage,
@@ -200,7 +201,7 @@ export async function buildPromptPlan(input: PromptPlanInput): Promise<PromptPla
   if (!isAux) {
     const staged = await stagePromptImages({ cfg, ctx, messages, trailingUser, binding, prompt, deps })
     prompt = staged.prompt
-    if (staged.stagedDir !== null) stagedDirs = [staged.stagedDir]
+    if (staged.stagedDir !== null && !stagedDirs.includes(staged.stagedDir)) stagedDirs.push(staged.stagedDir)
     newlySentImageIds.push(...staged.stagedIds)
     if (prompt.trim() === '') {
       throw new LlmError('request carries no user text or images to forward to agy', Err.AGY_ERROR)
@@ -472,14 +473,25 @@ function buildChatPromptText(input: ChatPromptInput): string {
   // filtered out every user message (a pasted reminder block IS the task).
   const taskText = latestUserTaskText(messages) || latestUserMessageAny(messages)
   const dropToolPayloads = binding !== undefined
+  const isBridgeToolResult = (m: Message): boolean => {
+    if (!isToolResultMessage(m)) return false
+    const callId = toolCallIdOf(m)
+    return callId !== null && callId.startsWith('agytc-bridge-')
+  }
   const trailingText = effectiveTrailingUser
-    .filter((m) => !(dropToolPayloads && isToolResultMessage(m)))
+    .filter((m) => !(dropToolPayloads && isToolResultMessage(m) && !isBridgeToolResult(m)))
     .map(textOf)
     .map((s) => s.trim())
     .filter((s) => s !== '')
+  const hasBridgeToolResult = effectiveTrailingUser.some(isBridgeToolResult)
   const trailingJoined = trailingText.join('\n\n')
   let prompt: string
-  if (taskText !== '') {
+  if (hasBridgeToolResult && trailingJoined !== '') {
+    // A bridge-synthesized tool result (e.g. exit_plan_mode approval or keep-planning
+    // feedback) was executed by DSH, not agy — send it directly instead of repeating
+    // the earlier human prompt.
+    prompt = trailingJoined
+  } else if (taskText !== '') {
     prompt = trailingText.includes(taskText) || trailingJoined.includes(taskText)
       ? trailingJoined
       : (trailingJoined === '' ? taskText : taskText + '\n\n' + trailingJoined)
@@ -576,24 +588,30 @@ async function stagePromptImages(input: StageImagesInput): Promise<{
   let prompt = input.prompt
   const sentIds = binding?.sentImageIds ?? []
   const fromIdx = binding !== undefined ? binding.lastMessageCount : 0
-  const imageRefs = collectUnsentImageRefs(messages, trailingUser, fromIdx, sentIds)
+  const mediaRefs = collectUnsentMediaRefs(messages, trailingUser, fromIdx, sentIds)
   const readImage = deps.readImage
-  if (imageRefs.length === 0 || !readImage) return { prompt, stagedDir: null, stagedIds: [] }
+  if (mediaRefs.length === 0) return { prompt, stagedDir: null, stagedIds: [] }
+  if (!readImage && mediaRefs.every((r) => r.data === undefined && r.path === undefined)) {
+    return { prompt, stagedDir: null, stagedIds: [] }
+  }
 
   const dir = cfg.mediaDir !== '' ? cfg.mediaDir : defaultMediaDir(stateDir())
   const key = ctx.sessionKey !== '' ? ctx.sessionKey.replace(/[^a-zA-Z0-9_-]+/g, '_') : 'anon'
-  const res = await stageImages({
+  const res = await stageMedia({
     dir,
     key,
-    images: imageRefs,
-    readImage,
-    maxImages: cfg.mediaMaxImages,
-    maxBytes: cfg.mediaMaxBytes,
+    items: mediaRefs,
+    ...(readImage ? { readMedia: (ref) => readImage(ref as ImageRefLike) } : {}),
+    maxItems: cfg.mediaMaxImages,
+    maxImageBytes: cfg.mediaMaxBytes,
+    maxFileBytes: cfg.mediaMaxFileBytes,
   })
   if (res.promptSuffix !== '') {
-    prompt = prompt === ''
-      ? (res.promptSuffix + '\n\n[Please inspect the attached image(s) using view_file and assist the user.]')
-      : (prompt + '\n\n' + res.promptSuffix)
+    const hasNonImage = res.staged.some((s) => s.kind !== undefined && s.kind !== 'image')
+    const onlyAttachmentsHint = hasNonImage
+      ? '[Please inspect the attached file(s) using view_file / read_file and assist the user.]'
+      : '[Please inspect the attached image(s) using view_file and assist the user.]'
+    prompt = prompt === '' ? (res.promptSuffix + '\n\n' + onlyAttachmentsHint) : (prompt + '\n\n' + res.promptSuffix)
   }
   return {
     prompt,

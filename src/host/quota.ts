@@ -505,22 +505,10 @@ export class QuotaService {
       this.cliDeps.forceStaggerMs?.() ??
       (process.env.NODE_TEST_CONTEXT !== undefined ? 0 : 400 + Math.floor(Math.random() * 450))
 
-    if (process.platform === 'win32') {
-      for (let i = 0; i < accounts.length; i++) {
-        await this.refreshAccountQuota(accounts[i]!, force).catch(() => null)
-        if (i < accounts.length - 1) {
-          const gap = nextForceGapMs()
-          if (gap > 0) await new Promise((resolve) => setTimeout(resolve, gap))
-        }
-      }
-      return
-    }
-    // Group by effective proxy egress: distinct proxies run concurrently, while
-    // accounts sharing the SAME egress stay bounded and keep an organic jitter
-    // between starts — one IP must never fire a simultaneous multi-account
-    // burst. A user-initiated sweep may overlap a COUPLE of accounts on one
-    // egress (see sweep.ts); waiting for every account's full cascade in turn
-    // made a five-account pool take ~55s (measured 2026-11-19).
+    // Isolated accounts run pure REST calls and never touch the Windows OS
+    // Credential Manager slot; only the single `systemHome` account uses
+    // `credentialSlotMutex` inside `readCliUsageFamilies`. Keep bounded
+    // per-egress concurrency across all platforms to avoid slow serial sweeps.
     const concurrency = Math.max(1, Math.floor(this.cliDeps.forceConcurrency?.() ?? QUOTA_FORCE_CONCURRENCY))
     await sweepAccountsByEgress(accounts, {
       egressOf: (acc) => this.proxyFor(acc) || '__direct__',
