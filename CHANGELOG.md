@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.3.1 (2026-11-22)
+
+### English
+
+- **Expose `v0.6.55` upstream APIs to Pi & PiCrust**:
+  - Merged quota-derived model catalog (`quotaCatalogForAccount`) and `selectedModels` allow-list filtering into `mapCatalogToPiModels` and widget `availableModels`.
+  - Exposed `transport` (`cli` / `acp`), `acpActiveProcesses` / `acpSessions`, `sandbox`, `agent`, `agySettings`, `syncAccountCustomizations`, `imageTool`, and `selectedModels` in `AgyWidgetState.settings`.
+  - Added `/agy transport <cli|acp|status>`, `/agy sandbox <on|off>`, `/agy agent <name|clear>`, `/agy settings <val|clear>`, `/agy sync-ecosystem [on|off|run]`, `/agy image-tool <on|off>`, `/agy selected-models <list|clear>`, and in-session `agy_image` tool registration + `acpPool.dispose()` on shutdown.
+
+### 中文
+
+- **向 Pi 与 PiCrust 暴露上游 `v0.6.55` 新增接口**：
+  - 在 `mapCatalogToPiModels` 与 `availableModels` 中合并基于配额推导的模型目录（`quotaCatalogForAccount`）并支持 `selectedModels` 白名单过滤。
+  - 在 `AgyWidgetState.settings` 暴露 `transport`（`cli` / `acp`）、`acpActiveProcesses` / `acpSessions`、`sandbox`、`agent`、`agySettings`、`syncAccountCustomizations`、`imageTool` 与 `selectedModels`。
+  - 新增 `/agy transport <cli|acp|status>`、`/agy sandbox <on|off>`、`/agy agent <name|clear>`、`/agy settings <val|clear>`、`/agy sync-ecosystem [on|off|run]`、`/agy image-tool <on|off>`、`/agy selected-models <list|clear>`，以及对话内 `agy_image` 工具注册与会话退出时清理 `acpPool`。
+
 ## 1.3.0 (2026-11-21)
 
 ### English

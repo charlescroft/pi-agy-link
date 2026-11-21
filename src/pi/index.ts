@@ -6,6 +6,10 @@ import { listPlugins, manageAgyPlugin } from '../host/agy-plugins.ts'
 import { runBootHygiene } from '../host/boot-hygiene.ts'
 import { MIN_AGY_VERSION, compareVersions, parseVersion, probeProcess } from '../host/runner.ts'
 import { defineAgyMirrorTool } from '../provider/mirror/definition.ts'
+import { defineAgyImageTool } from '../host/image-tool.ts'
+import { mergeCatalogWithQuotaModels, quotaCatalogForAccount } from '../domain/models/quota-catalog.ts'
+import { sanitizeCatalogEntries } from '../host/models.ts'
+import { modelMatches } from '../common/pool-types.ts'
 import type { Context as CordisContext } from './dsh-shims/cordis.ts'
 import type { Message, StreamChunk, TokenUsage } from './dsh-shims/dsh-llm.ts'
 import type { ManagedAccount, ModelFamily } from '../common/pool-types.ts'
@@ -73,18 +77,38 @@ function formatResetShort(iso?: string): string | undefined {
   return `${days}d ${hrs % 24}h`
 }
 
-function mapCatalogToPiModels(services: ReturnType<typeof createHostServices>) {
+function resolveAllCatalogModels(services: ReturnType<typeof createHostServices>) {
   const poolData = services.pool.getPoolData()
   const activeId = services.pool.getActiveAccountId('google') ?? poolData.lastActiveAccountId ?? poolData.primaryAccountId ?? undefined
-  const catalog = services.catalog.get(activeId)
+  const cfg = services.getConfig()
+  const accounts = services.pool.getAccounts()
+  const activeAcc = activeId ? services.pool.getAccount(activeId) : undefined
+  const baseCatalog = cfg.poolWideCatalog
+    ? services.catalog.getUnion(accounts, services.pool)
+    : activeAcc
+      ? services.catalog.getModelsForAccount(activeAcc, services.pool)
+      : services.catalog.get(activeId).models
+  const quotaScope = cfg.poolWideCatalog ? accounts : activeAcc ? [activeAcc] : accounts.slice(0, 1)
+  const quotaModels = quotaScope.flatMap((acc) => quotaCatalogForAccount(acc))
+  return sanitizeCatalogEntries(
+    mergeCatalogWithQuotaModels(sanitizeCatalogEntries(baseCatalog).entries, quotaModels),
+  ).entries
+}
+
+function mapCatalogToPiModels(services: ReturnType<typeof createHostServices>) {
   const cfg = services.getConfig()
   const effectiveContextWindow = resolveEffectiveCompactLimit(cfg).effectiveLimit
+  const selected = (Array.isArray(cfg.selectedModels) ? cfg.selectedModels : [])
+    .map((s) => s.trim())
+    .filter(Boolean)
   const hidden = new Set(
     (Array.isArray(cfg.hiddenModels) ? cfg.hiddenModels : [])
       .map((s) => s.trim())
       .filter(Boolean)
   )
-  const rawModels = catalog.models.filter((m) => !hidden.has(m.id))
+  const rawModels = resolveAllCatalogModels(services).filter(
+    (m) => (selected.length === 0 || selected.some((want) => modelMatches(want, m.id))) && !hidden.has(m.id),
+  )
   return rawModels.map((m) => {
     const efforts = Array.isArray(m.efforts) ? m.efforts : []
     const supportsReasoning = efforts.length > 0
@@ -165,9 +189,8 @@ function buildWidgetState(services: ReturnType<typeof createHostServices>): AgyW
 
   const cfg = services.getConfig()
   const effectiveContextWindow = resolveEffectiveCompactLimit(cfg).effectiveLimit
-  const availableModels = services.catalog
-    .get(activeId ?? undefined)
-    .models.map((m) => m.id)
+  const availableModels = resolveAllCatalogModels(services).map((m) => m.id)
+  const acpSt = services.acpPool.status()
 
   const authSt = services.poolAuth.status()
   const pendingAuthUrl = authSt.phase === 'waiting' ? authSt.url : undefined
@@ -193,16 +216,25 @@ function buildWidgetState(services: ReturnType<typeof createHostServices>): AgyW
       poolWideCatalog: Boolean(cfg.poolWideCatalog),
       autoFallbackModel: Boolean(cfg.autoFallbackModel),
       hiddenModels: Array.isArray(cfg.hiddenModels) ? [...cfg.hiddenModels] : [],
+      selectedModels: Array.isArray(cfg.selectedModels) ? [...cfg.selectedModels] : [],
       autoWarmup: Boolean(cfg.autoWarmup),
       imageModel: cfg.imageModel || '',
       imageEffort: cfg.imageEffort || 'low',
       imageTimeoutMs: Number(cfg.imageTimeoutMs ?? 240000),
       imageRetries: Number(cfg.imageRetries ?? 1),
       imageOutputDir: cfg.imageOutputDir || '',
+      imageTool: Boolean(cfg.imageTool),
       autoCompactOverride: Number(cfg.autoCompactOverride ?? 0),
       effectiveCompactLimit: effectiveContextWindow,
       modelApiMaxRetries: Number(cfg.modelApiMaxRetries ?? 3),
       slimPromptRules: cfg.slimPromptRules !== false,
+      transport: cfg.transport || 'cli',
+      acpActiveProcesses: Number(acpSt.activeProcesses ?? 0),
+      acpSessions: Number(acpSt.sessions ?? 0),
+      sandbox: Boolean(cfg.sandbox),
+      agent: cfg.agent || '',
+      agySettings: cfg.agySettings || '',
+      syncAccountCustomizations: Boolean(cfg.syncAccountCustomizations),
       plugins,
       agyPluginsEnabled: plugins.filter((p) => p.enabled).map((p) => p.name),
     },
@@ -742,7 +774,46 @@ export default function (pi: ExtensionAPI): void {
       clearInterval(authWatchTimer)
       authWatchTimer = null
     }
+    services.acpPool.dispose()
   })
+
+  let imageToolRegistered = false
+  const ensureImageToolRegistered = () => {
+    if (imageToolRegistered || !services.getConfig().imageTool) return
+    imageToolRegistered = true
+    const imageToolDef = defineAgyImageTool({
+      imageService: () => services.imageService,
+    })
+    pi.registerTool({
+      name: imageToolDef.name,
+      label: 'Antigravity Image Generator',
+      description: imageToolDef.description,
+      parameters: {
+        type: 'object',
+        properties: {
+          prompt: { type: 'string', description: 'Detailed image prompt (or edit instruction when imagePaths is given).' },
+          name: { type: 'string', description: 'Optional filename stem for the generated artifact.' },
+          aspectRatio: { type: 'string', description: 'Optional aspect ratio (1:1, 16:9, 9:16, 4:3, 3:4, ...).' },
+          imagePaths: { type: 'string', description: 'Optional comma- or newline-separated local reference image paths for editing.' },
+          outPath: { type: 'string', description: 'Optional output file path or directory to copy the generated image into.' },
+          model: { type: 'string', description: 'Optional driving Antigravity model id.' },
+          effort: { type: 'string', description: 'Optional reasoning effort (low, medium, high).' },
+        },
+        required: ['prompt'],
+      } as any,
+      execute: async (_toolCallId, params: Record<string, unknown>, signal) => {
+        if (!services.getConfig().imageTool) {
+          throw new Error('agy_image is disabled (/agy image-tool on)')
+        }
+        const text = await imageToolDef.execute(params as any, { signal } as any)
+        return {
+          content: [{ type: 'text' as const, text: typeof text === 'string' ? text : String(text ?? '') }],
+          details: {},
+        }
+      },
+    })
+  }
+  ensureImageToolRegistered()
 
   const mirrorTool = defineAgyMirrorTool({ runs: services.runs })
   pi.registerTool({
@@ -1169,6 +1240,111 @@ export default function (pi: ExtensionAPI): void {
         services.setOverride('imageOutputDir', nextDir)
         publishAgyUi(ctx, services)
         emitOutput(ctx, nextDir ? `Image output directory set to ${nextDir}` : 'Image output directory reset to default')
+        return
+      }
+      if (sub === 'image-tool' && rest[0]) {
+        const on = rest[0].toLowerCase() === 'on' || rest[0].toLowerCase() === 'true'
+        services.setOverride('imageTool', on)
+        if (on) ensureImageToolRegistered()
+        publishAgyUi(ctx, services)
+        emitOutput(ctx, `agy_image tool ${on ? 'enabled' : 'disabled'}`)
+        return
+      }
+      if (sub === 'transport') {
+        const rawMode = (rest[0] || '').toLowerCase()
+        if (!rawMode || rawMode === 'status') {
+          const st = services.acpPool.status()
+          emitOutput(ctx, `Transport: ${services.getConfig().transport} (ACP activeProcesses=${st.activeProcesses}, sessions=${st.sessions})`)
+          return
+        }
+        if (rawMode !== 'cli' && rawMode !== 'acp') {
+          emitOutput(ctx, 'Usage: /agy transport <cli|acp|status>', 'error')
+          return
+        }
+        services.setOverride('transport', rawMode)
+        publishAgyUi(ctx, services)
+        emitOutput(ctx, `Transport mode set to ${rawMode} — effective next turn`)
+        return
+      }
+      if (sub === 'sandbox' && rest[0]) {
+        const on = rest[0].toLowerCase() === 'on' || rest[0].toLowerCase() === 'true'
+        services.setOverride('sandbox', on)
+        publishAgyUi(ctx, services)
+        emitOutput(ctx, `Terminal sandbox ${on ? 'enabled' : 'disabled'} — effective next turn`)
+        return
+      }
+      if (sub === 'agent') {
+        const rawAgent = rest.join(' ').trim()
+        const nextAgent = !rawAgent || rawAgent === 'off' || rawAgent === 'clear' || rawAgent === 'default' ? '' : rawAgent
+        services.setOverride('agent', nextAgent)
+        publishAgyUi(ctx, services)
+        emitOutput(ctx, nextAgent ? `Custom agent set to ${nextAgent} — effective next turn` : 'Custom agent cleared (using default)')
+        return
+      }
+      if (sub === 'settings') {
+        const rawVal = rest.join(' ').trim()
+        if (!rawVal || rawVal === 'show') {
+          const cur = services.getConfig().agySettings.trim()
+          emitOutput(ctx, cur ? `Current --settings override: ${cur}` : 'Current --settings override: (none)')
+          return
+        }
+        if (rawVal === 'off' || rawVal === 'clear') {
+          services.setOverride('agySettings', '')
+          publishAgyUi(ctx, services)
+          emitOutput(ctx, 'Cleared --settings override')
+          return
+        }
+        if (rawVal.startsWith('{')) {
+          try {
+            const parsed = JSON.parse(rawVal)
+            if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+              emitOutput(ctx, 'Inline --settings JSON must be a plain object', 'error')
+              return
+            }
+          } catch (err) {
+            emitOutput(ctx, `Invalid --settings JSON: ${err instanceof Error ? err.message : String(err)}`, 'error')
+            return
+          }
+        }
+        services.setOverride('agySettings', rawVal)
+        publishAgyUi(ctx, services)
+        emitOutput(ctx, 'Updated --settings override — effective next turn')
+        return
+      }
+      if (sub === 'selected-models') {
+        const raw = rest.join(' ').trim()
+        const list =
+          !raw || raw === 'clear' || raw === 'none'
+            ? []
+            : raw
+                .split(',')
+                .map((s: string) => s.trim())
+                .filter(Boolean)
+        services.setOverride('selectedModels', list)
+        registerAgyProvider()
+        publishAgyUi(ctx, services)
+        emitOutput(ctx, list.length > 0 ? `Selected models allow-list: ${list.join(', ')}` : 'Cleared selected models allow-list')
+        return
+      }
+      if (sub === 'sync-ecosystem' || sub === 'sync') {
+        const arg0 = (rest[0] || '').toLowerCase()
+        if (arg0 === 'on' || arg0 === 'off' || arg0 === 'true' || arg0 === 'false') {
+          const on = arg0 === 'on' || arg0 === 'true'
+          services.setOverride('syncAccountCustomizations', on)
+          publishAgyUi(ctx, services)
+          emitOutput(ctx, `Account ecosystem auto-sync ${on ? 'enabled' : 'disabled'}`)
+          return
+        }
+        try {
+          const result = services.ecosystem.syncAll({ force: true })
+          publishAgyUi(ctx, services)
+          emitOutput(
+            ctx,
+            `Ecosystem synced (${result.syncedAccounts.length} accounts): +${result.copiedFiles}/-${result.removedFiles} files`,
+          )
+        } catch (err) {
+          emitOutput(ctx, `Ecosystem sync failed: ${err instanceof Error ? err.message : String(err)}`, 'error')
+        }
         return
       }
       showStatus(ctx)
