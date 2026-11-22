@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { existsSync, statSync } from 'node:fs'
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from '@earendil-works/pi-coding-agent'
 import { createAssistantMessageEventStream } from '@earendil-works/pi-ai'
@@ -126,7 +127,7 @@ function mapCatalogToPiModels(services: ReturnType<typeof createHostServices>) {
       baseUrl: 'agy-cli://local',
       reasoning: supportsReasoning,
       thinkingLevelMap,
-      input: ['text'] as Array<'text' | 'image'>,
+      input: ['text', 'image'] as Array<'text' | 'image'>,
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
       contextWindow: effectiveContextWindow,
       maxTokens: 65_536,
@@ -330,6 +331,18 @@ function convertPiMessagesToDsh(context: { systemPrompt?: string; messages?: Arr
             parts.push({ type: 'text', text: p.text })
           } else if (p.type === 'thinking' && typeof p.thinking === 'string') {
             parts.push({ type: 'reasoning', text: p.thinking })
+          } else if (p.type === 'image' && typeof p.data === 'string' && p.data.length > 0) {
+            const mediaType =
+              typeof p.mimeType === 'string' && p.mimeType.trim() !== ''
+                ? p.mimeType.trim()
+                : 'image/png'
+            const attachmentId = `pi-img-${createHash('sha1').update(p.data).digest('hex').slice(0, 16)}`
+            parts.push({
+              type: 'image',
+              attachmentId,
+              mediaType,
+              data: p.data,
+            })
           } else if (p.type === 'toolCall') {
             parts.push({
               type: 'tool-call',

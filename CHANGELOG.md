@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.4.1 (2026-11-22)
+
+### English
+
+- **Fix(pi/multimodal): forward user image attachments from Pi into `agy` staging and advertise `['text', 'image']` input capability.** Previously `mapCatalogToPiModels` advertised `input: ['text']` only and `convertPiMessagesToDsh` skipped `type: 'image'` content blocks, so attached images were dropped before reaching `stagePromptImages`.
+
+### 中文
+
+- **修复(pi/多模态)：将 Pi 用户消息中的图片附件透传到 `agy` 多模态暂存链路，并将模型输入能力声明为 `['text', 'image']`。** 此前 `mapCatalogToPiModels` 仅声明 `input: ['text']`，且 `convertPiMessagesToDsh` 忽略了 `type: 'image'` 内容块，导致附带的图片在进入 `stagePromptImages` 前被丢弃。
+
 ## 1.4.0 (2026-11-22)
 
 ### English
