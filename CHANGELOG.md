@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.4.0 (2026-11-22)
+
+### English
+
+- **Sync upstream `dsh-agy-link` (`v0.6.55` → `v0.6.59`)**:
+  - **Fix(quota, `v0.6.59` / PR #160)**: Never spawn `agy` for hourly CLI quota polling with a token about to expire (`src/features/quota/cli-token.ts`, `CLI_TOKEN_SAFETY_MS = 120_000`), preventing `agy` from falling back to interactive OAuth and popping a browser window; falls back cleanly to REST polling when outside the safety window.
+  - **Fix(open, `v0.6.59` / PR #159)**: `executeOpenInSystem()` verifies target existence before handing it to the OS opener (preventing Explorer from silently opening Desktop on missing targets) and makes the opener injectable for tests.
+  - **Feat(accounts, `v0.6.58` / issue #152 part 1)**: Editable pool account labels (`POST /plugins/agy-link/pool/alias`) with inline rename UI (`src/client/sections/inline-editor.ts`) and 4-language localization.
+  - **Feat(failover, `v0.6.57`)**: Full-chain quota failover alignment (`src/provider/quota-failover.ts`) across subagents, auxiliary requests (`oneshot`), image generation, and translation workers.
+  - **Fix(subagent/acp, `v0.6.56` / PR #155)**: Surface live background task logs (`src/features/subagent/task-activity.ts`) and ACP tracker activity.
+
+### 中文
+
+- **跟进上游 `dsh-agy-link`（`v0.6.55` → `v0.6.59`）**：
+  - **修复(配额，`v0.6.59` / PR #160)**：每小时 CLI 配额轮询前确保 token 处于安全剩余窗口（`src/features/quota/cli-token.ts`，`CLI_TOKEN_SAFETY_MS = 120_000`），避免因 token 即将过期触发 `agy` 回退到交互式 OAuth 弹浏览器；无法刷新到安全窗口时跳过本轮 CLI 改由 REST 路径作答。
+  - **修复(open，`v0.6.59` / PR #159)**：`executeOpenInSystem()` 在交给系统打开器前先确认目标存在，避免缺失路径导致系统静默打开桌面，并使打开器可注入测试。
+  - **特性(账号，`v0.6.58` / issue #152 第一部分)**：支持编辑账号池显示名称（`POST /plugins/agy-link/pool/alias`）、卡片内联重命名编辑器（`src/client/sections/inline-editor.ts`）与四语言文案。
+  - **特性(故障转移，`v0.6.57`)**：全链路配额故障转移对齐（`src/provider/quota-failover.ts`），覆盖子代理、辅助请求（`oneshot`）、图像生成与翻译工作进程。
+  - **修复(子代理/ACP，`v0.6.56` / PR #155)**：实时展示后台任务日志（`src/features/subagent/task-activity.ts`）与 ACP tracker 活动状态。
+
 ## 1.3.1 (2026-11-22)
 
 ### English

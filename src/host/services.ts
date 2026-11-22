@@ -29,9 +29,11 @@ import { defaultMediaDir } from './media.ts'
 import { ImageService, runViaAdapter } from './image.ts'
 import { EcosystemService } from '../features/ecosystem/index.ts'
 import { AcpSessionPool, runAcpAttempt } from '../features/acp/index.ts'
+import { createPoolQuotaHooks } from '../provider/quota-failover.ts'
 import { agyMcpConfigPath, registerBridgeMcpConfig, type McpBridge } from './mcp-bridge.ts'
 import { readAccountCredential } from './credential-backup.ts'
-import { acquireCredentialSlot } from './credential-slot.ts'
+import { acquireCredentialSlot, defaultSlotIo, readPrimaryCredential } from './credential-slot.ts'
+import { installSlotOrThrow } from '../domain/credentials/lease.ts'
 import {
   Semaphore,
   findSessionLogFile,
@@ -96,6 +98,25 @@ export function createHostServices(ctx: Context, entryConfig: Record<string, unk
       bin: () => bin(),
       viaCli: () => getConfig().quotaViaCli,
       preemptAutoUpdate: () => getConfig().suppressAgyAutoUpdate,
+      // On Windows the CLI reads Credential Manager, so a token refreshed for
+      // the safety window has to land in the slot too — QuotaService already
+      // holds credentialSlotMutex for this read. Other platforms have no slot:
+      // agy reads the token document itself, which the refresh just rewrote.
+      ...(process.platform === 'win32'
+        ? {
+            syncSlot: () => {
+              const raw = readPrimaryCredential(pool.dir)?.raw
+              if (raw === undefined || raw === '') return false
+              try {
+                installSlotOrThrow(defaultSlotIo(), raw, log, 'quota token refresh')
+                return true
+              } catch {
+                return false
+              }
+            },
+          }
+        : {}),
+      log,
     },
   )
   const warmup = new WarmupService(
@@ -322,6 +343,8 @@ export function createHostServices(ctx: Context, entryConfig: Record<string, unk
     },
   })
 
+  const quotaHooks = createPoolQuotaHooks(pool)
+
   const translation = new TranslationService({
     cfg: getConfig,
     catalog: () => catalog.get(),
@@ -329,6 +352,7 @@ export function createHostServices(ctx: Context, entryConfig: Record<string, unk
     autoEnabled: (id) => sessionAuto.get(id) ?? getConfig().autoTranslate,
     sessionCwd: (id) => sessionWorkspace(id),
     sessionLogPath: (id) => findSessionLogFile(dshHome(), id),
+    poolQuotaHops: quotaHooks.poolQuotaHops,
     log,
     run: (req) => runTranslationStream(ctx, getConfig, log, req, translationWorkers),
     appendRecord: async (sessionId, record: TranslationRecord) => {
@@ -403,6 +427,7 @@ export function createHostServices(ctx: Context, entryConfig: Record<string, unk
     bin,
     run: (call) => runViaAdapter(adapter, call),
     catalog: () => catalog.get(),
+    ...quotaHooks,
     log,
   })
 

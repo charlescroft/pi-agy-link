@@ -12,49 +12,14 @@ Threat model and boundaries for dsh-agy-link.
 
 ## What it can do to your machine
 
-Whatever agy itself may do under the configured permission mode. **skip**
-(`--dangerously-skip-permissions`) auto-approves ordinary AGY permission
-prompts for unattended file writes and shell execution inside agy's workspace
-— treat it like giving any other agent skip-permissions. It does **not** bypass
-AGY hardcoded system protections. The GUI marks this mode red for a reason.
+- Per-account OAuth token files and `.bak` backups are written atomically with `0600` permissions; Windows Credential Manager handoffs verify refresh-token fingerprints (`sameCredentialGrant`) so foreign tokens can never overwrite an account file.
+- `EcosystemService` mirrors only an explicit allowlist of primary customizations (`plugins`, `skills`, `rules`, `agents`, and MCP config) into isolated pool account HOMEs while explicitly excluding `.env`, OAuth tokens (`.bak`, `.primary-credential.json`), private keys (`.pem`/`.key`), logs, conversations, and keychains.
+- DSH-side API keys and other providers' credentials are never read or modified.
+- `/agy doctor` strips Google auth URLs, `4/...` codes, `ya29.*` access tokens, `1//...` refresh tokens, JWTs, API keys, and proxy credentials before writing diagnostics.
 
 ## Headless permission behavior
 
-The bridge forwards the configured `plan` or `accept-edits` mode to the
-official `agy` process; it does not answer permission prompts or bypass them.
-In a headless/print invocation, agy may automatically deny a tool request.
-The bridge preserves that raw tool error in run status. Such an automatic
-denial is **not** evidence that a person approved or denied a prompt.
-Missing-file failures are reported as `missing_file`, not as approval outcomes;
-hardcoded-system-protection failures remain distinct. Raw AGY tool error text
-and its error result are preserved for replay.
-
-Do not rely on undocumented wildcard behavior for `plan` or `accept-edits`.
-Use a deliberately scoped workspace and test the exact commands and agy
-version you intend to operate. `skip` remains an explicit unattended-execution
-choice, not a fallback applied by this plugin.
-
-## What it never touches
-
-- The OAuth token file (see [AUTH.md](AUTH.md)).
-- DSH-side secrets, API keys, or other providers' configuration.
-
-## Report hygiene
-
-`/agy doctor` writes its report with redaction: Google auth URLs,
-`4/...` authorization codes, `ya29.*` access tokens, `1//0…` refresh tokens,
-OIDC/JWT `id_token`s, `AIza…`/`sk-…`/`GOCSPX-…` API keys, credentialed proxy
-URLs, and `Bearer` headers are stripped before the file hits disk. Still read it
-before attaching.
-
-## HTTP surfaces and request-body caps
-
-- The plugin's web routes (`/plugins/agy-link/*`) and the experimental loopback
-  MCP bridge (`/call`) share one bounded JSON body reader
-  (`src/host/read-json-body.ts`): bodies are capped (1 MiB for plugin routes,
-  8 MiB for `/call`) and oversized bodies are discarded rather than buffered, so
-  a local client — including a prompt-injected agy child holding the bridge token
-  — cannot exhaust host memory by streaming a huge POST body.
-- The MCP bridge binds to `127.0.0.1` only, requires a per-process random bearer
-  token compared in constant time, enforces `mcpToolAllowlist` at execution time,
-  and never exposes the internal `run_code`/`agy_ask`/`agy_tool` tools.
+- Loopback Origin enforcement: browser requests carrying a non-loopback `Origin` header are rejected (`403`), and no wildcard `Access-Control-Allow-Origin: *` header is emitted on `/media`, `/open`, or `/assets`.
+- `/plugins/agy-link/open` is strictly `POST`-only (`405` on `GET`, preventing auto-trigger via markdown image tags), confined via `realpathSync` to active workspace/media/brain directories, blocks sensitive credential paths (`.ssh`, `.aws`, `.gnupg`, `.kube`, `.dsh`, `.gemini/antigravity-cli`, `.env`, private keys), refuses executable extensions, and passes Windows targets via environment variable (`-LiteralPath`) without PowerShell string interpolation.
+- `/plugins/agy-link/embed` (Generative UI `<agent-embed>`) serves only confined local `.html` artifacts up to 2 MiB with strict CSP (`default-src 'none'`, `connect-src 'none'`, allowlisted Tailwind CDN script only) inside a sandboxed `<iframe sandbox="allow-scripts">` (no `allow-same-origin`).
+- Request bodies are capped (`1 MiB` for plugin routes, `8 MiB` for loopback MCP `/call`), and the loopback MCP bridge requires a constant-time random bearer token plus `mcpToolAllowlist` enforcement while excluding internal tools (`run_code`, `agy_ask`, `agy_tool`).

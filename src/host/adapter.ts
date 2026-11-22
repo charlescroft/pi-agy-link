@@ -7,7 +7,6 @@
 // first bind (ADR-7).
 import { homedir } from 'node:os'
 import { LlmAdapter, LlmError, type GenerateOptions, type LlmModelInfo, type LlmProviderInfo, type LlmResolvedModelInfo, type StreamChunk } from '@deepseek-ai/dsh-llm'
-import { modelFamilyOf } from '../common/pool-types.ts'
 import type { AgyGenerateOptions } from '../common/protocol.ts'
 import { resolveCallContext, effectivePermissionMode } from '../provider/call-context.ts'
 import { purposePolicy } from '../provider/purpose-policy.ts'
@@ -193,23 +192,14 @@ export class AgyAdapter extends LlmAdapter {
     return buildAgyArgs(opts)
   }
 
-  /** Effort and model self-healing wrapper around streamAttempt (issue #67, PR #100). */
+  /** Effort, model, and aux-quota self-healing wrapper around streamAttempt (issue #67, PR #100). */
   override async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
     yield* streamWithEffortRetry({
       streamAttempt: (opts, suppressEffort) => this.streamAttempt(opts, suppressEffort),
       learnEffortUnsupported: (model) => this.learnEffortUnsupported(model),
       catalogAdvertisesEffort: (model) => this.deps.catalog.advertisedEfforts(model).length > 0,
-      onModelUnsupported: (unrecog) => {
-        const fam = modelFamilyOf(unrecog)
-        const pool = this.deps.pool
-        if (pool) {
-          const currentId = pool.getActiveAccountId(fam)
-          if (currentId) {
-            pool.markModelUnsupported(currentId, unrecog)
-          }
-          pool.selectAccount(fam, unrecog)
-        }
-      },
+      pool: this.deps.pool,
+      defaultModel: () => this.deps.getConfig().defaultModel,
     }, options as AgyGenerateOptions)
   }
 
@@ -486,42 +476,34 @@ export class AgyAdapter extends LlmAdapter {
       // Steer: a NEW prompt arrives while the previous run is still live.
       // Abort it so two agy processes never append to the same conversation.
       if (runLive && !samePrompt) {
-        // Harvest the live conversation id BEFORE aborting: a tool-cut or
-        // caller abort used to drop the binding entirely, so the replacement
-        // process started a brand-new agy conversation with digest-only
-        // prompt (issue #35 root cause ②).
-        const liveCid = (liveRun.accountHome ?? '') === (account?.dir ?? '') ? liveRun.conversationId : null
-        if (
-          liveCid !== null &&
-          binding === undefined &&
-          !isAux &&
-          sessionAccountKey !== ''
-        ) {
-          binding = {
-            conversationId: liveCid,
-            lastMessageCount: Math.max(0, lastAssistantIdx + 1),
-            updatedAt: Date.now(),
-            model: currentModel,
-            interrupted: true,
-          }
-        } else if (binding !== undefined) {
-          binding.interrupted = true
-        }
-        // A run whose result was ALREADY consumed is just finishing its own
-        // shutdown: killing it there cut agy mid-finalize (re-creating the
-        // server-side divergence that makes it answer the previous message)
-        // and recorded a false ABORTED for a turn that actually answered.
-        // Give it a moment to exit on its own; only a still-running turn is
-        // actually preempted.
+        // Wait briefly if a result was already emitted before preempting leftover shutdown;
+        // only genuinely interrupted runs mark the binding or inject the warning banner.
         if (liveRun.hasResult) {
           const exited = await waitForRunSettle(liveRun, 1_500)
           if (!exited) this.deps.log?.('previous agy run did not exit within 1.5s after producing its result — preempting it')
         }
+        const wasConsumable = liveRun.hasConsumableResult
         if (!liveRun.isSettled) {
+          const liveCid = (liveRun.accountHome ?? '') === (account?.dir ?? '') ? liveRun.conversationId : null
+          if (!wasConsumable) {
+            if (
+              liveCid !== null &&
+              binding === undefined &&
+              !isAux &&
+              sessionAccountKey !== ''
+            ) {
+              binding = {
+                conversationId: liveCid,
+                lastMessageCount: Math.max(0, lastAssistantIdx + 1),
+                updatedAt: Date.now(),
+                model: currentModel,
+                interrupted: true,
+              }
+            } else if (binding !== undefined) {
+              binding.interrupted = true
+            }
+          }
           liveRun.requestAbort?.()
-          // Two agy processes must never append to one conversation at the same
-          // time. Give the aborted process a bounded moment to actually exit
-          // (SIGTERM, then the SIGKILL escalation) before the replacement spawns.
           const exited = await waitForRunSettle(liveRun, 3_500)
           if (!exited) {
             this.warnOnce(
@@ -529,7 +511,7 @@ export class AgyAdapter extends LlmAdapter {
               'the preempted agy run did not exit within 3.5s — starting the replacement anyway; its late write-back is ignored because the newer run owns the session',
             )
           }
-          if (!prompt.includes('the previous turn was interrupted')) {
+          if (!wasConsumable && !prompt.includes('the previous turn was interrupted')) {
             prompt = '[the previous turn was interrupted before it finished — do not continue or answer that unfinished work; respond only to the newest request below]\n\n' + prompt
           }
         }
