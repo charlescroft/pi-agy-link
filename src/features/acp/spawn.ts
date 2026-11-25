@@ -6,8 +6,19 @@
 // servers, task shells) with a single group signal. See ./strays.ts for the
 // reconciliation that catches anything that still slips through.
 import { spawn, type ChildProcess } from 'node:child_process'
+import { delimiter, dirname } from 'node:path'
 import { isCmdShim, windowsQuote } from '../../runtime/agy/bin.ts'
 import { nodeScriptEnv } from '../../runtime/agy/env.ts'
+
+function ensureNodeInPath(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const nodeDir = dirname(process.execPath)
+  if (!nodeDir) return env
+  const pathKey = Object.keys(env).find((k) => k.toLowerCase() === 'path') ?? 'PATH'
+  const current = env[pathKey] ?? ''
+  const entries = current.split(delimiter).filter(Boolean)
+  if (entries.includes(nodeDir)) return env
+  return { ...env, [pathKey]: current ? `${current}${delimiter}${nodeDir}` : nodeDir }
+}
 
 export interface AcpSpawnOptions {
   bin: string
@@ -20,18 +31,19 @@ export function spawnAcpChild(
   args: readonly string[],
   env: NodeJS.ProcessEnv,
 ): ChildProcess {
+  const effectiveEnv = ensureNodeInPath(env)
   const isWin = process.platform === 'win32'
   // Windows has no Unix process groups; `taskkill /T /F` walks the tree instead.
   const detached = !isWin
   if (isWin && isCmdShim(opts.bin)) {
     return spawn(process.env.ComSpec ?? 'cmd.exe', ['/d', '/s', '/c', [opts.bin, ...args].map(windowsQuote).join(' ')], {
-      cwd: opts.cwd, env, stdio: ['pipe', 'pipe', 'pipe'], windowsVerbatimArguments: true, windowsHide: true,
+      cwd: opts.cwd, env: effectiveEnv, stdio: ['pipe', 'pipe', 'pipe'], windowsVerbatimArguments: true, windowsHide: true,
     })
   }
   if (/\.(?:m?js|cjs)$/i.test(opts.bin)) {
     return spawn(process.execPath, [opts.bin, ...args], {
-      cwd: opts.cwd, env: nodeScriptEnv(env), stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true, detached,
+      cwd: opts.cwd, env: nodeScriptEnv(effectiveEnv), stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true, detached,
     })
   }
-  return spawn(opts.bin, [...args], { cwd: opts.cwd, env, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true, detached })
+  return spawn(opts.bin, [...args], { cwd: opts.cwd, env: effectiveEnv, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true, detached })
 }

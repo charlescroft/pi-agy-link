@@ -100,6 +100,7 @@ export class AcpSessionPool {
   private readonly idleTtlMs: number
   private sweepTimer: NodeJS.Timeout | null = null
   private readonly strays: StrayDeps | null
+  private readonly usesRealStrays: boolean
   private strayObserved: readonly number[] = []
   private strayScanAt = 0
   private reapedStrays = 0
@@ -110,9 +111,13 @@ export class AcpSessionPool {
   constructor(private readonly opts: AcpPoolOptions) {
     this.maxProcesses = opts.maxProcesses ?? 4
     this.idleTtlMs = opts.idleTtlMs ?? 15 * 60_000
+    this.usesRealStrays = opts.strays === undefined
     this.strays = opts.strays === undefined
       ? (process.env.NODE_TEST_CONTEXT === undefined ? realStrayDeps() : null)
       : opts.strays
+    if (this.usesRealStrays) {
+      getProcessAcpPools().add(this)
+    }
   }
 
   private ensureSweepTimer(): void {
@@ -448,8 +453,8 @@ export class AcpSessionPool {
     return closed
   }
 
-  /** Pids this pool still owns: live + draining. Never stray-killed. */
-  private trackedPids(): Set<number> {
+  /** Pids this pool instance owns: live + draining. */
+  private ownTrackedPids(): Set<number> {
     const out = new Set<number>()
     for (const proc of this.procs.values()) {
       if (proc.pid !== null && proc.pid !== undefined) out.add(proc.pid)
@@ -458,6 +463,29 @@ export class AcpSessionPool {
       if (entry.proc.pid !== null && entry.proc.pid !== undefined) out.add(entry.proc.pid)
     }
     return out
+  }
+
+  /**
+   * Pids owned across all live AcpSessionPool instances in this Node process.
+   * Hosts like PiCrust run multiple extension instances in one shared sidecar
+   * process (same `process.pid`); aggregating across instances prevents an idle
+   * instance from mistaking another active session's `agy acp` child for a stray.
+   */
+  private trackedPids(): Set<number> {
+    if (!this.usesRealStrays) return this.ownTrackedPids()
+    const out = new Set<number>()
+    for (const pool of getProcessAcpPools()) {
+      for (const pid of pool.ownTrackedPids()) out.add(pid)
+    }
+    return out
+  }
+
+  private hasAnyTrackedProcessInHost(): boolean {
+    if (!this.usesRealStrays) return this.procs.size > 0 || this.draining.size > 0
+    for (const pool of getProcessAcpPools()) {
+      if (pool.procs.size > 0 || pool.draining.size > 0) return true
+    }
+    return false
   }
 
   /**
@@ -496,7 +524,7 @@ export class AcpSessionPool {
   private observeStrays(now: number): readonly number[] {
     if (this.strays === null) return []
     if (this.strayScanAt !== 0 && now - this.strayScanAt < STRAY_SCAN_OBSERVE_MS) return this.strayObserved
-    return this.sweepStrays(now, this.procs.size === 0 && this.draining.size === 0).strays
+    return this.sweepStrays(now, !this.hasAnyTrackedProcessInHost()).strays
   }
 
   // A live turn is never idle: re-stamp it; otherwise TTL + no retained session.
@@ -587,6 +615,9 @@ export class AcpSessionPool {
   }
 
   dispose(): void {
+    if (this.usesRealStrays) {
+      getProcessAcpPools().delete(this)
+    }
     if (this.sweepTimer) {
       clearInterval(this.sweepTimer)
       this.sweepTimer = null
@@ -596,4 +627,16 @@ export class AcpSessionPool {
     for (const entry of this.draining.values()) entry.proc.close()
     this.draining.clear()
   }
+}
+
+const ACP_POOLS_REGISTRY_KEY = Symbol.for('pi-agy-link.acp-session-pools')
+
+function getProcessAcpPools(): Set<AcpSessionPool> {
+  const g = globalThis as Record<symbol, Set<AcpSessionPool> | undefined>
+  let set = g[ACP_POOLS_REGISTRY_KEY]
+  if (!set) {
+    set = new Set<AcpSessionPool>()
+    g[ACP_POOLS_REGISTRY_KEY] = set
+  }
+  return set
 }

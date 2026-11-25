@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.5.1 (2026-11-25)
+
+### English
+
+- **Fix ACP stray reaper killing sibling sessions in shared-process hosts (`src/features/acp/pool.ts`)**: Maintain a process-wide `AcpSessionPool` registry (`globalThis[Symbol.for('pi-agy-link.acp-session-pools')]`) so `trackedPids()` and `observeStrays()` aggregate live/draining ACP PIDs across all extension instances sharing the same Node process (e.g. PiCrust sidecar), preventing idle session instances from sending `SIGTERM` to other active sessions' `agy acp` processes.
+- **Fix `node` missing from `PATH` in GUI-spawned `agy acp` children (`src/features/acp/spawn.ts`)**: Append `dirname(process.execPath)` to child `PATH` when absent so MCP servers and hooks launched inside `agy acp` can resolve `node`.
+- **Optimize npm package size (`package.json`, `scripts/build-pi.mjs`)**: Minify Pi runtime bundles (`dist/pi-extension.js`, `dist/mcp-sanitize.mjs`), trim `files` to the 8 runtime/package files, and move `esbuild`/`qrcode` to `devDependencies` (zero runtime dependencies, tarball reduced from 5.3 MB to ~585 kB).
+
+### 中文
+
+- **修复同进程多实例下 ACP 孤儿清理误杀友军会话（`src/features/acp/pool.ts`）**：引入进程级 `AcpSessionPool` 注册表（`globalThis[Symbol.for('pi-agy-link.acp-session-pools')]`），在 `trackedPids()` 与 `observeStrays()` 中跨实例汇总同一 Node 进程（如 PiCrust sidecar）内所有活跃/排空中的 `agy acp` PID，避免空闲会话实例向其他活跃会话发送 `SIGTERM` 导致 `agy acp exited (code=0, signal=null)`。
+- **修复 GUI 启动环境下 `agy acp` 子进程找不到 `node` 的问题（`src/features/acp/spawn.ts`）**：启动 `agy acp` 时若 `PATH` 不含当前 Node 目录（`dirname(process.execPath)`）则自动追加，修复 `agy` 内部 MCP 与 hooks 报 `node: command not found`（exit 127）。
+- **优化 npm 打包体积（`package.json`、`scripts/build-pi.mjs`）**：压缩 Pi 运行时产物，精简 `files` 白名单至 8 个必要文件，并将 `esbuild`/`qrcode` 移至 `devDependencies`（零运行时依赖，压缩包由 5.3 MB 降至 ~585 kB）。
+
 ## 1.5.0 (2026-11-25)
 
 ### English
