@@ -42,15 +42,26 @@
 
 ## 4. 结构化异常态：区分「需重登」「需网页验证」与「终态封禁」
 
+状态由 `accountAuthState(acc)`（`src/common/quota-bench.ts`）唯一推导，UI / `/agy pool` / 判定共用：
+
 | 状态原因 | 判定特征 | 自动恢复语义 | UI 呈现 |
 | --- | --- | --- | --- |
-| `TOS_VIOLATION`（终态封禁） | `TOS_VIOLATION` / `violation of Terms of Service`（含 `appeal_url`） | **粘性隔离（#114）**：`clearAuthRequired(id, false)` 与 `needsAuthReverify()` 均不清除；仅用户显式重新授权/导入（`force = true`）可解除 | 显示「服务受限 / 申诉」及可点击 `appeal_url` |
-| `VALIDATION_REQUIRED`（临时人机/手机验证） | `VALIDATION_REQUIRED` / `Verify your account`（含 `validation_url`） | 允许后台重验与验证完成后恢复 | 显示「需安全验证」及可点击 `validation_url`，不误导重走 OAuth |
-| 普通 `authRequired`（凭据过期/撤销） | 连续 2 次确认或权威 `invalid_grant` | 任意有效请求/配额成功即自动 `clearAuthRequired(id, false)`；满 `AUTH_REVERIFY_DELAY_MS`（10m）允许后台自愈重验 | 显示「需重新登录」 |
+| `tos`（终态封禁） | `TOS_VIOLATION` / `violation of Terms of Service`（含 `appeal_url`） | **粘性隔离（#114）**：`clearAuthRequired(id, false)`、`needsAuthReverify()` 与配额自愈均不清除；仅用户显式重新授权/导入（`force = true`）可解除 | 红标「已封禁 (ToS)」+ 可点击 `appeal_url` |
+| `validation`（临时人机/手机验证） | `VALIDATION_REQUIRED` / `Verify your account`（含 `validation_url`） | 允许后台重验与验证完成后恢复；配额成功**不**清标（token 仍有效，issue #114 同理） | 红标「需安全验证」+ 可点击 `validation_url`，不误导重走 OAuth |
+| `relogin`（凭据过期/撤销） | 权威 `invalid_grant` / `revoked` / `unauthorized_client`，或连续 2 次非权威确认后升级 | 任意有效请求/配额成功即自动 `clearAuthRequired(id, false)`；快速复核窗口 2m（见下） | 红标「需重新登录」 |
+| `review`（待复核，非权威标记） | `authRequired` 且 `authError` 不含权威 OAuth 码、不是 TOS/验证（典型：agy 裸 "not signed in" 横幅、身份无法证明） | 后台快速复核（2m→30m 退避）或任何更新的配额快照即可清除 | **黄标**「认证复核中」，tooltip 说明无需重新登录；账号仍暂时不参与轮换 |
+
+### 4.1 自愈节奏：从「最多 70 分钟」降到「一轮复核」
+
+- 旧行为：背景轮询默认 60 分钟一轮（`quotaPollIntervalMs`），而 `shouldPollAccount()` 对 `authRequired` 直接返回 false，只有 `needsAuthReverify()`（标记满 10 分钟）才让它在**下一次整点轮询**进管道 → 误报红标最长挂 ~70 分钟，期间卡片配额条还是新的，自相矛盾（2026-11-23 现场）。
+- 现行为：`QuotaService.reverifyFlaggedAccounts()` 由 2 分钟定时器驱动（`AUTH_FAST_REVERIFY_MS`，`src/index.ts`），只处理「已过自身退避窗口」的标记；`authReverifyAttempts` 每失败一次退避翻倍（2/4/8/16/30 分钟，`authReverifyDelayMs()`），所以真死号不会被每两分钟敲一次 Google。
+- **零网络自愈（活证据）**：`AccountPoolManager.healAuthFlagsFromQuota()` 在每次轮询收尾与每次快速复核前运行——只要任一配额族 `updatedAt` 晚于 `authMarkedAt`（无论写入者是本进程还是共用 `pool.json` 的另一个进程），就证明 token 可用，直接清标。TOS / `VALIDATION_REQUIRED` 例外：它们的配额端点照样能通。
+- 判定顺序：先把「网络阶段被写入的标记」用配额时间戳证伪，再决定是否发一次网络复核请求。
 
 ## 5. 测试锚点
 
 - `test/failure-classifier.test.ts` / `test/auth-jitter.test.ts`：`disabled` 日志不误判权威鉴权失败、同秒日志偏移读取、MCP 错误不误判、HTTP/2 `GOAWAY` 与代理 `502/504` 归类为 `NETWORK`。
+- `test/auth-flag-heal.test.ts`：更新的配额快照证伪标记（零网络）、旧快照不算证据、无 `authMarkedAt` 的历史标记可被证伪、TOS/验证不被配额自愈、2m→30m 退避与「只复核过期标记」。
 - `test/credential-slot.test.ts` / `test/issue101-slot-failover.test.ts`：主槽网络超时不连坐隔离辅账号、带 `expiry` 唯一写入。
 - `test/pool-auth.test.ts`：主账号 OAuth 登录与导入清除 `authRequired` 并触发选择器同步。
 
@@ -59,4 +70,45 @@
 - `alias` 是卡片上的**显示标签**；`defaultAlias === true` 表示它仍是「自动生成」的占位（`备用 Google 账号 N` / 主账号默认名），界面会按 locale 重新渲染。
 - 用户手动改名必须走 `setAccountAlias()`——它同时 `trim()` 并置 `defaultAlias = false`，否则输入的名字永远不会被显示（界面仍在渲染生成标签）。
 - 路由 `POST /plugins/agy-link/pool/alias` 是唯一写入口：非空、长度上界、未知 id → 404。空名会让卡片无标签，因此服务端直接拒绝而不是静默接受。
-- 锚点：`test/issue152-alias-edit.test.ts`、`test/http-contract.test.ts`（路由表面登记）。
+- **主账号换号自动重置旧别名（issue #152 第二部分）**：当 `systemHome` 主账号通过 `/agy auth` 重新登录为**不同 Google 邮箱**时，`resetAccountIdentity(id, email, true)` 同步重置自定义旧别名并恢复 `defaultAlias = true`，防止卡片仍展示上一个账号的名称。
+- 锚点：`test/issue152-alias-edit.test.ts`、`test/slice3-ssh-tier-143-145-152.test.ts`、`test/http-contract.test.ts`（路由表面登记）。
+
+## 6. 三端免全局钥匙串隔离（`SSH_CONNECTION`）与外部独立登录保护（issue #145）
+
+- **`SSH_CONNECTION` 隔离（`agy >= 1.5`）**：`isolatedHomeEnv()` 为所有带独立 `dir` 的隔离池账号注入 `SSH_CONNECTION="127.0.0.1 0 127.0.0.1 0"`，`agy 1.5+` 将其识别为远程 SSH 会话并直接读写各自 `dir/.gemini/antigravity-cli/antigravity-oauth-token`，三端（含 Windows）绕开全局共享钥匙串/凭据管理器。Windows 下当 `supportsSshIsolation(agyVersion)` 成立时，隔离辅账号免除全局凭据槽排队与 ACP 切号驱逐，且 `QuotaService.readCliUsageFamilies` 可直接为隔离账号（含免费账号，issue #143）执行官方 `agy -p /usage`。
+- **外部独立登录保护（issue #145，`respectExternalSignIn`）**：`src/domain/credentials/external-guard.ts` 追踪插件上次写入 Windows 凭据槽的指纹（`.last-installed-slot.json`）；当配置 `respectExternalSignIn: true` 且检测到用户在独立 `agy` 终端中重新登录了未识别的外部账号时，租约获取前拒绝覆盖并在租约释放后保留外部登录。锚点：`test/slice3-ssh-tier-143-145-152.test.ts`。
+
+## 隔离账号不得回落到机器级 keyring（2026-11-23）
+
+- 事故：会话 `8bade603` 第 8 回合运行 15.6 分钟后，ACP 回合返回空结果；插件丢弃 ACP 进程（日志出现 `ForceStopCascadeTree` + `Got signal terminated`）并回退 CLI，CLI 六次重试全部 `agy exited with code 1` 且 stderr 为空，最终中断。
+- 根因：该回合的 ACP 进程属于隔离账号 `dao`，但 agy 日志显示
+  `ChainedAuth: authenticated via keyring (effective: keyring)` 且 `applyAuthResult: email=`（空）。
+  即：隔离 token 过期/不可用时 agy **回落到机器级 keyring**，实际以主账号身份运行；而身份校验 `readAuthEmailFromLog` 把「没有 email」当成「无法判断」而放行，于是错误账号被计费/限流，最终该账号 token 失效导致空回合与重试雪崩。
+- 契约：
+  1. **出站前刷新**：隔离账号（`account.dir && !systemHome`）在 ACP/CLI spawn 前必须调用 `ensureFreshToken`（宿主注入 `quota.getValidAccessToken`），把 token 带入 `CLI_TOKEN_SAFETY_MS` 窗口，避免 agy 启动时回落到 keyring。
+  2. **身份硬门**：`readAuthEvidenceFromLog()` 同时解析 `ChainedAuth: authenticated via keyring`、`applyAuthResult: email=` 与 `keyringAuth: failed to fetch user info: <原因>`。判据是「能否证明身份」且「失败能否归因于网络」，不是「认证方式」：
+     - keyring + 正确 email → 放行（macOS 上插件为该账号预置槽位，agy 仍标 keyring）；
+     - 日志点名**另一个** email → `classifyIdentity()` 返回 `mismatch` → `Err.AUTH`（换槽重试一次，仍失败则隔离，走 2 次确认）；
+     - keyring + 空 email，且 agy 自己的 userinfo 拉取是**传输失败**（EOF / timeout） → `unproven` → 按 `Err.NETWORK` 重试，**不记 strike、不写红标**（2026-11-23 15:59 现场：健康账号被同形日志误判，红标挂了近一小时）；
+     - keyring + 空 email 且没有任何传输证据 → `mismatch`（真·keyring 回落）。
+   - 判定函数与探针分离：`classifyIdentity(evidence, expected, expectedIsolated)` 返回 `ok | unknown | unproven | mismatch`，`unknown`（日志没点名）永远是「不可判定」，不得当成 mismatch。
+  3. **失败可诊断**：`classifyExitOrFallback()` 在 stderr/结果为空时用 `rawErrText` 兜底，`agy exited with code 1` 会附带 ACP 的真实原因（如 `ACP prompt returned an empty turn: ...`），不再丢失。
+  4. **AUTH 不回退 CLI**：`retryOnCli` 排除 `Err.AUTH`；身份不匹配直接 `settleEarlyFailure(..., Err.AUTH)`。CLI 回退只对「transport 本身死掉」有意义，对凭据/身份问题只会重复烧同一份坏凭据。
+- 锚点：`test/acp-identity.test.ts`（含 `unproven` 分支）、`test/auth-flag-heal.test.ts`（活证据自愈 + 退避节奏）、`test/auth-flag.test.ts`（`accountAuthState` 四态）、`test/failure-classifier.test.ts`（PROCESS_EXIT 保留 rawErrText）。
+
+## 7. 外部进程凭据租约（External credential lease）
+
+- **问题**：Windows 凭据槽的同号快路径计数与辅账号引用计数只存在插件进程内存里。自己启动官方 `agy` 的外部进程（如 `dsh-codex-conductor` 的 WSL runner，长任务需扛过 DSH 重启并自行消费 stream-json）对插件不可见：插件可能在它运行中切槽，它也无法以池内辅账号身份运行。
+- **原则：不新增切换逻辑**。`ExternalLeaseRegistry`（`src/host/external-lease.ts`）只是插件自身运行用的同一套部件的又一个调用方：`pool.selectAccount(modelFamilyOf(model || 'gemini'), model)` 选号 → `acquireCredentialSlot()` 取槽（仅主账号与 agy < 1.5 的隔离账号；`baseDir: pool.dir`、`proxyUrl` 按「账号 > 全局 > 系统代理」、`parallel: cfg.parallelSameAccount`、`respectExternalSignIn: cfg.respectExternalSignIn`，与 provider 相同）→ 释放时由共享的 `settleRunFailure()` 结算。
+- **失败分类唯一实现**：`src/host/run-settlement.ts` 的 `settleRunFailure()` / `settleSlotUnavailable()` 从 one-shot 原样抽出（顺序：TOS → `--effort` 拒绝 → 硬额度（排除瞬时突发限流，按错误里的模型族冷却并在族不同时 advance）→ 模型不识别（`markModelUnsupported` + advance）→ 地区资格（advance）→ 登出（`shouldMarkAuthRequired` 时 `noteAuthFailure` + advance）→ 其它不可消费失败），one-shot 与外部租约共用，不得再各写一份。
+- **SSH 隔离账号不占槽**：账号有 `dir` 且非 `systemHome`，并且 `supportsSshIsolation(agy 版本)` 成立时，与 provider / ACP / 预热 / 配额路径一致**不取凭据槽**（`slot: false`），否则长达 45 分钟的外部任务会把所有隔离运行串行化并挡住主账号。版本由 `services.resolveVersion()` 解析（与开机探测共用同一个 `agy --version` 探测，未知时先探测，绝不猜；探测失败按占槽处理，对任何版本都安全）。发放前调用 `QuotaService.prepareIsolatedCliToken()`：与 CLI 配额读取同一个 `prepareCliToken` / `CLI_TOKEN_SAFETY_MS`，但**不写凭据槽**（SSH 隔离只读账号自己的 token 文件）。准备失败与配额路径一样不改号池：钉住时 `409 account_unavailable`，不钉住时换下一个账号。注：provider 的 SSH 隔离路径在 spawn 前不做这一步 token 预刷新。
+- **租约环境 `env`**：只含调用方必须设置的变量，由 provider 用的同一组 helper 生成：隔离账号 `isolatedHomeEnv(dir)`（agy < 1.5 也一样，provider 对所有版本都注入它）、`proxyEnvFor(proxyUrl)`、`ensureLoopbackNoProxy`、Windows 上 `foldProxyEnvCase`、`withAgyQuietEnv` 的五个开关。**绝不包含宿主自身的 `process.env`**。
+- **`account.home`**：插件自己运行该账号时用的 HOME——隔离账号为其 `dir`，主账号为插件宿主的 `os.homedir()`（不是空串：DSH-ASA 启动器把宿主 USERPROFILE 指到自己的数据目录，主账号对话就存在那里，空串会让调用方落回它自己的默认用户目录而无法续接）。主账号的 `env` 仍不含 HOME 重定位变量，是否据 `home` 设置 HOME/USERPROFILE 由调用方决定。
+- **钉住账号**：`accountId` 或 `accountDir`（Windows 下路径大小写/尾分隔符不敏感；与主账号的 `os.homedir()` 相同的目录钉住主账号）钉住续接对话所属账号；只要求存在、启用、未 `authRequired`，**不检查冷却**。不钉住时 `SlotUnavailableError` 按 one-shot 规则结算（`markAuthRequired`，或主账号重申失败的隔离辅账号只 advance）后换下一个可选账号，同一账号不试两次。
+- **等待有界**：`waitMs` 默认与 one-shot 相同（`dispatchTimeoutMinutes × 60000`，未配置 60000），上限 1 小时；多次换号共享同一截止时间，剩余时间耗尽即 `slot_timeout`，绝不传 `0`（`0` 对槽表示无限等待）。
+- **生命周期**（两种租约相同）：租约仅在内存；DSH 宿主重启全部丢失，客户端重新 acquire。TTL 默认 120s、夹到 15s–600s；`unref` 的清扫器每 5s 释放过期租约且**不结算**并记日志。`release` 恰好释放一次槽；`dispose` 中止排队中的取槽、释放全部租约、移除路由与发现文件。租约 id 为 128 位 `crypto.randomBytes`。
+- **发现文件**：`<pool.dir>/.link-endpoint.json`（`{url,pid,startedAt,token}`，原子写，mode `0600`；POSIX 上写后校验属主为本用户且组/其他无权限，否则删除文件并放弃发布）；卸载时仅当文件仍指向本进程 pid 与 url 才删除，另一个宿主接管后不误删。
+- **鉴权**：`token` 为每次插件启动的 256 位随机值（`newLeaseToken()`），只写在发现文件里。所有 `/lease*` 路由先用 `hasLeaseBearer()`（`timingSafeEqual`）校验 `Authorization: Bearer <token>`，不符即 `401 unauthorized`，再做来源与方法检查。理由：租约交出账号的 env（令牌目录）并预支其配额，回环地址只说明同机、不说明可信。没有端口就没有发现文件，也就没有人能租号。
+- **并发刷新**：同一账号的多个租约（以及插件自己的 ACP/CLI 运行）经 `prepareIsolatedCliToken` → `getValidAccessToken` 共用一个按账号的在途 Promise（`tokenRefreshInFlight`），同一时刻只有一次读取/刷新；刷新结果经 `writeFileAtomicSync` 原子改名写盘，不会写坏令牌文件。
+- **非 Windows**：取槽为空操作（`undefined` 租约），选号、TTL 与结算照常。测试运行（`NODE_TEST_CONTEXT`）下默认取槽同样为空操作，永不触碰真实凭据管理器。
+- 锚点：`test/external-lease.test.ts`、`test/lease-routes.test.ts`、`test/run-settlement.test.ts`。

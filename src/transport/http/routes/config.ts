@@ -1,9 +1,13 @@
+import { isEffortId } from '../../../common/reasoning.ts'
+import { MIN_WARMUP_INTERVAL_HOURS } from '../../../common/timeouts.ts'
 import type { HostServices } from '../../../host/services.ts'
 import { parseCompactLimitValue } from '../../../common/compact-threshold.ts'
 import { runRoute, sendJson, readBody, methodOf, type RawRes, type RouteRegistrar } from '../respond.ts'
 
 const PERMISSION_MODES = new Set(['skip', 'auto', 'plan', 'accept-edits'])
 const TRANSPORTS = new Set(['cli', 'acp'])
+const WARMUP_WINDOWS = new Set(['weekly', '5h', 'both'])
+const TRANSLATE_DISPLAYS = new Set(['card', 'replace'])
 
 function validateConfigValue(key: string, value: unknown): string | null {
   if (key === 'hiddenModels') {
@@ -32,11 +36,56 @@ function validateConfigValue(key: string, value: unknown): string | null {
       ? null
       : 'transport must be cli or acp'
   }
-  if (key === 'sandbox' || key === 'imageTool' || key === 'syncAccountCustomizations') {
+  if (key === 'translateDisplay') {
+    return typeof value === 'string' && TRANSLATE_DISPLAYS.has(value)
+      ? null
+      : 'translateDisplay must be card or replace'
+  }
+  if (key === 'sandbox' || key === 'imageTool' || key === 'syncAccountCustomizations' || key === 'backgroundWakeup' || key === 'mcpBridge' || key === 'cloakSystemPrompt' || key === 'respectExternalSignIn' || key === 'auxNeutralWorkspace') {
     return typeof value === 'boolean' ? null : `${key} must be a boolean`
   }
-  if (key === 'agent') {
-    return typeof value === 'string' ? null : 'agent must be a string'
+  if (key === 'warmupWindows') {
+    return typeof value === 'string' && WARMUP_WINDOWS.has(value)
+      ? null
+      : 'warmupWindows must be weekly, 5h, or both'
+  }
+  if (key === 'warmupDailyTime') {
+    return typeof value === 'string' && (value === '' || /^\d{1,2}:\d{2}$/.test(value.trim()))
+      ? null
+      : 'warmupDailyTime must be HH:MM or empty'
+  }
+  if (key === 'warmupTimezone') {
+    return typeof value === 'string' ? null : 'warmupTimezone must be an IANA timezone string'
+  }
+  if (key === 'warmupIntervalHours') {
+    if (typeof value !== 'number' || !Number.isFinite(value) || value < 0 || value > 168) {
+      return 'warmupIntervalHours must be a number between 0 and 168'
+    }
+    if (value > 0 && value < MIN_WARMUP_INTERVAL_HOURS) {
+      return `warmupIntervalHours must be 0 (off) or at least ${MIN_WARMUP_INTERVAL_HOURS}`
+    }
+    return null
+  }
+  if (key === 'warmupMaxProbesPerRun') {
+    return typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 200
+      ? null
+      : 'warmupMaxProbesPerRun must be a number between 0 and 200 (0 = unlimited)'
+  }
+  if (key === 'agent' || key === 'orchestratorPlannerModel' || key === 'orchestratorExecutorModel' || key === 'btwModel') {
+    return typeof value === 'string' ? null : `${key} must be a string`
+  }
+  if (key === 'orchestratorPlannerEffort' || key === 'orchestratorExecutorEffort' || key === 'btwEffort') {
+    if (typeof value !== 'string') return `${key} must be a string`
+    const trimmed = value.trim().toLowerCase()
+    if (trimmed !== '' && !isEffortId(trimmed)) {
+      return `${key} must be empty or a valid reasoning effort`
+    }
+    return null
+  }
+  if (key === 'quotaPollIntervalMs') {
+    return typeof value === 'number' && Number.isFinite(value) && value >= 60_000
+      ? null
+      : 'quotaPollIntervalMs must be a number of milliseconds >= 60000'
   }
   if (key === 'agySettings') {
     if (typeof value !== 'string') return 'agySettings must be a string'
@@ -66,12 +115,18 @@ function handleConfig(services: HostServices, req: unknown, res: unknown): void 
         const body = await readBody(req)
         const key = typeof body.key === 'string' ? body.key : ''
         const allowed = [
-          'enabled', 'permissionMode', 'sandbox', 'agent', 'agySettings', 'transport', 'imageTool', 'syncAccountCustomizations',
-          'defaultModel', 'defaultEffort', 'askTool', 'workspaceRoot', 'hiddenModels', 'autoWarmup', 'warmupModels',
-          'autoTranslate', 'translateModel', 'translateEffort', 'translateTargetLanguage', 'translateMaxChars', 'translateSkipSameModel', 'translateBindConversation', 'translateMinIntervalMs',
+          'enabled', 'permissionMode', 'sandbox', 'agent', 'agySettings', 'transport', 'imageTool', 'syncAccountCustomizations', 'backgroundWakeup', 'mcpBridge',
+          'cloakSystemPrompt', 'respectExternalSignIn', 'auxNeutralWorkspace',
+          'defaultModel', 'defaultEffort',
+          'orchestratorPlannerModel', 'orchestratorPlannerEffort', 'orchestratorExecutorModel', 'orchestratorExecutorEffort',
+          'askTool', 'workspaceRoot', 'hiddenModels',
+          'autoWarmup', 'warmupModels', 'warmupWindows', 'warmupDailyTime', 'warmupTimezone', 'warmupIntervalHours', 'warmupMaxProbesPerRun',
+          'autoTranslate', 'translateDisplay', 'translateModel', 'translateEffort', 'translateTargetLanguage', 'translateMaxChars', 'translateSkipSameModel', 'translateBindConversation', 'translateMinIntervalMs',
           'imageModel', 'imageEffort', 'imageTimeoutMs', 'imageMaxBytes', 'imageOutputDir', 'imageRetries',
+          'btwModel', 'btwEffort',
           'showHeaderBadge', 'showTranslateAction', 'poolWideCatalog', 'selectedModels',
           'autoCompactOverride', 'modelApiMaxRetries', 'slimPromptRules', 'proxyUrl', 'disableTelemetry',
+          'quotaPollIntervalMs',
         ]
         if (!allowed.includes(key)) {
           sendJson(res as RawRes, 400, { error: 'key not settable' })

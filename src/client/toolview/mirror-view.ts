@@ -1,6 +1,7 @@
 // Main mirror tool-card component: collapsed row + expandable body.
 
-import { isError, isSettled } from './args.ts';
+import { MIRROR_TOOL_RELOAD_NOTICE } from '../../common/mirror-error.ts';
+import { isError, isSettled, isTransientMirrorToolNotFound } from './args.ts';
 import { mirrorCardModel } from './card-model.ts';
 import { CardBody } from './card-bodies.ts';
 import { cls, diffStat, displaySummary, displayTitle, previewLine, tr } from './format.ts';
@@ -13,13 +14,21 @@ export function AgyMirrorToolView(props: AgyToolViewProps): unknown {
 	const h = hx;
 	const { block, cwd, home, openFile, inspect, t, callId } = props;
 	const settle = isSettled(block);
-	const err = isError(block);
-	const model = mirrorCardModel(block, cwd, home);
+	const transientMirrorMiss = isTransientMirrorToolNotFound(block);
+	const err = !transientMirrorMiss && isError(block);
+	const baseModel = mirrorCardModel(block, cwd, home);
+	if (baseModel.kind === 'checklist' && !err) {
+		return null;
+	}
+	const model = transientMirrorMiss
+		? { ...baseModel, output: tr(t, 'tv.mirrorReloadSkipped', MIRROR_TOOL_RELOAD_NOTICE) }
+		: baseModel;
 	const cardKey = callId ? `call:${callId}` : `${model.kind}:${model.tool ?? ''}:${model.title}:${model.path ?? model.command ?? ''}`;
-	const [open, setOpen] = useToggle(false, cardKey);
+	const defaultOpen = model.kind === 'checklist';
+	const [open, setOpen] = useToggle(defaultOpen, cardKey);
 	const state: 'ok' | 'err' | 'run' = !settle ? 'run' : err ? 'err' : 'ok';
 	const title = displayTitle(model, t);
-	const summary = displaySummary(model, cwd, home);
+	const summary = displaySummary(model, cwd, home, t);
 	const stat = diffStat(model);
 	const preview = !open && model.kind !== 'diff' ? previewLine(model, cwd, home) : undefined;
 	const hasFileLink = (model.kind === 'diff' || model.kind === 'read') && model.path && openFile !== undefined;

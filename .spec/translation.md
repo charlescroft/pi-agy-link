@@ -27,7 +27,7 @@ GET  /plugins/agy-link/translate/turn?session=<id>&turn=<n>      # 该回合是�
 GET  /plugins/agy-link/translate/state?session=<id>&message=<id>  # 该条回复的状态（供按钮）
 ```
 
-`/translate/state` 回答 `{state: 'ready'|'busy'|'idle'}`：`ready` = 该 `messageId`（或回退到它所属 turn）已有持久记录，`busy` = 本会话有翻译在跑。回复按钮每次挂载都问它一次，因此**译文完成后切窗口/切会话/整页刷新都仍显示 ✓**。
+`/translate/state` 回答 `{state: 'ready'|'busy'|'idle'}`：`ready` = 该 `messageId`（或回退到它所属 turn）已有持久记录，`busy` = 本会话有翻译在跑。回复按钮每次挂载都问它一次，因此**译文完成后切窗口/切会话/整页刷新都仍显示 ✓**。挂载时回答 `busy`（例如自动翻译正在跑，不是本页发起的请求）时，按钮每 3 秒再问一次，直到 `ready`（✓）或 `idle`（回到可点）；否则没有任何本页请求会结束这个旋转圈，它会一直转到下次重新挂载。
 
 状态码：`200` 成功；`400` 参数或空回合；`409` 当前回合仍在跑；`405` 方法；`502` 无可用账号等模型侧失败。
 
@@ -90,11 +90,11 @@ GET  /plugins/agy-link/translate/state?session=<id>&message=<id>  # 该条回复
 
 ## 6. 持久化与渲染
 
-- 记录类型：`plugin:agy-link/translation`（`ignorable: true`），字段：`version/turn/anchorSeq/text/original?/model/effort/accountId?/sourceModel?/provider/durationMs/createdAt`。
+- 记录类型：`plugin:agy-link/translation`（`ignorable: true`），字段：`version/turn/sourceTurn?/anchorSeq/text/original?/model/effort/accountId?/sourceModel?/provider/durationMs/createdAt`。**新写入记录必须保持 `turn: null`、`sourceTurn: <原回合号>`**，客户端投影（`src/client/translate-record.ts`）必须返回 `location: { kind: 'session' }` 与 `groupTree: 'turn'`——否则当用户中途翻译较早回合时，DSH 的 `ConversationLocationIndex` 会按 `data.turn` 劫持 `currentTurn` 并把卡片吞进可折叠的 0-tool `ProcessGroup`，导致译文消失与后续回复布局错乱。
 - 落库顺序：优先动态 import 宿主提供的 `appendPluginRecord`（non-literal specifier，保持可选）；不可用时**回退到原生 `session.append(type, data)`**。两者都失败才返回 `null`（卡片不落地，其余功能不受影响）。
 - 会话事件读取（`sessionEvents`）：依次尝试 `session.snapshotEvents()`、`session.ownEvents()`，再回退 `.log` / `.events` 数组。**DSH 真实 Session 没有 `.log`**——只读 `.log` 的旧实现会拿到空数组并报 `SESSION_UNAVAILABLE`，这是"点了没反应"的根因之一。
 - **不得在 `session/event` 回调内同步 append**：`Session.append` 在 publication 边界内会拒绝重入；翻译是异步的，落库天然在后续栈。
-- 客户端（`src/client/translate.ts`）：注册 Conversation 事件 Definition（`kind = agy-translation`）+ `conversation.chat.node` keyed `agy-translation` 渲染卡片；卡片 `anchorSeq = 被翻译消息 seq + 0.1`，因此**即使翻译几十秒后才落库，也会显示在所属回复下方**（按钮路径用的是被点的那条消息的 seq）。
+- 客户端（`src/client/translate.ts`）：注册 Conversation 事件 Definition（`kind = agy-translation`）+ `conversation.chat.node` keyed `agy-translation` 渲染卡片。Definition **必须经 `ctx.inject(['uiConversation'], …)` 注册（`registerConversationDefinitions`）**：客户端 boot 条目只等 `slots`/`locale`，插件可能先于 dsh-client-ui-conversation 应用；一次性 `ctx.get('uiConversation')` 拿到 `undefined` 就整页静默不注册——记录照常落库，但一张卡片都不会出现（ACP 卡片同理）；卡片 `anchorSeq = 被翻译消息 seq + 0.1`，因此**即使翻译几十秒后才落库，也会显示在所属回复下方**（按钮路径用的是被点的那条消息的 seq）。
 - 卡片外观**必须像 DSH 原生组件，而不是插件自造的横幅**（0.5.1 的品牌渐变版被人类验收否决：整宽高饱和色块在会话里像一块外来横幅）。配方与仓库内 `agy-tv-card` 同源：`0.5px` `--dsw-alias-border-l1` 描边、`--dsw-alias-markdown-code-block` 底、`--dsw-radius-md`（12px）圆角、`--dsw-alias-markdown-code-block-banner` 头部横幅；正文按 DSH Markdown 排版（`--dsw-font-markdown-base-font-size` / `--dsw-font-markdown-base-line-height`）。
 - 身份区分只保留最小量：头部一枚**单色** Gemini 四角星（`--dsw-alias-state-business-primary`）+「Gemini 译文」标签。**禁止**品牌渐变底/渐变描边/渐变字标/右上柔光/整宽高饱和填充；也不再单独占一行「Translated by Gemini」署名（标签已承担）。
 - 卡片头部：星标 + 标签、模型/档位/账号（caption 元信息）、复制、查看原文（有 `original` 时）、收起——全是 11.5px ghost 按钮（`--dsw-alias-interactive-bg-hover` 悬停）；原文区块以顶部虚分隔线接在正文之后。根元素 `data-agy-translation="gemini"`。

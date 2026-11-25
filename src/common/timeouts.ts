@@ -18,6 +18,13 @@ export const WRITE_TIMEOUT_MS = 20_000
 /** Manual CLI warmup across one or more accounts (up to 45s per CLI probe). */
 export const WARMUP_WRITE_TIMEOUT_MS = 90_000
 
+/**
+ * Floor for `warmupIntervalHours` (hours). A full-pool warmup run now takes
+ * minutes by design (accounts are 30–120s apart), so a 1-hour interval would
+ * re-arm before the previous run finished. 0 still means "disabled".
+ */
+export const MIN_WARMUP_INTERVAL_HOURS = 3
+
 /** Host-side hard deadline for any plugin route; the last line of defence. */
 export const ROUTE_TIMEOUT_MS = 30_000
 
@@ -59,11 +66,33 @@ export const QUOTA_ENDPOINT_DOWN_MS = 10 * 60_000
 export const QUOTA_LICENSE_RETRY_MS = 6 * 3600_000
 
 /**
+ * How long a CLI `/usage` probe that didn't answer within its 20s budget is
+ * skipped for that account, in favour of the REST path. Measured 2026-11-23:
+ * `agy -p /usage` spent ~13s in `loadCodeAssist` and then hit the process
+ * shutdown timeout, so every manual "同步" burned ~19s before the REST fallback
+ * produced the numbers anyway. The negative cache makes the next sync ~1-2s.
+ */
+export const CLI_USAGE_TIMEOUT_RETRY_MS = 10 * 60_000
+
+/**
  * How long a free-tier account's refused summary call stays suppressed.
  * Aligned with the weekly quota window: the verdict only changes when the
  * account's entitlement does, which cannot happen within hours (#137).
  */
 export const QUOTA_FREE_TIER_RETRY_MS = 7 * 24 * 3600_000
+
+/**
+ * How long a refused summary stays suppressed for an account that has ALREADY
+ * reported a 5-hour window.
+ *
+ * `no_summary_access` is the *shape* of a free-tier refusal (no 5h bucket), not
+ * proof of a free plan. A paid account can still get 403 PERMISSION_DENIED
+ * transiently, and freezing it for a week left its Gemini/Claude rows stuck on
+ * a multi-day-old snapshot while Argon kept advancing — the mixed-age card
+ * reported 2026-11-23. Re-probe hourly instead; one extra request per hour per
+ * refused account is far below the anti-ban budget this module protects.
+ */
+export const QUOTA_SUMMARY_REFUSED_RETRY_MS = 1 * 3600_000
 
 /**
  * Same-egress parallelism for a user-initiated pool sweep. Antigravity's risk

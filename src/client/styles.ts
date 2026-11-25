@@ -7,13 +7,16 @@ import { GLOBAL_CSS } from './global-css.ts';
 export function injectGlobalStyles(): void {
 	if (typeof document === 'undefined') return;
 	const styleId = 'dsh-agy-link-global-css';
-	if (document.getElementById(styleId) === null) {
-		const st = document.createElement('style');
-		st.id = styleId;
-		st.textContent = GLOBAL_CSS;
-		const host = document.head ?? document.documentElement;
-		if (host) host.appendChild(st);
+	const existing = document.getElementById(styleId);
+	if (existing !== null) {
+		if (existing.textContent !== GLOBAL_CSS) existing.textContent = GLOBAL_CSS;
+		return;
 	}
+	const st = document.createElement('style');
+	st.id = styleId;
+	st.textContent = GLOBAL_CSS;
+	const host = document.head ?? document.documentElement;
+	if (host) host.appendChild(st);
 }
 
 export const S: Record<string, Record<string, unknown>> = {
@@ -27,6 +30,8 @@ export const S: Record<string, Record<string, unknown>> = {
 		display: 'flex',
 		alignItems: 'center',
 		justifyContent: 'space-between',
+		flexWrap: 'wrap',
+		gap: '8px',
 		padding: '10px 14px',
 		background: 'var(--agy-bg-header)',
 		border: '1px solid var(--agy-border-card)',
@@ -131,6 +136,8 @@ export const S: Record<string, Record<string, unknown>> = {
 		cursor: 'pointer',
 		fontSize: '12px',
 		fontWeight: 600,
+		whiteSpace: 'nowrap',
+		flexShrink: 0,
 	},
 	btnPrimary: {
 		display: 'inline-flex',
@@ -145,6 +152,8 @@ export const S: Record<string, Record<string, unknown>> = {
 		fontSize: '12px',
 		fontWeight: 700,
 		boxShadow: '0 2px 6px rgba(37, 99, 235, 0.35)',
+		whiteSpace: 'nowrap',
+		flexShrink: 0,
 	},
 	btnDanger: {
 		display: 'inline-flex',
@@ -158,6 +167,8 @@ export const S: Record<string, Record<string, unknown>> = {
 		cursor: 'pointer',
 		fontSize: '11px',
 		fontWeight: 600,
+		whiteSpace: 'nowrap',
+		flexShrink: 0,
 	},
 	btnSm: {
 		display: 'inline-flex',
@@ -171,6 +182,8 @@ export const S: Record<string, Record<string, unknown>> = {
 		cursor: 'pointer',
 		fontSize: '11.5px',
 		fontWeight: 600,
+		whiteSpace: 'nowrap',
+		flexShrink: 0,
 	},
 	btnSmPrimary: {
 		display: 'inline-flex',
@@ -184,16 +197,23 @@ export const S: Record<string, Record<string, unknown>> = {
 		cursor: 'pointer',
 		fontSize: '11.5px',
 		fontWeight: 700,
+		whiteSpace: 'nowrap',
+		flexShrink: 0,
 	},
 	segGroup: {
 		display: 'inline-flex',
+		flexWrap: 'wrap',
+		maxWidth: '100%',
 		background: 'var(--agy-seg-group-bg)',
 		borderRadius: '7px',
 		padding: '3px',
 		border: '1px solid var(--agy-seg-group-border)',
+		// The cluster shrinks as ONE unit; the label column absorbs the squeeze.
+		flexShrink: 0,
+		whiteSpace: 'nowrap',
 	},
 	segBtn: {
-		padding: '4px 10px',
+		padding: '3px 9px',
 		borderRadius: '4px',
 		border: 'none',
 		background: 'transparent',
@@ -201,9 +221,12 @@ export const S: Record<string, Record<string, unknown>> = {
 		cursor: 'pointer',
 		fontSize: '11.5px',
 		fontWeight: 600,
+		// A squeezed segmented button used to break 开启 into 开 / 启 on two lines.
+		whiteSpace: 'nowrap',
+		flexShrink: 0,
 	},
 	segBtnActive: {
-		padding: '4px 10px',
+		padding: '3px 9px',
 		borderRadius: '4px',
 		border: 'none',
 		background: 'var(--agy-seg-btn-active-bg)',
@@ -212,6 +235,8 @@ export const S: Record<string, Record<string, unknown>> = {
 		fontSize: '11.5px',
 		fontWeight: 700,
 		boxShadow: '0 2px 4px rgba(37, 99, 235, 0.4)',
+		whiteSpace: 'nowrap',
+		flexShrink: 0,
 	},
 	input: {
 		flex: '1',
@@ -224,6 +249,12 @@ export const S: Record<string, Record<string, unknown>> = {
 		outline: 'none',
 	},
 	muted: { color: 'var(--agy-text-tertiary)', fontSize: '11.5px' },
+	// Row descriptions: one line, ellipsised, full copy in the title tooltip.
+	// Long prose on every row is what made the settings page feel crowded.
+	mutedLine: {
+		color: 'var(--agy-text-tertiary)', fontSize: '11.5px',
+		overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+	},
 	// Right-hand control cluster of a settings row: the toggle and the dropdowns
 	// wrap as ONE unit, so a narrow panel moves them under the label instead of
 	// squeezing the description into a column of two characters.
@@ -281,5 +312,89 @@ export const S: Record<string, Record<string, unknown>> = {
 		padding: '14px 16px',
 		marginBottom: '14px',
 		color: 'var(--agy-text-primary)',
+	},
+	tabBar: {
+		display: 'flex',
+		alignItems: 'center',
+		gap: '4px',
+		padding: '4px',
+		marginBottom: '12px',
+		background: 'var(--agy-seg-group-bg)',
+		border: '1px solid var(--agy-seg-group-border)',
+		borderRadius: '9px',
+		flexWrap: 'wrap',
+	},
+	tabBtn: {
+		flex: '1 1 auto',
+		display: 'inline-flex',
+		alignItems: 'center',
+		justifyContent: 'center',
+		gap: '6px',
+		padding: '6px 10px',
+		borderRadius: '6px',
+		border: 'none',
+		background: 'transparent',
+		color: 'var(--agy-text-secondary)',
+		cursor: 'pointer',
+		fontSize: '12px',
+		fontWeight: 600,
+		whiteSpace: 'nowrap',
+		transition: 'background 0.14s ease, color 0.14s ease',
+	},
+	tabBtnActive: {
+		flex: '1 1 auto',
+		display: 'inline-flex',
+		alignItems: 'center',
+		justifyContent: 'center',
+		gap: '6px',
+		padding: '6px 10px',
+		borderRadius: '6px',
+		border: 'none',
+		background: 'var(--agy-seg-btn-active-bg)',
+		color: 'var(--agy-seg-btn-active-text)',
+		cursor: 'pointer',
+		fontSize: '12px',
+		fontWeight: 700,
+		boxShadow: '0 2px 5px rgba(37, 99, 235, 0.28)',
+		whiteSpace: 'nowrap',
+		transition: 'background 0.14s ease, color 0.14s ease',
+	},
+	tabCount: {
+		display: 'inline-flex',
+		alignItems: 'center',
+		justifyContent: 'center',
+		minWidth: '17px',
+		height: '16px',
+		padding: '0 5px',
+		borderRadius: '999px',
+		fontSize: '10.5px',
+		fontWeight: 700,
+		background: 'rgba(127, 127, 127, 0.18)',
+		color: 'inherit',
+	},
+	sectionCard: {
+		background: 'var(--agy-bg-card)',
+		border: '1px solid var(--agy-border-card)',
+		borderRadius: '9px',
+		padding: '12px 14px',
+		boxShadow: 'var(--agy-shadow-card)',
+		display: 'flex',
+		flexDirection: 'column',
+		gap: '10px',
+	},
+	sectionCardHead: {
+		display: 'flex',
+		alignItems: 'center',
+		justifyContent: 'space-between',
+		gap: '8px',
+		paddingBottom: '7px',
+		borderBottom: '1px solid var(--agy-border-divider)',
+	},
+	sectionCardTitle: {
+		fontSize: '12.5px',
+		fontWeight: 700,
+		color: 'var(--agy-text-primary)',
+		letterSpacing: '0.01em',
+		whiteSpace: 'nowrap',
 	},
 };

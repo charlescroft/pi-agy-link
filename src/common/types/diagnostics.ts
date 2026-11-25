@@ -36,7 +36,7 @@ export function looksLikeValidationRequired(text?: string): boolean {
  */
 export function looksLikeHeadlessPermissionDenial(text?: string): boolean {
   if (!text) return false
-  return /(?:approval|confirmation|review)\s+required\s+in\s+(?:non-interactive|print|headless)|cannot\s+(?:prompt|request)\s+(?:for\s+)?(?:permission|approval|review)\s+in\s+(?:print|non-interactive)|tool\s+execution\s+denied:\s*approval\s+required/i.test(
+  return /(?:approval|confirmation|review)\s+required\s+in\s+(?:non-interactive|print|headless)|cannot\s+(?:prompt|request)\s+(?:for\s+)?(?:permission|approval|review)\s+in\s+(?:print|non-interactive)|tool\s+execution\s+denied:\s*approval\s+required|headless mode cannot prompt for|a tool required [^\n]*permission that headless mode cannot prompt for|no output produced [—-]+ a tool required/i.test(
     text,
   )
 }
@@ -66,6 +66,52 @@ export function extractAuthUrl(text: string): string | undefined {
   return m[0].replace(/[)\]>.,;\x27\x22]+$/, '')
 }
 
+/** Account has run out of Antigravity AI credits (`Your AI credits balance is too low`). */
+export function looksLikeAiCreditsLow(text?: string): boolean {
+  if (!text) return false
+  return /ai credits balance is too low|insufficient ai credits|out of ai credits|ai credits? (?:exhausted|depleted)/i.test(text)
+}
+
+/**
+ * A quota refusal scoped to ONE model, not the whole account pool.
+ *
+ * Live signature (agy 1.5.15, image model):
+ *   `ResourceExhausted, HTTP 429: You have exhausted your capacity on this
+ *    model. Your quota will reset after 4h32m32s.`
+ *
+ * `looksLikeHardRateLimit` matches "exhausted your capacity", and the caller
+ * used to cool the whole `google` FAMILY for 4.5 hours even though the family
+ * aggregate still had ~20% and every text model was healthy. A model-scoped
+ * refusal must never remove an account from rotation for other models.
+ */
+export function looksLikeModelScopedCapacity(text?: string): boolean {
+  if (!text) return false
+  return /\b(?:on|for) this model\b|this model(?:'s)?\s+(?:quota|capacity|limit)|model[-\s]specific\s+(?:quota|capacity|limit)/i.test(
+    text,
+  )
+}
+
+/** Models whose quota is not the text family's pool (`generate_image` etc.). */
+export function isModelScopedQuotaTool(toolName: string): boolean {
+  return toolName === 'generate_image'
+}
+
+/** Image-generation model ids carry their own per-model quota. */
+export function isImageModelId(model?: string): boolean {
+  return Boolean(model && /image/i.test(model))
+}
+
+/**
+ * One predicate for "this refusal is about ONE model, not the account's family":
+ * either the prose says so, or the error names an image model. Families must
+ * never be cooled from this.
+ */
+export function isModelScopedQuotaFailure(text?: string): boolean {
+  if (!text) return false
+  if (looksLikeModelScopedCapacity(text)) return true
+  return isImageModelId(extractQuotaErrorModel(text))
+}
+
 /**
  * HARD, server-issued rate-limit signatures — the ONLY patterns allowed to
  * put an account into cooldown. Deliberately narrow: bare `429` or
@@ -76,6 +122,7 @@ export function extractAuthUrl(text: string): string | undefined {
  */
 export function looksLikeHardRateLimit(text?: string): boolean {
   if (!text) return false
+  if (looksLikeAiCreditsLow(text)) return true
   return /RESOURCE_EXHAUSTED|\bQUOTA_EXHAUSTED\b|"?code"?\s*[:=]\s*429\b|"?status"?\s*[:=]\s*429\b|HTTP(?:\/[\d.]+)?[ :]?429\b|too many requests|individual quota reached|quota (?:exceeded|reached|exhausted|limit)|rate[ -]?limit(?:ed)? (?:exceeded|reached|hit)?|exceeded (?:your |the )?quota|has been exhausted|exhausted your (?:quota|capacity)|out of quota|check quota|insufficient quota|usage limit reached/i.test(
     text,
   )
@@ -180,11 +227,39 @@ export function extractQuotaErrorModel(text?: string): string | undefined {
 }
 
 /**
- * True when a failed result envelope carries a hard quota refusal (meaning the
+ * Standalone `⚠ ...` error banner that `agy` itself injects into assistant
+ * text and closes normally (`end_turn` / `status: DONE`) when an internal LLM
+ * call hits hard quota or AI-credits exhaustion. Requiring the `⚠` prefix on
+ * its own line prevents normal model prose mentioning "rate limit" or "quota"
+ * from ever triggering a false cooldown or account rotation.
+ */
+export function isAgyQuotaBannerLine(line: string): boolean {
+  const trimmed = line.trim()
+  if (!/^⚠\uFE0F?\s+/.test(trimmed)) return false
+  const body = trimmed.replace(/^⚠\uFE0F?\s+/, '')
+  return looksLikeHardRateLimit(body) && !isTransientBurstRateLimit(body)
+}
+
+/**
+ * Extract a trailing standalone `⚠ <hard quota>` banner from assistant text.
+ * Checking only the last non-empty line avoids false positives when prose
+ * quotes a warning earlier in a legitimate response.
+ */
+export function extractAgyQuotaBanner(text?: string): string | undefined {
+  if (!text) return undefined
+  const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean)
+  if (lines.length === 0) return undefined
+  const last = lines[lines.length - 1]!
+  return isAgyQuotaBannerLine(last) ? last : undefined
+}
+
+/**
+ * True when a result envelope carries a hard quota refusal (meaning the
  * attempt must rotate accounts rather than soft-finish on any partial text).
+ * Includes `ok: true` envelopes whose trailing text is agy's own `⚠` quota banner.
  */
 export function isHardQuotaResultError(ok: boolean, error?: string, response?: string): boolean {
-  if (ok) return false
+  if (ok) return Boolean(extractAgyQuotaBanner(response))
   if (error && error.trim() !== '') {
     return looksLikeHardRateLimit(error) && !isTransientBurstRateLimit(error)
   }
@@ -192,14 +267,67 @@ export function isHardQuotaResultError(ok: boolean, error?: string, response?: s
 }
 
 /**
- * True when a failed result envelope represents a non-consumable account/policy
- * failure even when partial response text was already buffered before the error.
+ * True when a result envelope represents a non-consumable account/policy
+ * failure even when partial response text was already buffered or agy closed
+ * the turn normally after emitting a `⚠` quota banner.
  */
 export function isNonConsumableResultError(ok: boolean, error?: string, response?: string): boolean {
-  if (ok) return false
   if (isHardQuotaResultError(ok, error, response)) return true
+  if (ok) return false
   if (looksLikeTosViolation(error) || looksLikeTosViolation(response)) return true
   if (looksLikeValidationRequired(error) || looksLikeValidationRequired(response)) return true
   if (error && (looksLikeEligibilityFailure(error) || looksLikeAuthFailure(error))) return true
   return false
+}
+
+/** Executor failed to start because no valid plan model was configured on the session. */
+export function looksLikePlanModelNotSpecified(text?: string): boolean {
+  if (!text) return false
+  return /(?:failed to construct executor:\s*)?plan model not specified|you must specify a valid model/i.test(text)
+}
+
+/** agy failed to fetch model configuration / available model list from Google APIs. */
+export function looksLikeModelConfigFetchFailure(text?: string): boolean {
+  if (!text) return false
+  return /failed to get model config|failed to get model infos|Cache\(availableModels\):\s*Singleflight refresh failed|Failed to poll FetchAvailableModels|failed to get load code assist response/i.test(
+    text,
+  )
+}
+
+function trimDiagnosticLine(line: string, maxLen = 280): string {
+  const cleaned = line
+    .replace(/^[IWEF]\d{4}\s+\d{2}:\d{2}:\d{2}\.\d+\s+(?:\d+\s+)?\S+\]\s*/, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+  return cleaned.length > maxLen ? cleaned.slice(0, maxLen) + '...' : cleaned
+}
+
+/** Extract the most specific network/transport error line from agy logs or stderr. */
+export function extractTransportDiagnostic(text?: string): string | undefined {
+  if (!text) return undefined
+  const lines = text.split(/\r?\n/)
+  const pattern = /connection reset by peer|tls handshake timeout|tls:\s*(?:handshake failure|bad record mac|alert)|proxyconnect|dial tcp|i\/o timeout|context deadline exceeded|econn(?:refused|reset|aborted)|enotfound|ehostunreach|enetunreach|no route to host|socket hang up|unexpected eof|:\s*eof\b|bad gateway|gateway time-?out|token refresh failed due to network error/i
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i]!
+    if (pattern.test(line)) {
+      const trimmed = trimDiagnosticLine(line)
+      if (trimmed !== '') return trimmed
+    }
+  }
+  return undefined
+}
+
+/** Extract the most specific model-config fetch failure line from agy logs or stderr. */
+export function extractModelConfigDiagnostic(text?: string): string | undefined {
+  if (!text) return undefined
+  const lines = text.split(/\r?\n/)
+  const pattern = /failed to get model config|failed to get model infos|Cache\(availableModels\):\s*Singleflight refresh failed|Failed to poll FetchAvailableModels|failed to get load code assist response/i
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i]!
+    if (pattern.test(line)) {
+      const trimmed = trimDiagnosticLine(line)
+      if (trimmed !== '') return trimmed
+    }
+  }
+  return undefined
 }

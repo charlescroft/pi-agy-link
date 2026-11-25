@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
@@ -20,10 +20,11 @@ import { RunRegistry } from '../src/host/recording.ts'
 import { SessionStore } from '../src/host/sessions.ts'
 import type { AttemptDeps, AttemptInput, AttemptSlot } from '../src/provider/attempt.ts'
 
-function createMockAcpBin(dir: string, behavior: 'normal' | 'fail-resume-load' | 'hang-prompt' | 'crash-on-prompt' = 'normal'): string {
+function createMockAcpBin(dir: string, behavior: 'normal' | 'fail-resume-load' | 'hang-prompt' | 'crash-on-prompt' | 'crash-after-chunk' = 'normal'): string {
   const scriptPath = join(dir, `mock-acp-${behavior}.mjs`)
   const script = `
 import { createInterface } from 'node:readline';
+import { appendFileSync } from 'node:fs';
 
 const mode = ${JSON.stringify(behavior)};
 const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });
@@ -52,14 +53,37 @@ rl.on('line', (line) => {
     return;
   }
   if (msg.method === 'session/load') {
+    // A real agy replays the stored transcript; an id that does not exist
+    // "succeeds" with nothing. Only the replay is evidence of a real restore.
+    if (mode === 'fail-resume-load') {
+      send({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: msg.params.sessionId, update: { sessionUpdate: 'user_message_chunk', content: { type: 'text', text: 'earlier question' } } } });
+      send({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: msg.params.sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'earlier answer' } } } });
+    }
     send({ jsonrpc: '2.0', id: msg.id, result: { sessionId: msg.params.sessionId } });
     return;
   }
   if (msg.method === 'session/new') {
-    send({ jsonrpc: '2.0', id: msg.id, result: { sessionId: 'acp-sess-1' } });
+    const models = process.env.MOCK_ACP_ADVERTISE_MODELS
+      ? { models: { availableModels: [
+          { modelId: 'gemini-4-hydrogen-high' },
+          { modelId: 'gemini-4-hydrogen-xhigh' },
+          { modelId: 'gemini-4-neon-high' },
+        ] } }
+      : {};
+    send({ jsonrpc: '2.0', id: msg.id, result: { sessionId: 'acp-sess-1', ...models } });
+    return;
+  }
+  if (msg.method === 'session/set_model') {
+    if (process.env.MOCK_ACP_RECORD_DIR) {
+      try { appendFileSync(process.env.MOCK_ACP_RECORD_DIR + '/calls.log', msg.method + ' ' + JSON.stringify(msg.params) + '\\n'); } catch {}
+    }
+    send({ jsonrpc: '2.0', id: msg.id, result: {} });
     return;
   }
   if (msg.method === 'session/set_mode' || msg.method === 'session/set_config_option') {
+    if (process.env.MOCK_ACP_RECORD_DIR) {
+      try { appendFileSync(process.env.MOCK_ACP_RECORD_DIR + '/calls.log', msg.method + ' ' + JSON.stringify(msg.params) + '\\n'); } catch {}
+    }
     send({ jsonrpc: '2.0', id: msg.id, result: { ok: true } });
     return;
   }
@@ -72,6 +96,14 @@ rl.on('line', (line) => {
     if (mode === 'crash-on-prompt') {
       process.stderr.write('fatal acp stderr');
       process.exit(2);
+    }
+    if (mode === 'crash-after-chunk') {
+      send({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: sid, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'partial answer' } } } });
+      setTimeout(() => {
+        process.stderr.write('fatal acp stderr');
+        process.exit(2);
+      }, 30);
+      return;
     }
     if (mode === 'hang-prompt') {
       send({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: sid, update: { sessionUpdate: 'tool_call', toolCallId: 'tc-hang', name: 'run_command', status: 'running', rawInput: { CommandLine: 'sleep' } } } });
@@ -143,9 +175,17 @@ test('ACP protocol helpers map updates, tool outputs, usage, results, and permis
 
   const text = acpUpdateToAgyEvents('s1', { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'hi' } }, st)
   assert.equal(text[0]?.kind, 'step')
-  assert.equal((text[0] as Extract<AgyEvent, { kind: 'step' }>).usage?.input_tokens, 120)
+  // issue #158: `used` is context occupancy, never a token sample — it lives in
+  // lastContextUsed so it can never clobber PromptResponse.usage with 0 output/cache.  assert.equal((text[0] as Extract<AgyEvent, { kind: 'step' }>).usage, undefined)
+  assert.equal(st.lastContextUsed, 120)
   assert.equal(st.accumulatedText, 'hi')
 
+  // An update that really reports token counts still feeds the sample.
+  acpUpdateToAgyEvents('s1', { sessionUpdate: 'usage_update', used: 120, outputTokens: 7, cachedReadTokens: 90 }, st)
+  assert.equal(st.lastUsage.cache_read_tokens, 90)
+  assert.equal(st.lastUsage.output_tokens, 7)
+  const text2 = acpUpdateToAgyEvents('s1', { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '!' } }, st)
+  assert.equal((text2[0] as Extract<AgyEvent, { kind: 'step' }>).usage?.output_tokens, 7)
   const startTool = acpUpdateToAgyEvents('s1', {
     sessionUpdate: 'tool_call',
     toolCallId: 'c1',
@@ -230,11 +270,15 @@ test('AcpProcess runs initialize, openSession, prompt streaming, and resume fall
     sandbox: false,
     agent: 'reviewer',
     preemptAutoUpdate: false,
+    env: { ...process.env, MOCK_ACP_RECORD_DIR: dir },
   })
   const proc2 = new AcpProcess({ bin: loadBin, cwd: dir, permissionMode: 'skip', preemptAutoUpdate: false })
   try {
-    const sid = await proc.openSession({ cwd: dir, addDirs: [dir], model: 'gemini-4-hydrogen', effort: 'medium', mode: 'auto' })
+    const opened = await proc.openSession({ cwd: dir, addDirs: [dir], model: 'gemini-4-hydrogen', effort: 'medium', mode: 'auto' })
+    const sid = opened.sessionId
     assert.equal(sid, 'acp-sess-1')
+    assert.equal(opened.status, 'created')
+    assert.equal(opened.resumeFailed, false)
     assert.equal(proc.isAlive(), true)
     assert.equal(proc.sessionCount, 1)
 
@@ -251,11 +295,34 @@ test('AcpProcess runs initialize, openSession, prompt streaming, and resume fall
 
     // Reuse already-open session without issuing another session/new.
     const reused = await proc.openSession({ cwd: dir, resumeId: sid, mode: 'auto' })
-    assert.equal(reused, sid)
+    assert.equal(reused.sessionId, sid)
+    assert.equal(reused.status, 'cached')
+    // issue #167: set_config_option is not idempotent on agy's side — it logs
+    // 'Switching model in session <sid>' and re-runs the switch for an unchanged
+    // value. DSH opens the session again on every turn, so an unchanged turn
+    // must not re-send anything.
+    const callsAfterFirst = readFileSync(join(dir, 'calls.log'), 'utf8').trim().split('\n')
+    assert.equal(callsAfterFirst.filter((l) => l.startsWith('session/set_mode')).length, 1)
+    assert.equal(callsAfterFirst.filter((l) => l.startsWith('session/set_config_option')).length, 2)
+    await proc.openSession({ cwd: dir, resumeId: sid, mode: 'auto', model: 'gemini-4-hydrogen', effort: 'medium' })
+    assert.equal(readFileSync(join(dir, 'calls.log'), 'utf8').trim().split('\n').length, callsAfterFirst.length)
+    // A turn that changes only the effort sends only the effort.
+    await proc.openSession({ cwd: dir, resumeId: sid, mode: 'auto', effort: 'high' })
+    const effortCalls = readFileSync(join(dir, 'calls.log'), 'utf8').trim().split('\n').slice(callsAfterFirst.length)
+    assert.equal(effortCalls.length, 1)
+    assert.match(effortCalls[0] ?? '', /thought_level.*high/)
+    // A model change re-sends the effort: agy resets it to the new model's default.
+    await proc.openSession({ cwd: dir, resumeId: sid, mode: 'auto', model: 'gemini-4-neon', effort: 'high' })
+    const modelCalls = readFileSync(join(dir, 'calls.log'), 'utf8').trim().split('\n').slice(callsAfterFirst.length + 1)
+    assert.equal(modelCalls.length, 2)
+    assert.match(modelCalls[0] ?? '', /"configId":"model".*gemini-4-neon/)
+    assert.match(modelCalls[1] ?? '', /thought_level.*high/)
 
     // Resume fallback to session/load when session/resume errors.
     const sid2 = await proc2.openSession({ cwd: dir, resumeId: 'prev-cid', mode: 'skip' })
-    assert.equal(sid2, 'prev-cid')
+    assert.equal(sid2.sessionId, 'prev-cid')
+    assert.equal(sid2.status, 'loaded')
+    assert.equal(sid2.resumeFailed, false)
   } finally {
     await Promise.all([closeProc(proc), closeProc(proc2)])
     rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 30 })
@@ -269,7 +336,7 @@ test('AcpProcess enforces idle/maxTurn timeouts, abort cancellation, and crash r
   const proc = new AcpProcess({ bin: hangBin, cwd: dir, permissionMode: 'skip', preemptAutoUpdate: false })
   const crashProc = new AcpProcess({ bin: crashBin, cwd: dir, permissionMode: 'skip', preemptAutoUpdate: false })
   try {
-    const sid = await proc.openSession({ cwd: dir })
+    const { sessionId: sid } = await proc.openSession({ cwd: dir })
 
     await assert.rejects(
       proc.prompt({ sessionId: sid, text: 'wait', timeoutMs: 40, idleTimeoutMs: 40, longToolIdleMs: 90, onUpdate: () => {} }),
@@ -288,7 +355,7 @@ test('AcpProcess enforces idle/maxTurn timeouts, abort cancellation, and crash r
       /maxTurn/,
     )
 
-    const crashSid = await crashProc.openSession({ cwd: dir })
+    const { sessionId: crashSid } = await crashProc.openSession({ cwd: dir })
     await assert.rejects(
       crashProc.prompt({ sessionId: crashSid, text: 'crash', timeoutMs: 5_000, onUpdate: () => {} }),
       /exited/,
@@ -481,18 +548,82 @@ test('runAcpAttempt streams happy path, falls back cleanly on pre-stream failure
     assert.equal(abortedRec.failureInfo?.kind, 'aborted')
     assert.equal(released, beforeRelease + 1)
 
-    // 4. Unexpected child exit during prompt classifies as failure instead of hanging
-    const crashRec = await runAcpAttempt(crashPool, deps, { ...baseInput, bin: createMockAcpBin(dir, 'crash-on-prompt'), sessionKey: 'sess-acp-crash', persistBinding: false }, slot())
+    // 4. A child that dies before emitting anything is a dead transport, not an
+    // answer: the attempt hands back null so the caller re-runs over CLI -p.
+    const beforeCrashRelease = released
+    const deadRec = await runAcpAttempt(crashPool, deps, { ...baseInput, bin: createMockAcpBin(dir, 'crash-on-prompt'), sessionKey: 'sess-acp-dead', persistBinding: false }, slot())
+    assert.equal(deadRec, null, 'a turn with no output must fall back to the CLI transport')
+    assert.equal(released, beforeCrashRelease, 'the fallback keeps the slot held for the CLI retry')
+
+    // 5. A child that dies AFTER producing output keeps its partial answer and
+    // classifies as a failure instead of being retried (that would duplicate it).
+    const crashPool2 = new AcpSessionPool({
+      bin: () => createMockAcpBin(dir, 'crash-after-chunk'),
+      cfg: () => cfg,
+      createProcess: (o) => {
+        const p = new AcpProcess({ ...o, preemptAutoUpdate: false })
+        spawnedProcs.push(p)
+        return p
+      },
+    })
+    const crashRec = await runAcpAttempt(crashPool2, deps, { ...baseInput, bin: createMockAcpBin(dir, 'crash-after-chunk'), sessionKey: 'sess-acp-crash', persistBinding: false }, slot())
     assert.ok(crashRec)
     for await (const _ of crashRec.eventsFrom(0)) { /* wait for settlement */ }
     assert.ok(crashRec.failureInfo !== null)
     assert.equal(crashRec.failureInfo?.kind, 'error')
     assert.equal(crashRec.failureInfo?.code, Err.PROCESS_EXIT)
+    crashPool2.dispose()
   } finally {
     await Promise.all(spawnedProcs.map((p) => closeProc(p)))
     pool.dispose()
     badPool.dispose()
     crashPool.dispose()
+    rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 30 })
+  }
+})
+
+test('issue #167: an advertised effort-suffixed model id is switched atomically in one call', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agy-acp-atomic-'))
+  const bin = createMockAcpBin(dir, 'normal')
+  const proc = new AcpProcess({
+    bin,
+    cwd: dir,
+    permissionMode: 'skip',
+    preemptAutoUpdate: false,
+    env: { ...process.env, MOCK_ACP_RECORD_DIR: dir, MOCK_ACP_ADVERTISE_MODELS: '1' },
+  })
+  try {
+    const opened = await proc.openSession({ cwd: dir, model: 'gemini-4-hydrogen', effort: 'xhigh', mode: 'skip' })
+    assert.equal(opened.sessionId, 'acp-sess-1')
+    const calls = readFileSync(join(dir, 'calls.log'), 'utf8').trim().split('\n')
+    const setModel = calls.filter((l) => l.startsWith('session/set_model'))
+    const configCalls = calls.filter((l) => l.startsWith('session/set_config_option'))
+    assert.equal(setModel.length, 1, 'one atomic switch')
+    assert.match(setModel[0] ?? '', /gemini-4-hydrogen-xhigh/)
+    assert.equal(configCalls.length, 0, 'no model→thought_level double switch')
+  } finally {
+    await closeProc(proc)
+    rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 30 })
+  }
+})
+
+test('issue #167: without an advertised id the two-step config switch still works', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agy-acp-atomic-fallback-'))
+  const bin = createMockAcpBin(dir, 'normal')
+  const proc = new AcpProcess({
+    bin,
+    cwd: dir,
+    permissionMode: 'skip',
+    preemptAutoUpdate: false,
+    env: { ...process.env, MOCK_ACP_RECORD_DIR: dir },
+  })
+  try {
+    await proc.openSession({ cwd: dir, model: 'gemini-4-hydrogen', effort: 'xhigh', mode: 'skip' })
+    const calls = readFileSync(join(dir, 'calls.log'), 'utf8').trim().split('\n')
+    assert.equal(calls.filter((l) => l.startsWith('session/set_model')).length, 0)
+    assert.equal(calls.filter((l) => l.startsWith('session/set_config_option')).length, 2)
+  } finally {
+    await closeProc(proc)
     rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 30 })
   }
 })

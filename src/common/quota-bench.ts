@@ -1,7 +1,17 @@
 // Pure quota-bench, cooldown, and auth-quarantine predicates shared across
 // domain scheduling, host commands, and client UI so every surface derives
 // account availability from a single source of truth.
-import { modelMatches, type FamilyQuotaInfo, type ManagedAccount, type ModelFamily } from './pool-types.ts'
+import {
+  argonSharesGoogleGroup,
+  effectiveFamilyCooldown,
+  isTerminalAuthError,
+  modelMatches,
+  sharedArgonPeerFamily,
+  type FamilyQuotaInfo,
+  type ManagedAccount,
+  type ModelFamily,
+} from './pool-types.ts'
+import { isAuthoritativeAuthError, looksLikeValidationRequired } from './types.ts'
 
 /** Proactive rotation thresholds: bench accounts at or below these remaining fractions until reset. */
 export const LOW_QUOTA_5H = 0.10
@@ -58,6 +68,16 @@ export function isWeeklyQuotaBenched(
   return isWindowBenched(quota.weeklyFraction, quota.weeklyResetTime, LOW_QUOTA_WEEKLY, now)
 }
 
+/** Effective quota-bench override timestamp, shared across google <-> argon when folded. */
+export function effectiveQuotaGateClearedAt(acc: ManagedAccount, family: ModelFamily): number | undefined {
+  const direct = acc.quotaGateClearedAt?.[family]
+  const peerFam = sharedArgonPeerFamily(acc, family)
+  const peer = peerFam ? acc.quotaGateClearedAt?.[peerFam] : undefined
+  if (direct === undefined) return peer
+  if (peer === undefined) return direct
+  return Math.max(direct, peer)
+}
+
 /**
  * True when a family's cached quota snapshot benches the account.
  *
@@ -66,11 +86,14 @@ export function isWeeklyQuotaBenched(
  * cached row is no newer than that stamp, so a fresh poll always re-arms it.
  */
 export function isQuotaBenched(acc: ManagedAccount, family: ModelFamily, now: number, model?: string): boolean {
-  // Argon falls back to the plain Gemini row once the backend folds it into
-  // the shared Gemini group (agy >= 1.5.5 stops emitting a dedicated group).
-  const quota = acc.quotas?.[family] ?? (family === 'argon' ? acc.quotas?.google : undefined)
+  // Argon uses its own quota book when present, and only reads `quotas.google`
+  // when the backend explicitly declared Argon as a member of Gemini Models'
+  // group description (agy 1.5.15 paid plans); an absent row without that proof
+  // remains "unknown" (.spec/quota-and-risk-control.md).
+  const sharedArgon = family === 'argon' && argonSharesGoogleGroup(acc)
+  const quota = acc.quotas?.[family] ?? (sharedArgon ? acc.quotas?.google : undefined)
   if (!quota) return false
-  const clearedAt = acc.quotaGateClearedAt?.[family]
+  const clearedAt = effectiveQuotaGateClearedAt(acc, family)
   if (is5hQuotaBenched(quota, clearedAt, now) || isWeeklyQuotaBenched(quota, clearedAt, now)) return true
   if (!model || model.trim() === '' || !Array.isArray(quota.models)) return false
   if (clearedAt !== undefined && (quota.updatedAt ?? 0) <= clearedAt) return false
@@ -86,18 +109,18 @@ export function accountHasActiveCooldown(acc: ManagedAccount, now: number): bool
 
 /**
  * True when any family reported on the account is benched by its quota snapshot.
- * Skips the synthesized `argon -> google` fallback when the account has no dedicated
- * `quotas.argon` row, since `google` itself already reflects that shared bucket.
+ *
+ * Each family is judged on its OWN row only. An account with no `argon` row is
+ * not Argon-benched (unknown ≠ drained) — a drained Gemini pool must never
+ * bench Argon, because the two are separate quota books.
  */
 export function accountHasQuotaBench(acc: ManagedAccount, now: number): boolean {
-  return QUOTA_FAMILIES.some(
-    (fam) => (fam !== 'argon' || acc.quotas?.argon !== undefined) && isQuotaBenched(acc, fam, now),
-  )
+  return QUOTA_FAMILIES.some((fam) => isQuotaBenched(acc, fam, now))
 }
 
 /** True when a family has an active local 429 cooldown timer on this account. */
 export function isFamilyInCooldown(acc: ManagedAccount, family: ModelFamily, now: number): boolean {
-  const cd = acc.cooldowns?.[family]
+  const cd = effectiveFamilyCooldown(acc, family)
   return Boolean(cd && cd.cooldownUntil > now)
 }
 
@@ -114,7 +137,7 @@ export function isFamilyCooling(acc: ManagedAccount, family: ModelFamily, now: n
 export function accountKnownFamilies(acc: ManagedAccount): QuotaFamily[] {
   return QUOTA_FAMILIES.filter((fam) => {
     if (fam === 'argon') {
-      return acc.quotas?.argon !== undefined || acc.cooldowns?.argon !== undefined
+      return acc.quotas?.argon !== undefined || (!argonSharesGoogleGroup(acc) && acc.cooldowns?.argon !== undefined)
     }
     return acc.quotas?.[fam] !== undefined || acc.cooldowns?.[fam] !== undefined
   })
@@ -136,11 +159,37 @@ export function isAccountFullyCooling(acc: ManagedAccount, now: number): boolean
 }
 
 /**
+ * Why an account is barred from running, in the terms the user needs to act on.
+ *
+ *   `relogin`     — authoritative OAuth state (invalid_grant / revoked…): only a
+ *                   real sign-in fixes it.
+ *   `validation`  — Google wants a human verification step; re-running OAuth is
+ *                   the wrong button.
+ *   `tos`         — terminal ToS suspension; only the appeal form helps.
+ *   `review`      — flagged by non-authoritative evidence (an agy "not signed
+ *                   in" banner, an unprovable identity). Nothing is known to be
+ *                   broken: the background re-verification decides. Painting it
+ *                   the same red as a dead login is what made the console cry
+ *                   wolf (reported 2026-11-23).
+ */
+export type AccountAuthState = 'healthy' | 'relogin' | 'review' | 'validation' | 'tos'
+
+export function accountAuthState(acc: ManagedAccount): AccountAuthState {
+  const reason = acc.quotaUnavailable?.reason
+  if (reason === 'tos_violation') return 'tos'
+  if (reason === 'validation_required') return 'validation'
+  if (acc.authRequired !== true) return 'healthy'
+  if (isTerminalAuthError(acc.authError)) return 'tos'
+  if (looksLikeValidationRequired(acc.authError)) return 'validation'
+  if (isAuthoritativeAuthError(acc.authError ?? '')) return 'relogin'
+  return 'review'
+}
+
+/**
  * True when the account cannot operate due to auth expiration, web verification
- * (`VALIDATION_REQUIRED`), or ToS suspension (`TOS_VIOLATION`).
+ * (`VALIDATION_REQUIRED`), an unverified flag, or ToS suspension
+ * (`TOS_VIOLATION`).
  */
 export function isAccountCriticalAuth(acc: ManagedAccount): boolean {
-  if (acc.authRequired === true) return true
-  const reason = acc.quotaUnavailable?.reason
-  return reason === 'validation_required' || reason === 'tos_violation'
+  return accountAuthState(acc) !== 'healthy'
 }

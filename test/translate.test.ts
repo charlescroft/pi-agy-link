@@ -19,7 +19,7 @@ import {
   type SessionEventLike,
   type TranslationRecord,
 } from '../src/host/translate.ts'
-import { defaultConfig } from '../src/common/types.ts'
+import { defaultConfig, Err } from '../src/common/types.ts'
 import type { Catalog } from '../src/host/models.ts'
 
 const catalog: Catalog = {
@@ -197,6 +197,7 @@ function makeService(options: {
   autoEnabled?: (id: string) => boolean
   cfg?: ReturnType<typeof defaultConfig>
   onRun?: (call: RunnerCall) => void
+  schedule?: (fn: () => Promise<unknown>, ms: number) => void
 }) {
   const calls: RunnerCall[] = []
   const records: Array<{ sessionId: string; record: TranslationRecord }> = []
@@ -230,6 +231,7 @@ function makeService(options: {
       return 42
     },
     ...(options.autoEnabled === undefined ? {} : { autoEnabled: options.autoEnabled }),
+    ...(options.schedule === undefined ? {} : { schedule: options.schedule }),
     now: (() => {
       let t = 1_000
       return () => (t += 10)
@@ -351,7 +353,8 @@ test('translateTurn appends a durable record anchored at the final message', asy
   assert.equal(records.length, 1)
   const rec = records[0]!.record
   assert.equal(records[0]!.sessionId, 's1')
-  assert.equal(rec.turn, 1)
+  assert.equal(rec.turn, null)
+  assert.equal(rec.sourceTurn, 1)
   assert.equal(rec.anchorSeq, 103)
   assert.equal(rec.messageId, 'm-1-3')
   assert.equal(rec.model, 'gemini-3.8-flash')
@@ -403,7 +406,8 @@ test('translateMessage resolves the owning turn', async () => {
   const { service, records } = makeService({ runs: [{ ok: true, text: '人话版' }] })
   const res = await service.translateMessage('s1', 'm-1-3')
   assert.equal(res.ok, true)
-  assert.equal(records[0]!.record.turn, 1)
+  assert.equal(records[0]!.record.turn, null)
+  assert.equal(records[0]!.record.sourceTurn, 1)
 })
 
 test('autoTranslateTurn is skipped when the switch is off', async () => {
@@ -438,7 +442,8 @@ test('translateMessage falls back to lastCompletedTurn when message is unindexed
   const { service, records } = makeService({ runs: [{ ok: true, text: '人话版' }] })
   const res = await service.translateMessage('s1', 'unknown-msg-id')
   assert.equal(res.ok, true)
-  assert.equal(records[0]!.record.turn, 1)
+  assert.equal(records[0]!.record.turn, null)
+  assert.equal(records[0]!.record.sourceTurn, 1)
 })
 
 test('sessionEvents reads from snapshotEvents and ownEvents', () => {
@@ -466,6 +471,57 @@ test('autoTranslateTurn translates and persists when enabled', async () => {
   assert.equal(records.length, 1)
 })
 
+test('a failed auto translation is retried later and stops once it lands', async () => {
+  const scheduled: Array<{ fn: () => Promise<unknown>; ms: number }> = []
+  const { service, records } = makeService({
+    runs: [{ ok: false, code: 'AGY_ERROR', error: 'HTTP 503: No capacity available for model gemini-4-hydrogen-low' }, { ok: true, text: '人话版' }],
+    autoEnabled: () => true,
+    schedule: (fn, ms) => void scheduled.push({ fn, ms }),
+  })
+  assert.equal((await service.autoTranslateTurn('s1', 1))?.ok, false)
+  assert.deepEqual(scheduled.map((s) => s.ms), [60_000])
+  assert.equal(records.length, 0)
+  const retried = (await scheduled[0]!.fn()) as { ok: boolean } | null
+  assert.equal(retried?.ok, true)
+  assert.equal(records.length, 1)
+  assert.equal(scheduled.length, 1, 'nothing more is scheduled after a success')
+})
+
+test('auto-translate retries are bounded and skip failures a retry cannot fix', async () => {
+  const scheduled: Array<{ fn: () => Promise<unknown>; ms: number }> = []
+  const failing = makeService({
+    runs: [{ ok: false, code: 'AGY_ERROR', error: 'HTTP 503' }],
+    autoEnabled: () => true,
+    schedule: (fn, ms) => void scheduled.push({ fn, ms }),
+  })
+  await failing.service.autoTranslateTurn('s1', 1)
+  for (let i = 0; i < scheduled.length; i++) await scheduled[i]!.fn()
+  assert.deepEqual(scheduled.map((s) => s.ms), [60_000, 120_000, 300_000, 600_000])
+  assert.equal(failing.calls.length, 5)
+
+  const never: number[] = []
+  const disabled = makeService({
+    runs: [{ ok: false, code: Err.AUX_DISABLED }],
+    autoEnabled: () => true,
+    schedule: (_fn, ms) => void never.push(ms),
+  })
+  await disabled.service.autoTranslateTurn('s1', 1)
+  assert.deepEqual(never, [], 'aux-disabled is not retried')
+
+  // Switching auto-translate off stops a pending retry.
+  let on = true
+  const later: Array<() => Promise<unknown>> = []
+  const toggled = makeService({
+    runs: [{ ok: false, code: 'AGY_ERROR', error: 'HTTP 503' }],
+    autoEnabled: () => on,
+    schedule: (fn) => void later.push(fn),
+  })
+  await toggled.service.autoTranslateTurn('s1', 1)
+  on = false
+  assert.equal(await later[0]!(), null)
+  assert.equal(toggled.calls.length, 1)
+})
+
 test('translateMessage explains the CLICKED message, not the turn final answer', async () => {
   // Turn 1 holds three assistant events: prose at seq 101, a tool-only step at
   // 102 and the real answer at 103. Clicking the early prose used to resolve
@@ -479,7 +535,8 @@ test('translateMessage explains the CLICKED message, not the turn final answer',
   assert.doesNotMatch(calls[0]!.text ?? '', /最终答复/)
   assert.equal(records[0]!.record.messageId, 'm-1-1')
   assert.equal(records[0]!.record.anchorSeq, 101, 'the card lands under the clicked message')
-  assert.equal(records[0]!.record.turn, 1)
+  assert.equal(records[0]!.record.turn, null)
+  assert.equal(records[0]!.record.sourceTurn, 1)
 })
 
 test('dedupe is message-scoped: siblings in one turn translate independently', async () => {

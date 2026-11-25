@@ -26,12 +26,33 @@ export interface StatusPayload {
 	agent?: string;
 	agySettings?: string;
 	transport?: 'cli' | 'acp';
-	acpStatus?: { activeProcesses: number; sessions: number; keys: readonly string[] } | null;
+	acpStatus?: {
+		activeProcesses: number
+		sessions: number
+		keys: readonly string[]
+		/** Processes still finishing background work for a switched-away account. */
+		drainingProcesses?: number
+		drainingKeys?: readonly string[]
+		/** `agy acp` children of this host the pool no longer tracks. */
+		strayProcesses?: number
+		strayPids?: readonly number[]
+		/** Total strays killed since the pool started. */
+		reapedStrays?: number
+		/** Times another agy rewrote the machine-wide credential slot under us. */
+		slotOverwriteDetectedCount?: number
+		lastSlotRecoveryAt?: number | null
+	} | null;
+	backgroundWakeup?: boolean;
+	mcpBridge?: boolean;
 	imageTool?: boolean;
 	syncAccountCustomizations?: boolean;
 	workspaceRoot?: string;
 	defaultModel?: string;
 	defaultEffort?: string;
+	orchestratorPlannerModel?: string;
+	orchestratorPlannerEffort?: string;
+	orchestratorExecutorModel?: string;
+	orchestratorExecutorEffort?: string;
 	auth?: {
 		phase: string;
 		accountId?: string;
@@ -72,7 +93,10 @@ export interface StatusPayload {
 	selectedModels?: readonly string[];
 	autoWarmup?: boolean;
 	warmupModels?: readonly string[];
+	warmupWindows?: 'weekly' | '5h' | 'both';
+	warmupMaxProbesPerRun?: number;
 	autoTranslate?: boolean;
+	translateDisplay?: 'card' | 'replace';
 	translateModel?: string;
 	translateEffort?: string;
 	showHeaderBadge?: boolean;
@@ -81,8 +105,21 @@ export interface StatusPayload {
 	imageModel?: string;
 	imageEffort?: string;
 	imageOutputDir?: string;
+	btwModel?: string;
+	btwEffort?: string;
 	bindings?: number;
-	lastRun?: { ok: boolean; code: string; durationMs: number; model: string } | null;
+	/**
+	 * Host summary of the most recent run. Diagnostic only: no client surface
+	 * reads it today, and its shape is the host's (`processOk`/`processCode`),
+	 * not a boolean `ok`/`code` pair.
+	 */
+	lastRun?: {
+		processOk: boolean
+		processCode: string
+		durationMs: number
+		model: string
+		toolErrors: readonly string[]
+	} | null;
 }
 
 const STATUS_CACHE_KEY = 'dsh_agy_status_cache';
@@ -229,6 +266,7 @@ export function ensureStatusPolling(): void {
 	statusPollInterval = 3000;
 	void statusPollTick(false);
 	statusPollTimer = setInterval(() => { void statusPollTick(false); }, 3000);
+	(statusPollTimer as unknown as { unref?: () => void })?.unref?.();
 }
 
 export function stopStatusPollingIfIdle(): void {
@@ -238,6 +276,7 @@ export function stopStatusPollingIfIdle(): void {
 		clearInterval(statusPollTimer);
 		statusPollInterval = 15000;
 		statusPollTimer = setInterval(() => { void statusPollTick(false); }, 15000);
+		(statusPollTimer as unknown as { unref?: () => void })?.unref?.();
 	}
 }
 

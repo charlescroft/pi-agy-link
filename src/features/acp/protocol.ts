@@ -26,7 +26,21 @@ export interface AcpStreamState {
   textSeq: number
   thoughtSeq: number
   accumulatedText: string
+  /**
+   * Usage sample attached to streamed steps. agy 1.5.x's `usage_update` only
+   * carries { used, size } — a context-window occupancy figure, NOT a usage
+   * sample — so this stays empty until an update reports real token counts
+   * (output / cache read / cache write). See issue #158: writing `used` into
+   * `input_tokens` made the run's final usage `{inputTokens: used,
+   * outputTokens: 0}`, which zeroed the cache-hit rate and the token speed and
+   * inflated the uncached input count.
+   */
   lastUsage: RawUsage
+  /**
+   * Latest context-window occupancy from `usage_update`. Diagnostic only: it
+   * never reaches DSH's token meter, because "context used" is not "tokens
+   * billed this call" (issue #158).   */
+  lastContextUsed: number
   toolArgsByCallId: Map<string, { name: string; args: unknown }>
 }
 
@@ -36,6 +50,7 @@ export function createAcpStreamState(): AcpStreamState {
     thoughtSeq: 0,
     accumulatedText: '',
     lastUsage: {},
+    lastContextUsed: 0,
     toolArgsByCallId: new Map(),
   }
 }
@@ -46,6 +61,20 @@ function asObj(v: unknown): Record<string, unknown> | null {
 
 function num(v: unknown): number | undefined {
   return typeof v === 'number' && Number.isFinite(v) ? v : undefined
+}
+
+/** ACP tool statuses that end a tool's lifecycle (anything else is still live). */
+const ACP_TERMINAL_STATUSES = new Set(['completed', 'failed', 'error', 'cancelled', 'canceled'])
+
+/**
+ * True when an ACP tool status is terminal. agy 1.5.x only ever reports
+ * `in_progress`, `pending` (transient) and `completed`; `failed`/`cancelled`
+ * are accepted defensively. An absent status is NOT terminal — the first
+ * `tool_call` for a background command carries no status at all.
+ */
+export function isAcpTerminalStatus(rawStatus: string | undefined): boolean {
+  if (rawStatus === undefined || rawStatus === '') return false
+  return ACP_TERMINAL_STATUSES.has(rawStatus)
 }
 
 export function extractAcpToolOutput(update: Record<string, unknown>): string | undefined {
@@ -99,7 +128,14 @@ export function acpUpdateToAgyEvents(
     const content = asObj(update.content)
     if (content?.type === 'text' && typeof content.text === 'string' && content.text !== '') {
       state.accumulatedText += content.text
-      const usage = Object.keys(state.lastUsage).length > 0 ? { ...state.lastUsage } : undefined
+      // Only attach usage when it carries real per-call metrics (output or cache
+      // tokens), never a bare `{ input_tokens: used }` snapshot from usage_update
+      // which would clobber PromptResponse.usage (#158).
+      const hasRealMetrics =
+        state.lastUsage.output_tokens !== undefined ||
+        state.lastUsage.cache_read_tokens !== undefined ||
+        state.lastUsage.thinking_tokens !== undefined
+      const usage = hasRealMetrics ? { ...state.lastUsage } : undefined
       return [{
         kind: 'step',
         stepKey: `acp-text-${state.textSeq}`,
@@ -126,9 +162,35 @@ export function acpUpdateToAgyEvents(
     return []
   }
   if (kind === 'usage_update') {
+    // agy 1.5.x sends { used, size } only: the context window occupancy at the
+    // end of the internal call. It carries NO output/cache breakdown, so it is
+    // recorded as a diagnostic figure and never promoted to a usage sample —
+    // doing that overwrote the real `PromptResponse.usage` with
+    // {inputTokens: used, outputTokens: 0} (issue #158: 0% cache hit, 0 tok/s,
+    // inflated uncached input).
     const used = num(update.used)
-    if (used !== undefined) state.lastUsage.input_tokens = used
-    return []
+    if (used !== undefined) state.lastContextUsed = used
+    // Only populate state.lastUsage when the update actually includes detailed
+    // token breakdowns; agy 1.5.x only sends `{ used, size }` here (#158).
+    const detailed = acpUsageToRawUsage(update)
+    // A cache-read or output count, when a future agy version does send one,
+    // still counts as a real sample. Both spellings are accepted.
+    const cachedRead = num(update.cachedReadTokens) ?? num(update.cache_read_tokens)
+    if (cachedRead !== undefined && detailed.cache_read_tokens === undefined) {
+      detailed.cache_read_tokens = cachedRead
+    }
+    const outputTokens = num(update.outputTokens) ?? num(update.output_tokens)
+    if (outputTokens !== undefined && detailed.output_tokens === undefined) {
+      detailed.output_tokens = outputTokens
+    }
+    if (
+      detailed.output_tokens !== undefined ||
+      detailed.cache_read_tokens !== undefined ||
+      detailed.cache_write_tokens !== undefined ||
+      detailed.thinking_tokens !== undefined
+    ) {
+      state.lastUsage = { ...state.lastUsage, ...detailed }
+    }    return []
   }
   if (kind === 'tool_call' || kind === 'tool_call_update') {
     const callId = typeof update.toolCallId === 'string' && update.toolCallId !== '' ? update.toolCallId : `acp-tc-${Date.now()}`
@@ -154,6 +216,7 @@ export function acpUpdateToAgyEvents(
       stepKey: callId,
       stepKind: 'tool',
       state: stepState,
+      ...(rawStatus !== '' ? { rawStatus } : {}),
       text: output ?? '',
       conversationId: sessionId,
       tool: {
@@ -191,6 +254,7 @@ export function acpPromptResultToAgyEvent(
   sessionId: string,
   result: Record<string, unknown>,
   accumulatedText: string,
+  fallbackContextUsed?: number,
 ): AgyEvent {
   const stopReason = typeof result.stopReason === 'string' ? result.stopReason : 'end_turn'
   const rawErr = result.error
@@ -203,6 +267,9 @@ export function acpPromptResultToAgyEvent(
         : undefined
   const ok = stopReason !== 'error' && stopReason !== 'refusal' && extractedErr === undefined
   const usage = acpUsageToRawUsage(result.usage)
+  if (Object.keys(usage).length === 0 && typeof fallbackContextUsed === 'number' && fallbackContextUsed > 0) {
+    usage.input_tokens = fallbackContextUsed
+  }
   return {
     kind: 'result',
     conversationId: sessionId,

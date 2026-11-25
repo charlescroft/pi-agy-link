@@ -15,18 +15,26 @@
 //      a string literal repeated across features, which drifted every time a
 //      model was retired.
 //
-// Ground truth (verified against `agy models` / `agy --help`, agy 1.5.7):
+// Ground truth (verified against `agy models`, agy 1.5.15, 2026-11-24):
 //
-//   gemini-4-argon-low|-medium|-high          Gemini 4 Argon
-//   gemini-4-hydrogen-low|-medium|-high|-xhigh Gemini 4 Hydrogen
-//   gemini-pro-orchestrator-g1-pro            Orchestrator (Argon)
-//   gemini-3.8-flash-low|-medium|-high        Gemini 3.8 Flash
-//   claude-opus-5-5-low|-medium|-high         Claude Opus 5.5
-//   claude-sonnet-5-5-low|-medium|-high       Claude Sonnet 5.5
-//   gpt-oss-120b-medium                       GPT-OSS 120B (Medium)
+//   gemini-4-neon-low|-medium|-high|-xhigh     Gemini 4 Neon
+//   gemini-4-carbon-low|-medium|-high          Gemini 4 Carbon (Pro/Ultra)
+//   gemini-4-argon-low|-medium|-high           Gemini 4 Argon
+//   gemini-4-hydrogen-low|-medium|-high|-xhigh Gemini 4 Hydrogen (all plans)
+//   gemini-pro-orchestrator-neon               Orchestrator (Neon)
+//   gemini-pro-orchestrator                    Orchestrator (Carbon)
+//   gemini-pro-orchestrator-argon              Orchestrator (Argon)
+//   gemini-3.8-flash-low|-medium|-high         Gemini 3.8 Flash
+//   claude-opus-5-5-low|-medium|-high          Claude Opus 5.5
+//   claude-sonnet-5-5-low|-medium|-high        Claude Sonnet 5.5
+//   gpt-oss-120b-medium                        GPT-OSS 120B (Medium)
 //
-// Nothing else. Gemini 4 Carbon is `Unavailable` in agy's own picker and does
-// not appear in `agy models`; the Claude 4.6 line is retired upstream.
+// The Claude 4.6 line is retired upstream.
+//
+// The `gemini-pro-orchestrator*` entries are ROLE models: picking one makes
+// the session run on Antigravity's orchestrator. Since agy 1.5.14, `--settings`
+// (`orchestrator.planner` / `orchestrator.executor` with `<model>-<effort>`
+// slugs) controls the planner and executor model + thinking effort (issue #174).
 
 /**
  * One entry of the offline lineup: a concrete agy model id, the label DSH's
@@ -48,6 +56,17 @@ export const PREFERRED_GEMINI_HYDROGEN = 'gemini-4-hydrogen'
 /** Gemini Pro tier / Argon (Pro & Ultra plans only). */
 export const PREFERRED_GEMINI_ARGON = 'gemini-4-argon'
 
+/**
+ * The image model whose OWN quota bucket `generate_image` consumes.
+ *
+ * It is NOT the model that drives the image turn (`imageModel` config = a chat
+ * model). Google meters image generation against a separate per-model bucket
+ * inside the same `google` family — the quota snapshot exposes it as
+ * `quotas.google.models[].modelId = gemini-3.1-flash-image`. Scheduling must
+ * therefore check that bucket explicitly, and must never cool the family for it.
+ */
+export const PREFERRED_IMAGE_QUOTA_MODEL = 'gemini-3.1-flash-image'
+
 /** Anthropic tier (Sonnet — the default Anthropic pick). */
 export const PREFERRED_CLAUDE = 'claude-sonnet-5-5'
 
@@ -58,13 +77,17 @@ export const PREFERRED_CLAUDE_OPUS = 'claude-opus-5-5'
 export const PREFERRED_OPENAI = 'gpt-oss-120b-medium'
 
 /**
- * Offline/signed-out lineup. Mirrors `agy models` (agy 1.5.7) exactly —
+ * Offline/signed-out lineup. Mirrors `agy models` (agy 1.5.15) —
  * same ids, same effort sets, same order.
  */
 export const DEFAULT_FALLBACK_MODELS: readonly FallbackModelDef[] = [
+  { id: 'gemini-4-neon', name: 'Gemini 4 Neon', efforts: ['low', 'medium', 'high', 'xhigh'] },
+  { id: 'gemini-4-carbon', name: 'Gemini 4 Carbon', efforts: ['low', 'medium', 'high'] },
   { id: 'gemini-4-argon', name: 'Gemini 4 Argon', efforts: ['low', 'medium', 'high'] },
   { id: 'gemini-4-hydrogen', name: 'Gemini 4 Hydrogen', efforts: ['low', 'medium', 'high', 'xhigh'] },
-  { id: 'gemini-pro-orchestrator-g1-pro', name: 'Orchestrator (Argon)' },
+  { id: 'gemini-pro-orchestrator-neon', name: 'Orchestrator (Neon)' },
+  { id: 'gemini-pro-orchestrator', name: 'Orchestrator (Carbon)' },
+  { id: 'gemini-pro-orchestrator-argon', name: 'Orchestrator (Argon)' },
   { id: 'gemini-3.8-flash', name: 'Gemini 3.8 Flash', efforts: ['low', 'medium', 'high'] },
   { id: 'claude-opus-5-5', name: 'Claude Opus 5.5', efforts: ['low', 'medium', 'high'] },
   { id: 'claude-sonnet-5-5', name: 'Claude Sonnet 5.5', efforts: ['low', 'medium', 'high'] },

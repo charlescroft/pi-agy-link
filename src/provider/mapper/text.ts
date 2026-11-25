@@ -1,4 +1,5 @@
 // Text streaming helpers: suffix-delta accumulation and local-image URL rewrite.
+import { isAgyQuotaBannerLine } from '../../common/types.ts'
 
 /** Suffix-delta: emit only what grew; fall back to a newline + full text. */
 export function suffixDelta(prev: string, next: string): string {
@@ -88,4 +89,54 @@ export function normalizeFileLinks(text: string): string {
       return `${prefix}[${label}](${target})`
     },
   )
+}
+
+/**
+ * Strip leaked `agy` internal retry / output-token-limit auto-continuation
+ * notices that occasionally bleed into assistant text streams:
+ *  - `⚠ API error (attempt N)...` / `⚠️ API error (attempt N)...`
+ *  - 3-line output-token-limit continuation preamble (`Your previous response
+ *    was cut off because it exceeded the output token limit...` + continuation
+ *    directive + `Retries remaining: N`)
+ */
+export function stripAgyInternalNoise(text: string): string {
+  if (!text) return text
+  let out = text
+  // 1. Leaked `⚠ API error (attempt N)...` retry banners
+  out = out.replace(/(?:^|\r?\n)[ \t]*⚠\uFE0F?[ \t]*API error \(attempt \d+\)[^\r\n]*(?=\r?\n|$)/gi, '')
+  // 2. Output-token-limit auto-continuation 3-line block (or single-line variants)
+  out = out.replace(
+    /(?:^|\r?\n)[ \t]*Your previous response was cut off because it exceeded the output token limit[^\r\n]*(?:\r?\n[ \t]*(?:Please continue|Continue directly|Resume directly|Continue from where you left off)[^\r\n]*)?(?:\r?\n[ \t]*Retries remaining:[ \t]*\d+[^\r\n]*)?(?=\r?\n|$)/gi,
+    '',
+  )
+  out = out.replace(/(?:^|\r?\n)[ \t]*Retries remaining:[ \t]*\d+[ \t]*(?=\r?\n|$)/gi, '')
+  if (out !== text) {
+    out = out.replace(/^\r?\n+/, '').replace(/\n{3,}/g, '\n\n')
+  }
+  return out
+}
+
+/** Hold back an incomplete trailing `⚠` line across streaming chunk boundaries. */
+export function splitPendingWarn(text: string): { ready: string; pending: string } {
+  if (text === '' || text.endsWith('\n')) return { ready: text, pending: '' }
+  const nl = text.lastIndexOf('\n')
+  const tail = nl >= 0 ? text.slice(nl + 1) : text
+  if (/^\s*⚠/.test(tail) && tail.length <= 320) {
+    return { ready: nl >= 0 ? text.slice(0, nl + 1) : '', pending: tail }
+  }
+  return { ready: text, pending: '' }
+}
+
+/** Strip standalone `⚠ <hard quota>` lines emitted by agy inside assistant text. */
+export function stripQuotaBannerLines(text: string): string {
+  if (!text.includes('⚠')) return text
+  const parts = text.split(/(\r?\n)/)
+  let out = ''
+  for (let i = 0; i < parts.length; i += 2) {
+    const line = parts[i] ?? ''
+    const sep = parts[i + 1] ?? ''
+    if (isAgyQuotaBannerLine(line)) continue
+    out += line + sep
+  }
+  return out
 }

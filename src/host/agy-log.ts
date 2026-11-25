@@ -30,8 +30,12 @@ export function agyLogDir(homeDir: string): string {
   return join(homeDir, '.gemini', 'antigravity-cli', 'log')
 }
 
+function isAgyRunLogFile(name: string): boolean {
+  return (name.startsWith('cli-') || name.startsWith('acp-server-')) && name.endsWith('.log')
+}
+
 /**
- * Byte-size snapshot of `cli-*.log` files present right now.
+ * Byte-size snapshot of `cli-*.log` and `acp-server-*.log` files present right now.
  * Recording byte offsets (instead of filenames alone) ensures two `agy` spawns
  * within the same wall-clock second (`cli-YYYYMMDD_HHMMSS.log`) still capture
  * the second invocation's appended log lines.
@@ -41,7 +45,7 @@ export function snapshotAgyLogs(homeDir: string): Map<string, number> {
   const out = new Map<string, number>()
   try {
     for (const f of readdirSync(dir)) {
-      if (!f.startsWith('cli-') || !f.endsWith('.log')) continue
+      if (!isAgyRunLogFile(f)) continue
       try {
         out.set(f, statSync(join(dir, f)).size)
       } catch {
@@ -77,6 +81,32 @@ function readFileTailFromOffset(filePath: string, offset: number, maxBytes: numb
   }
 }
 
+/** Size of one log file in bytes (0 when absent) — the offset to start from. */
+export function logSize(file: string | null | undefined): number {
+  if (!file) return 0
+  try {
+    return statSync(file).size
+  } catch {
+    return 0
+  }
+}
+
+/**
+ * Bytes appended to ONE log file since `offset`, capped at MAX_LOG_BYTES.
+ * Used for the ACP transport, where `agy acp --log-file` writes a single known
+ * file: a silent turn (empty end_turn, no stderr, no JSON-RPC error) leaves the
+ * real cause — proxy connect failures, executor construction — only here.
+ */
+export function readLogSlice(file: string | null | undefined, offset: number): string {
+  if (!file) return ''
+  try {
+    if (!existsSync(file)) return ''
+    return readFileTailFromOffset(file, Math.max(0, offset), MAX_LOG_BYTES)
+  } catch {
+    return ''
+  }
+}
+
 /**
  * Concatenated text of the log bytes THIS run created (new files or bytes
  * appended past `before`), newest first. Returns '' when the run wrote no
@@ -89,7 +119,7 @@ export function readAgyRunLogText(homeDir: string, before: AgyLogSnapshot): stri
   try {
     if (!existsSync(dir)) return ''
     entries = readdirSync(dir)
-      .filter((f) => f.startsWith('cli-') && f.endsWith('.log'))
+      .filter((f) => isAgyRunLogFile(f))
       .flatMap((f) => {
         try {
           const st = statSync(join(dir, f))

@@ -1,10 +1,6 @@
-// AgyAdapter — the LlmAdapter implementation at the heart of the plugin
-// (spec section 3). Translates one DSH model call into a short-lived
-// `agy -p --output-format stream-json` child process, maps the NDJSON event
-// stream onto StreamChunks, and binds DSH sessions to agy conversations for
-// multi-turn continuity (ADR-4). Only the trailing user messages become the
-// prompt; earlier context rides agy-native history plus a digest prefix on
-// first bind (ADR-7).
+// AgyAdapter — turns one DSH model call into an agy process/ACP session,
+// maps its event stream onto StreamChunks, and binds DSH sessions to agy
+// conversations for multi-turn continuity (spec §3, ADR-4/ADR-7).
 import { homedir } from 'node:os'
 import { LlmAdapter, LlmError, type GenerateOptions, type LlmModelInfo, type LlmProviderInfo, type LlmResolvedModelInfo, type StreamChunk } from '@deepseek-ai/dsh-llm'
 import type { AgyGenerateOptions } from '../common/protocol.ts'
@@ -15,7 +11,7 @@ import { EffortPolicy } from '../provider/effort-policy.ts'
 import { FailoverBudget } from '../provider/failover-budget.ts'
 import { SpawnLimiter } from '../provider/spawn-limiter.ts'
 import { listAvailableModels, resolveModelInfo, type ModelResolutionDeps } from '../provider/model-resolution.ts'
-import { providerRetryPolicyFor, streamWithEffortRetry } from '../provider/retry-policy.ts'
+import { providerRetryPolicyFor, streamWithEffortRetry, isRevivableFailure } from '../provider/retry-policy.ts'
 import { deliverContext } from '../provider/context-delivery.ts'
 export { calcPromptTokens, mergeSentImageIds } from '../provider/finalize.ts'
 import { selectSessionAccount } from '../provider/account-selection.ts'
@@ -25,6 +21,7 @@ import { runAgyAttempt } from '../provider/attempt-outcome.ts'
 export { STATUS_NOTICE_BLOCK_INDEX, awaitWithNotices } from '../provider/notices.ts'
 export { AGY_PROMPT_SAFE_BYTES, AGY_SINGLE_MESSAGE_MAX_BYTES, buildDigest, collectUnsentImageRefs, elideMiddle, isRealUserMessage, isSyntheticHarnessMessage, latestUserMessageAny, latestUserTaskText, utf8Bytes } from '../provider/prompt-text.ts'
 import { Err, accountsShareSingleEgress, PROVIDER_ID, type PluginConfig } from '../common/types.ts'
+import { isAgyLinkNoticeSource } from '../common/agy-link-source.ts'
 import type { RunRecording } from './recording.ts'
 import { defaultEffortFor, findEntry, resolveModelSlug } from './models.ts'
 import { detectSystemProxy } from './wincred.ts'
@@ -72,6 +69,21 @@ export class AgyAdapter extends LlmAdapter {
   /** Models currently known to reject `--effort` (persisted seed + learned). */
   effortUnsupportedModels(): string[] {
     return this.effortPolicy.unsupportedModels()
+  }
+
+  /** In-flight recording for a session (used by /agy btw to inspect live turn progress). */
+  activeRun(sessionKey: string): RunRecording | undefined {
+    return this.activeRuns.get(sessionKey)
+  }
+
+  /** Live in-flight recording for `sessionKey`, if any. */
+  getActiveRun(sessionKey: string): RunRecording | undefined {
+    return this.activeRuns.get(sessionKey)
+  }
+
+  /** Turns in flight: boot probes yield to real work instead of competing. */
+  activeRunCount(): number {
+    return this.activeRuns.size
   }
 
   /** True when `--effort` must not be passed to this model. */
@@ -194,13 +206,20 @@ export class AgyAdapter extends LlmAdapter {
 
   /** Effort, model, and aux-quota self-healing wrapper around streamAttempt (issue #67, PR #100). */
   override async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
+    let effective = options as AgyGenerateOptions
+    if (effective.purpose === 'compaction' && effective.sessionId !== undefined && this.deps.sessionPendingModel) {
+      const pending = this.deps.sessionPendingModel(String(effective.sessionId))
+      if (pending && pending !== '' && pending !== effective.model) {
+        effective = { ...effective, model: pending }
+      }
+    }
     yield* streamWithEffortRetry({
       streamAttempt: (opts, suppressEffort) => this.streamAttempt(opts, suppressEffort),
       learnEffortUnsupported: (model) => this.learnEffortUnsupported(model),
       catalogAdvertisesEffort: (model) => this.deps.catalog.advertisedEfforts(model).length > 0,
       pool: this.deps.pool,
       defaultModel: () => this.deps.getConfig().defaultModel,
-    }, options as AgyGenerateOptions)
+    }, effective)
   }
 
   private async *streamAttempt(options: AgyGenerateOptions, suppressEffort = false): AsyncIterable<StreamChunk> {
@@ -251,21 +270,14 @@ export class AgyAdapter extends LlmAdapter {
     const continuation = detectContinuation(options.messages)
     if (continuation !== null) {
       const rec = this.deps.runs.get(continuation.runId)
-      // A SETTLED recording that ended in an ACCOUNT-scoped failure must not be
-      // re-driven: DSH re-issues the same step (same trailing tool result), so
-      // resuming it merely replays the identical failure. That is why quota
-      // exhaustion AFTER a tool call used to dead-end the turn while a healthy
-      // account sat idle — the fix is to forget the dead run and fall through,
-      // which re-assembles the prompt and re-selects an account.
-      //
-      // Only account-scoped codes qualify, and only up to the pool's spare
-      // depth: a deterministic failure (or a pool with nothing left to try)
-      // must still surface as the turn's error instead of re-running the work
-      // forever on rotating accounts.
+      // Do not re-drive a settled recording that failed account-scoped or lacks finishable events:
+      // forget it so prompt assembly can rotate accounts or retry cleanly.
       const deadFailure = rec !== undefined && rec.isSettled ? rec.failureInfo : null
-      const deadNoResult = rec !== undefined && rec.isSettled && deadFailure === null && !rec.hasFinishableEventFrom(continuation.eventIndex + 1, policy.mirrorTools && hasToolSupport)
-      if (rec !== undefined && !deadNoResult && !(deadFailure !== null && this.claimFailover(sessionKey, deadFailure.code))) {
-        yield* driveSpanImpl(this.deps, rec, continuation.eventIndex + 1, policy.mirrorTools && hasToolSupport, isCodeMode, goalContext, supportsGoalUpdate, supportsPlanExit, options.signal)
+      const mirrorLive = policy.mirrorTools && hasToolSupport && (this.deps.isMirrorToolAvailable?.(sessionKey) ?? true)
+      const deadNoResult = rec !== undefined && rec.isSettled && deadFailure === null && !rec.hasFinishableEventFrom(continuation.eventIndex + 1, mirrorLive)
+      const deadRevivable = deadFailure !== null && isRevivableFailure(deadFailure.code)
+      if (rec !== undefined && !deadNoResult && !deadRevivable && !(deadFailure !== null && this.claimFailover(sessionKey, deadFailure.code))) {
+        yield* driveSpanImpl(this.deps, rec, continuation.eventIndex + 1, policy.mirrorTools && hasToolSupport, isCodeMode, goalContext, supportsGoalUpdate, supportsPlanExit, options.signal, undefined, false, sessionKey)
         return
       }
       if (rec !== undefined) {
@@ -275,7 +287,7 @@ export class AgyAdapter extends LlmAdapter {
           deadNoResult
             ? 'agy run ' + continuation.runId + ' settled without a consumable result — retrying this step instead of replaying it'
             : 'agy run ' + continuation.runId + ' settled in ' + (deadFailure?.code ?? '') + ' — retrying this step instead of replaying it'
-              + (deadFailure?.code === Err.NETWORK && this.sharesSingleEgress() ? ' on the same account (shared egress)' : ' on another account'),
+              + (deadRevivable ? ' with a fresh process' : (deadFailure?.code === Err.NETWORK && this.sharesSingleEgress() ? ' on the same account (shared egress)' : ' on another account')),
         )
       } else {
         this.warnOnce(
@@ -350,17 +362,18 @@ export class AgyAdapter extends LlmAdapter {
       cfg,
       model,
       isAux,
+      allowAuxModelFallback: isCompaction || isTitle,
       sessionKey,
       ...(options.reasoningEffort === undefined ? {} : { reasoningEffort: String(options.reasoningEffort) }),
+      ...(options.agyQuotaModel === undefined ? {} : { quotaModel: options.agyQuotaModel }),
+      ...(options.agyAvoidAccountIds === undefined ? {} : { avoidAccountIds: options.agyAvoidAccountIds }),
     })
     const account = selection.account
     let family = selection.family
     let activeModel = selection.activeModel
     // The account is final here: record it as *the* in-use account for Google
     // (or bootstrap when none is set) without hijacking it on Argon/Claude/GPT turns.
-    if (account && !isAux && (family === 'google' || !this.deps.pool?.getPoolData().lastActiveAccountId)) {
-      this.deps.pool?.markAccountActive(account.id)
-    }
+    if (account && !isAux) this.deps.pool?.markAccountActive(account.id, family)
     // Image callers need the account's HOME to find agy's artifact directory
     // (`<home>/.gemini/antigravity-cli/brain/<conversation>/`). The hook is
     // advisory: a throwing listener must never break a run.
@@ -434,23 +447,14 @@ export class AgyAdapter extends LlmAdapter {
       const runLive = liveRun !== undefined && !liveRun.isSettled
       const samePrompt = prevPrompt !== undefined && prevPrompt.prompt === prompt
       if (runLive && samePrompt) {
-        // RESCUE before BUSY: an identical prompt for a session whose run is
-        // still alive is normally a continuation span — but when the trailing
-        // mirror result failed to parse as one (malformed callId, harness-side
-        // re-send after a mirror dispatch hiccup), full prompt assembly lands
-        // here and the old behaviour threw BUSY, killing a mid-flight agentic
-        // turn that was perfectly healthy (2026-10-10 23:0x incident). If the
-        // live recording has already cut a span we know exactly where DSH's
-        // consumption stopped: re-drive it from there. Without a cut point
-        // (first span still streaming, nothing consumed yet) a duplicate
-        // really is a duplicate → BUSY stands.
+        // Rescue an identical prompt if the live run already cut a span instead of failing BUSY.
         const rescueFrom = liveRun.lastCutIndex !== null ? liveRun.lastCutIndex + 1 : null
         if (rescueFrom !== null) {
           this.deps.log?.(
             'duplicate-debounce rescue: identical prompt for a live agy run ' + liveRun.runId + ' — re-driving from event ' + rescueFrom + ' instead of throwing BUSY',
           )
           this.activeSessionPrompts.set(sessionKey, { prompt, startedAt: now, inFlight: true })
-          yield* driveSpanImpl(this.deps, liveRun, rescueFrom, policy.mirrorTools && hasToolSupport, isCodeMode, goalContext, supportsGoalUpdate, supportsPlanExit, options.signal)
+          yield* driveSpanImpl(this.deps, liveRun, rescueFrom, policy.mirrorTools && hasToolSupport, isCodeMode, goalContext, supportsGoalUpdate, supportsPlanExit, options.signal, undefined, false, sessionKey)
           return
         }
         throw new LlmError(
@@ -519,11 +523,13 @@ export class AgyAdapter extends LlmAdapter {
       this.activeSessionPrompts.set(sessionKey, { prompt, startedAt: now, inFlight: true })
     }
 
-    // ---- spawn + parse + outcome: delegated to provider/attempt-outcome.ts ----
-    // The attempt machinery owns argv/transport, the credential-slot dispatch,
-    // child spawn, parser feed and the detached outcome closure. The adapter
-    // injects its private state as callbacks so it stays the single owner of
-    // activeRuns, failover budgets and network streaks.
+    // Dispatch to attempt-outcome.ts. Inject private state callbacks so adapter owns activeRuns/failover.
+    if (!isAux && sessionKey !== '') {
+      const lastUser = [...messages].reverse().find((m) => m.role === 'user') as { source?: { kind?: unknown; form?: unknown } } | undefined
+      const isWakeNotice = isAgyLinkNoticeSource(lastUser?.source)
+      if (!isWakeNotice) this.deps.backgroundObserver?.onHumanTurn?.(sessionKey)
+      this.deps.backgroundObserver?.onAttemptStart?.(sessionKey)
+    }
     const attemptDeps: AttemptDeps = {
       acquire: (signal?: AbortSignal) => this.deps.acquire(signal),
       pool: this.deps.pool,
@@ -532,6 +538,8 @@ export class AgyAdapter extends LlmAdapter {
       log: this.deps.log,
       onParser: this.deps.onParser,
       onRun: this.deps.onRun,
+      ...(this.deps.onAccountUsed === undefined ? {} : { onAccountUsed: this.deps.onAccountUsed }),
+      ...(this.deps.ensureFreshToken === undefined ? {} : { ensureFreshToken: this.deps.ensureFreshToken }),
       clearInFlightPrompt: (key: string, p: string) => this.clearInFlightPrompt(key, p),
       registerActiveRun: (key: string, r: RunRecording) => this.activeRuns.set(key, r),
       unregisterActiveRun: (key: string, r: RunRecording) => {
@@ -548,6 +556,11 @@ export class AgyAdapter extends LlmAdapter {
       minSpawnIntervalMs: this.minSpawnIntervalMs,
       spawnLimiter: this.spawnLimiter,
       ...(this.deps.runAcp === undefined ? {} : { runAcp: this.deps.runAcp }),
+      ...(this.deps.agyVersion === undefined ? {} : { agyVersion: this.deps.agyVersion }),
+      ...(this.deps.backgroundObserver === undefined ? {} : { backgroundObserver: this.deps.backgroundObserver }),
+      ...(this.deps.appendAcpNotice === undefined ? {} : { appendAcpNotice: this.deps.appendAcpNotice }),
+      ...(this.deps.noteAcpReport === undefined ? {} : { noteAcpReport: this.deps.noteAcpReport }),
+      ...(this.deps.reinstallCredentialSlot === undefined ? {} : { reinstallCredentialSlot: this.deps.reinstallCredentialSlot }),
     }
     const attemptInput: AttemptInput = {
       cfg,
@@ -556,6 +569,7 @@ export class AgyAdapter extends LlmAdapter {
       sessionKey,
       workspaceRoot,
       isAux,
+      isBackgroundAux: isCompaction || isTitle || isReview,
       account,
       prompt,
       model,
@@ -566,16 +580,19 @@ export class AgyAdapter extends LlmAdapter {
       binding,
       messages,
       newlySentImageIds,
+      ...(plan.stagedImages.length > 0 ? { stagedImages: plan.stagedImages } : {}),
       sessionAccountKey,
       family,
       signal: options.signal,
       agyOnEvent: options.agyOnEvent,
+      ...(options.agyQuotaModel === undefined ? {} : { quotaModel: options.agyQuotaModel }),
+      ...(options.agyAvoidAccountIds === undefined ? {} : { avoidAccountIds: options.agyAvoidAccountIds }),
       ...resolveAttemptOverrides(options, cfg),
     }
     const rec = yield* runAgyAttempt(attemptDeps, attemptInput)
 
     // First span of the run: stream recorded events until the first
     // completed tool step cuts it (or the result finishes it).
-    yield* driveSpanImpl(this.deps, rec, 0, policy.mirrorTools && hasToolSupport, isCodeMode, goalContext, supportsGoalUpdate, supportsPlanExit, options.signal, compactionNotice)
+    yield* driveSpanImpl(this.deps, rec, 0, policy.mirrorTools && hasToolSupport, isCodeMode, goalContext, supportsGoalUpdate, supportsPlanExit, options.signal, compactionNotice, false, sessionKey)
   }
 }

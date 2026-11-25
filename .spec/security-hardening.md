@@ -24,6 +24,18 @@ Each invariant below is enforced in code AND covered by a regression test.
   behind by crashed processes; `syncMcpBridge()` serializes concurrent starts;
   `registerBridgeMcpConfig()` de-duplicates `(bridge, file)` registrations idempotently
   and `teardownBridgeState()` runs/clears all registered restores once. (test: `test/http-contract.test.ts`)
+- **4x Schema & Budget Hardening (`src/host/mcp-schema.ts`, `src/host/bridge.mjs`)**:
+  - Every exported tool carries `_meta: { 'antigravity/alwaysLoad': true }` so `agy` never hides large MCP tools behind on-demand discovery.
+  - Tool definitions are budgeted under `AGY_MCP_SAFE_TOKEN_BUDGET` (18,000 tokens, safely below `agy`'s 20,000-token hard drop ceiling) by stripping metadata and progressively trimming verbose descriptions without dropping any tool.
+  - Regex `pattern` constraints are converted from JS `\uXXXX` / surrogate pairs to Go RE2 `\x{...}`; RE2-incompatible lookarounds/backreferences are downgraded into `description` notes so `agy` never crashes in `"building toolbox"`.
+  - `$ref` (with cycle guard), `allOf`, nullable `anyOf`/`oneOf`, `const`, empty `enum`, and item-less arrays are flattened; MCP tool results returning images are forwarded as native MCP `image` + `text` content blocks. (test: `test/mcp-schema.test.ts`)
+  - **`items` 后置不变式（`enforceArrayItems`）**：`prepareMcpTools()` 在清洗之后再走一遍全树，任何 `type: "array"` 缺 `items` 一律补 `{type:"string"}`。原因：Gemini 对 function declaration 的校验是**整轮**失败——`GenerateContentRequest.tools[0].function_declarations[N].parameters.properties[args].items: missing field` 一条就让整个请求 400，而清洗器会因为 `anyOf` 合并、depth 截断、`$ref` 解析失败等路径漏掉节点。`findArraysMissingItems()` 导出为可审计的检查器。
+- **Schema doctor for THIRD-PARTY MCP servers (`src/host/mcp-sanitize.ts`, `src/host/mcp-sanitize-shim.ts` → `dist/mcp-sanitize.mjs`)**:
+  - The bridge sanitizer only covers tools DSH exposes through `dsh-tools-<port>`. Servers the user registers DIRECTLY in `<agy home>/.gemini/config/mcp_config.json` (godot, blender, computer-use, chrome-devtools, …) bypass it, and `agy` forwards their schemas to Google verbatim. Live consequence (2026-11-23): `godot-mcp` 3.1.0 ships 12 tools declaring `{"type":"array"}` with no `items` (`game_procedural_mesh` vertices/normals/uvs/indices, `create_script` methods, `game_call_method`/`game_emit_signal`/`game_rpc` args, five `points` tools), so **every** turn died with `400 INVALID_ARGUMENT … items: missing field` even when none of those tools was called.
+  - `writeMcpConfig()` now wraps every foreign stdio entry so it launches `dist/mcp-sanitize.mjs` (a transparent stdio JSON-RPC proxy) with the original spec carried in `DSH_AGY_MCP_TARGET`; the proxy rewrites only `tools/list` results through the SAME `sanitizeMcpSchema` + `enforceArrayItems` the bridge uses, and forwards every other frame byte for byte. The proxy is spawned with the host binary plus `ELECTRON_RUN_AS_NODE=1` (issue #140 rule) and must strip that flag plus the marker env before starting the real server.
+  - Wrapping is idempotent and self-describing: a stale wrapper (upgraded/moved plugin) is re-pointed at the live shim from its own env, `unwrapForeignServers()` restores the original spec, and the registry is unwrapped once the LAST `dsh-tools-*` entry leaves the file — so teardown, a crashed host, or another rewriting host never leaves `agy` pointing at a shim that no longer exists. Entries without `command` (http/sse) and specs over `MAX_WRAPPED_SPEC_CHARS` are left untouched, and a missing shim (build not run) skips wrapping instead of breaking every server.
+  - `agy` caches per-tool descriptors at `<home>/.gemini/antigravity-cli/mcp/<server>/<tool>.json` carrying the BROKEN schema, so a wrapped server's cache directory is dropped on rewrite; otherwise the 400 survives until agy happens to refresh it.
+  - Verification anchors: `test/mcp-sanitize-doctor.test.ts` (fixes the real godot shapes, end-to-end shim handshake, registry wrap/restore, cache invalidation, missing-shim fallback) plus the live probe that launches each wrapped entry through `D:\dsh\DeepSeek Harness.exe` and asserts `findArraysMissingItems` is empty for all 217 declared tools.
 
 ## One-shot `agy_ask` file inlining (`src/host/oneshot.ts`)
 
@@ -34,6 +46,37 @@ Each invariant below is enforced in code AND covered by a regression test.
 
 - Every JSON body is read through `readJsonBody()`, capped at **1 MiB**; oversized
   bodies are discarded (`strict` callers get `__invalidJson`). (test: `test/http-body.test.ts`)
+
+## External credential-lease routes (`src/transport/http/routes/lease.ts`)
+
+`/plugins/agy-link/lease/{acquire,renew,release}` (POST) and `/plugins/agy-link/lease`
+(GET) let a local process hold the Windows credential slot and settle account state,
+so they are gated more strictly than the console routes:
+
+- **Bearer token first**: every lease route requires `Authorization: Bearer <token>`,
+  where the token is a per-start 256-bit random value published only in the `0600`
+  discovery file `<pool dir>/.link-endpoint.json` (owner and mode verified on POSIX).
+  A missing or wrong token is **401 `unauthorized`**, decided before the origin and
+  method gates and compared with `timingSafeEqual`. A lease hands out an account's
+  environment and spends its quota; loopback only means "same machine".
+- Cross-origin browser requests (`Origin` present and not loopback / `app://` /
+  `file://`, same `isCrossOriginBlocked()` as `/media`) get **403 `cross_origin`**: a
+  webpage must not be able to hold the slot or quarantine an account.
+- Wrong method → **405 `method_not_allowed`**. Bodies are read strictly (malformed or
+  > 1 MiB → **400 `invalid_json`**); every field is type-checked (**400
+  `invalid_request`**): `holder` required, non-empty, ≤ 200 chars; ids/model ≤ 200;
+  `accountDir` ≤ 4096; `ttlMs`/`waitMs` finite numbers (`waitMs` > 0, capped at 1 h;
+  `ttlMs` clamped 15 s–600 s); `ok` boolean.
+- The reported `error` is truncated to **8 KiB** (UTF-8 safe) before it is classified
+  or stored as an account reason. `holder` is JSON-escaped before it is logged, so it
+  cannot forge log lines.
+- Lease ids are 128-bit `crypto.randomBytes`, never sequential; settlement requires
+  the id, so only the client that acquired a lease can report its outcome.
+- Every response uses the `{ ok:false, code, error }` envelope on failure. The acquire
+  route's backstop deadline is `longRouteTimeout(1 h)`; the slot wait itself is bounded
+  inside the registry, and a lease granted after the backstop already answered is
+  released at once (no orphaned slot holder). (tests: `test/lease-routes.test.ts`,
+  `test/external-lease.test.ts`)
 
 ## `/agy doctor` report (`src/host/diagnostics.ts`)
 

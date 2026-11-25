@@ -6,9 +6,14 @@
 // domain/accounts/admin.ts. This class owns the in-memory cache and delegates,
 // keeping every public method signature unchanged.
 import { homedir } from 'node:os'
+import { join } from 'node:path'
+import { stateDir } from '../common/config.ts'
 import {
   accountHasArgon,
+  argonSharesGoogleGroup,
   baseModelSlug,
+  sharedArgonPeerFamily,
+  type AccountPlanTier,
   type AccountPoolData,
   type FamilyQuotaInfo,
   type ManagedAccount,
@@ -25,11 +30,14 @@ import {
   LOW_QUOTA_WEEKLY,
   explainIneligibility,
   isAccountEligible,
+  isModelQuotaClear,
   orderByExpiry,
+  pickEligibleAccount,
   resolveEligibleActiveAccountId,
   type AccountIneligibilityReason,
 } from '../domain/accounts/selection.ts'
 import { QUOTA_FAMILIES, normalizeModelFamily } from '../common/quota-bench.ts'
+import { resolveAccountPlanTier } from '../common/plan-tier.ts'
 import { detectSystemProxy } from './wincred.ts'
 import { ensureIsolatedKeychain } from './runner.ts'
 
@@ -54,7 +62,7 @@ export class AccountPoolManager {
    * blip that healed while the process was down.
    */
   private readonly authStrikes = new Map<string, number>()
-  private readonly unsupportedModels = new Map<string, Set<string>>()
+  private readonly unsupportedModels = new Map<string, Map<string, number>>()
   private catalog?: {
     get(accountId?: string): { models?: readonly { id: string }[]; source?: string }
     getAccountCatalog?(accountId?: string): { models?: readonly { id: string }[]; source?: string } | undefined
@@ -88,15 +96,13 @@ export class AccountPoolManager {
       persist: () => this.persist(),
       markKnown: (id) => this.store.markKnown(id),
       ensureIsolatedKeychain,
-      pool: {
-        hasDedicatedGroup: (id, family) => this.hasDedicatedGroup(id, family),
-        isModelSupported: (acc: ManagedAccount, model: string) => this.isModelSupported(acc, model),
-      },
+      pool: this,
       selectAccount: (family, model) => this.selectAccount(family, model),
     })
+    this.admin.dropModelScopedCooldowns()
   }
 
-  private catalogForAccount(accountId: string): { models?: readonly { id: string }[]; source?: string } | undefined {
+  catalogForAccount(accountId: string): { models?: readonly { id: string }[]; source?: string } | undefined {
     if (!this.catalog) return undefined
     if (typeof this.catalog.getAccountCatalog === 'function') {
       return this.catalog.getAccountCatalog(accountId)
@@ -110,9 +116,9 @@ export class AccountPoolManager {
   }
 
   markModelUnsupported(accountId: string, model: string): void {
-    const set = this.unsupportedModels.get(accountId) ?? new Set()
-    this.unsupportedModels.set(accountId, set)
-    set.add(baseModelSlug(model))
+    const learned = this.unsupportedModels.get(accountId) ?? new Map<string, number>()
+    this.unsupportedModels.set(accountId, learned)
+    learned.set(baseModelSlug(model), Date.now())
   }
 
   /**
@@ -132,18 +138,8 @@ export class AccountPoolManager {
     const sysProxy = defaultProxy || detectSystemProxy()
     const now = Date.now()
     const resolvedActiveAccountIds: Partial<Record<ModelFamily, string>> = {}
-    const source = {
-      hasDedicatedGroup: (id: string, fam: ModelFamily) => this.hasDedicatedGroup(id, fam),
-      isModelSupported: (acc: ManagedAccount, model: string) => this.isModelSupported(acc, model),
-    }
     for (const fam of QUOTA_FAMILIES) {
-      const resolved = resolveEligibleActiveAccountId(
-        this.data.accounts,
-        this.data.activeAccountIds,
-        fam,
-        source,
-        now,
-      )
+      const resolved = resolveEligibleActiveAccountId(this.data.accounts, this.data.activeAccountIds, fam, this, now)
       if (resolved) resolvedActiveAccountIds[fam] = resolved
     }
     return {
@@ -186,7 +182,10 @@ export class AccountPoolManager {
    * as well as the primary system ~/.gemini/antigravity-cli/log directory.
    */
   sweepOldLogs(maxDays = 7): number {
-    return sweepOldAgyLogs(this.data.accounts, homedir(), maxDays)
+    // The ACP transport passes --log-file and writes per-process logs into the
+    // plugin state dir; they follow the same retention window as agy's own
+    // cli-*.log files, otherwise a long-lived session accumulates them forever.
+    return sweepOldAgyLogs(this.data.accounts, homedir(), maxDays, Date.now(), [join(stateDir(), 'logs')])
   }
 
   /** Create a new isolated account slot and prepare its filesystem home. */
@@ -212,6 +211,10 @@ export class AccountPoolManager {
     return this.admin.setAccountAlias(id, alias)
   }
 
+  setAccountPlanTier(id: string, tier: AccountPlanTier | undefined): boolean { return this.admin.setAccountPlanTier(id, tier) }
+
+  setPlanTierOverride(id: string, tier: AccountPlanTier | undefined): boolean { return this.admin.setPlanTierOverride(id, tier) }
+
   setAccountEnabled(id: string, enabled: boolean): boolean {
     const wasActive = this.data.activeAccountIds?.google === id || this.data.lastActiveAccountId === id
     const ok = this.admin.setAccountEnabled(id, enabled)
@@ -226,8 +229,8 @@ export class AccountPoolManager {
    * Record the account a run actually spawned with. The console derives its
    * single "in use" badge from this; exactly one account runs agy at a time.
    */
-  markAccountActive(id: string): void {
-    this.admin.markAccountActive(id)
+  markAccountActive(id: string, family: ModelFamily = 'google'): void {
+    this.admin.markAccountActive(id, family)
   }
 
   /**
@@ -262,13 +265,15 @@ export class AccountPoolManager {
    * External re-login detected (agy logout + new login): identity-bound state
    * from the PREVIOUS account must not leak onto the new one.
    */
-  resetAccountIdentity(id: string, newEmail: string): void {
-    this.admin.resetAccountIdentity(id, newEmail)
+  resetAccountIdentity(id: string, newEmail: string, resetAlias = false): void {
+    this.admin.resetAccountIdentity(id, newEmail, resetAlias)
   }
 
   clearAuthRequired(id: string, force = false): void {
     this.admin.clearAuthRequired(id, force)
   }
+  noteAuthReverifyAttempt(id: string): void { this.admin.noteAuthReverifyAttempt(id) }
+  healAuthFlagsFromQuota(): string[] { return this.admin.healAuthFlagsFromQuota() }
 
   /** Drop an email label that is provably wrong (e.g. a foreign token overwrote it). */
   clearAccountEmail(id: string): void {
@@ -327,6 +332,16 @@ export class AccountPoolManager {
     return this.explainIneligibility(acc, family, now, model) === null
   }
 
+  /** Record a 429 scoped to ONE model's quota bucket (e.g. the image model). */
+  recordModelFailure(id: string, model: string, reason: string, serverResetTime?: string): void {
+    this.admin.recordModelFailure(id, model, reason, serverResetTime)
+  }
+
+  /** Clear one model's cooldown after a successful call on it. */
+  recordModelSuccess(id: string, model: string): void {
+    this.admin.recordModelSuccess(id, model)
+  }
+
   /** Returns the currently active and healthy account ID (see PoolAdmin). */
   getActiveAccountId(family: ModelFamily = 'google', model?: string): string | undefined {
     return this.admin.getActiveAccountId(family, model)
@@ -361,6 +376,14 @@ export class AccountPoolManager {
     }
     if (email) acc.email = email
 
+    // Heal a PERSISTED tier that the fresh evidence contradicts: an account
+    // whose quota now shows a 5-hour window is not Free, and one with no Argon
+    // evidence at all is not Ultra. resolveAccountPlanTier() only overrides a
+    // stored tier whose defining marker is missing, so a legit Ultra detected
+    // from richer CLI groups is never downgraded here.
+    const healed = resolveAccountPlanTier(acc)
+    if (healed !== undefined && acc.planTier !== healed) acc.planTier = healed
+
     // If an updated family has exhausted its quota, proactively advance to the next account
     const now = Date.now()
     for (const [famKey, info] of Object.entries(quotas) as [ModelFamily, FamilyQuotaInfo][]) {
@@ -382,7 +405,7 @@ export class AccountPoolManager {
         // Folded/shared Argon pool rides the Gemini bucket when no dedicated argon row exists.
         const argonPinned = this.data.activeAccountIds?.argon
         const ownsArgon = argonPinned === id || (argonPinned === undefined && this.data.lastActiveAccountId === id)
-        if (!gateCleared && famKey === 'google' && !acc.quotas?.argon && ownsArgon) {
+        if (!gateCleared && famKey === 'google' && argonSharesGoogleGroup(acc) && ownsArgon) {
           this.advanceAccount(id, 'argon')
         }
       }
@@ -486,39 +509,43 @@ export class AccountPoolManager {
    * drop a 429 timer.
    */
   clearCooldown(id?: string, family?: ModelFamily, includeQuotaBench = false): void {
-    const now = Date.now()
-    const targetFamily = family ? (normalizeModelFamily(family) ?? family) : undefined
-    const clearOne = (acc: ManagedAccount): void => {
-      acc.cooldowns ??= {}
-      if (targetFamily) delete acc.cooldowns[targetFamily]
-      else acc.cooldowns = {}
-      if (!includeQuotaBench) return
-      const families = targetFamily ? [targetFamily] : (Object.keys(acc.quotas ?? {}) as ModelFamily[])
-      if (families.length === 0) return
-      acc.quotaGateClearedAt ??= {}
-      for (const fam of families) {
-        const updatedAt = acc.quotas?.[fam]?.updatedAt
-        acc.quotaGateClearedAt[fam] = Math.max(now, updatedAt ?? 0)
-      }
-    }
-    if (id) {
-      const acc = this.getAccount(id)
-      if (!acc) return
-      clearOne(acc)
-    } else {
-      for (const acc of this.data.accounts) clearOne(acc)
-    }
-    this.persist()
+    this.admin.clearCooldown(id, family, includeQuotaBench)
   }
 
-  /**
-   * Core scheduling algorithm: Sticky Sequential Drain.
-   * Sticks to the current active account until it runs out of quota/rate-limited,
-   * then smoothly advances to the next available account in cyclic order.
-   */
-  selectAccount(family: ModelFamily, model?: string): ManagedAccount | null {
+  private syncSharedSelect(acc: ManagedAccount, family: ModelFamily, prevId?: string): boolean {
+    const peer = sharedArgonPeerFamily(acc, family)
+    if (!peer) return false
+    const curPeer = this.data.activeAccountIds?.[peer]
+    if (peer === 'argon' && curPeer && this.getAccount(curPeer)?.quotas?.argon) return false
+    let changed = false
+    if ((curPeer === undefined || curPeer === prevId) && this.isAccountEligible(acc, peer)) {
+      this.data.activeAccountIds![peer] = acc.id
+      changed = curPeer !== acc.id
+    }
+    if (peer === 'google' && this.data.activeAccountIds?.google === acc.id && this.data.lastActiveAccountId !== acc.id) {
+      this.data.lastActiveAccountId = acc.id
+      changed = true
+    }
+    return changed
+  }
+
+  private commitSelectedAccount(picked: ManagedAccount, family: ModelFamily, prevId?: string): void {
+    if (!this.data.activeAccountIds) this.data.activeAccountIds = {}
+    this.data.activeAccountIds[family] = picked.id
+    if (family === 'google' || !this.data.lastActiveAccountId) this.data.lastActiveAccountId = picked.id
+    this.syncSharedSelect(picked, family, prevId)
+    this.persist()
+    if (prevId && prevId !== picked.id) this.onAccountSwitch?.(picked.id, family)
+  }
+
+  /** Sticky Sequential Drain: keep the active account until it is unusable. */
+  selectAccount(family: ModelFamily, model?: string, quotaModel?: string): ManagedAccount | null {
     const now = Date.now()
-    const candidates = this.data.accounts.filter((acc) => this.isAccountEligibleForModel(acc, family, model, now))
+    const candidates = this.data.accounts.filter(
+      (acc) =>
+        this.isAccountEligibleForModel(acc, family, model, now) &&
+        (quotaModel === undefined || quotaModel === '' || isModelQuotaClear(acc, family, quotaModel, now)),
+    )
 
     if (candidates.length === 0) return null
 
@@ -526,18 +553,7 @@ export class AccountPoolManager {
       // Pick least recently used candidate
       const sorted = candidates.slice().sort((a, b) => (a.lastUsedAt ?? 0) - (b.lastUsedAt ?? 0))
       const picked = sorted[0] ?? null
-      if (picked) {
-        const prevId = this.data.activeAccountIds?.[family]
-        if (!this.data.activeAccountIds) this.data.activeAccountIds = {}
-        this.data.activeAccountIds[family] = picked.id
-        if (family === 'google' || !this.data.lastActiveAccountId) {
-          this.data.lastActiveAccountId = picked.id
-        }
-        this.persist()
-        if (prevId && prevId !== picked.id) {
-          this.onAccountSwitch?.(picked.id, family)
-        }
-      }
+      if (picked) this.commitSelectedAccount(picked, family, this.data.activeAccountIds?.[family])
       return picked
     }
 
@@ -547,8 +563,10 @@ export class AccountPoolManager {
     if (activeId) {
       const activeCandidate = candidates.find((a) => a.id === activeId)
       if (activeCandidate) {
-        if ((family === 'google' || !this.data.lastActiveAccountId) && this.data.lastActiveAccountId !== activeCandidate.id) {
-          this.data.lastActiveAccountId = activeCandidate.id
+        const peerMoved = this.syncSharedSelect(activeCandidate, family, activeId)
+        const needLast = (family === 'google' || !this.data.lastActiveAccountId) && this.data.lastActiveAccountId !== activeCandidate.id
+        if (needLast || peerMoved) {
+          if (needLast) this.data.lastActiveAccountId = activeCandidate.id
           this.persist()
         }
         return activeCandidate
@@ -559,17 +577,20 @@ export class AccountPoolManager {
     //    account whose quota expires SOONEST (Priority 1: weekly quota expiry,
     //    Priority 2: 5h quota expiry, Priority 3: pool order).
     const nextAccount: ManagedAccount = this.orderByExpiry(candidates, family, activeId)[0]!
-
-    if (!this.data.activeAccountIds) this.data.activeAccountIds = {}
-    this.data.activeAccountIds[family] = nextAccount.id
-    if (family === 'google' || !this.data.lastActiveAccountId) {
-      this.data.lastActiveAccountId = nextAccount.id
-    }
-    this.persist()
-    if (activeId && activeId !== nextAccount.id) {
-      this.onAccountSwitch?.(nextAccount.id, family)
-    }
+    this.commitSelectedAccount(nextAccount, family, activeId)
     return nextAccount
+  }
+
+  /** Pick an eligible account WITHOUT mutating the active pointer (image rotation). */
+  findAccount(family: ModelFamily, model?: string, quotaModel?: string, avoid?: readonly string[]): ManagedAccount | null {
+    return pickEligibleAccount(this.data.accounts, this, {
+      family,
+      ...(model === undefined ? {} : { model }),
+      ...(quotaModel === undefined ? {} : { quotaModel }),
+      ...(avoid === undefined ? {} : { avoid }),
+      ...(this.data.activeAccountIds?.[family] === undefined ? {} : { activeId: this.data.activeAccountIds[family] }),
+      now: Date.now(),
+    })
   }
 
   /** Get countdown in milliseconds until the earliest account in cooldown resets. */
@@ -577,10 +598,7 @@ export class AccountPoolManager {
     return earliestResetCountdown(this.data.accounts, family)
   }
 
-  /**
-   * Earliest moment ANY enabled account could serve `family` again: the sooner
-   * of a cooldown expiry and a quota-window reset.
-   */
+  /** Earliest moment ANY enabled account can serve `family` again. */
   getEarliestAvailableCountdown(family: ModelFamily): number | null {
     return earliestAvailableCountdown(this.data.accounts, family)
   }

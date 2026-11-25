@@ -9,6 +9,7 @@ import { handleConfig } from './config.ts'
 import { handleSession, handleGoal, handleClear } from './session.ts'
 import { handleModels } from './models.ts'
 import { handleDoctor } from './doctor.ts'
+import { handleCacheStats } from './cache.ts'
 import { handleImage } from './image.ts'
 import { handleEcosystem } from './ecosystem.ts'
 import { handleSlashBridge } from './slash-bridge.ts'
@@ -25,7 +26,7 @@ export const COMMAND_REGISTRY: readonly CommandEntry[] = [
       'pool', 'accounts',
       'use', 'set-active',
       'enable-account', 'disable-account', 'add-account',
-      'refresh-quota', 'clear-cooldown', 'remove-account',
+      'refresh-quota', 'clear-cooldown', 'remove-account', 'plan',
     ],
     handle: handlePool,
   },
@@ -33,7 +34,7 @@ export const COMMAND_REGISTRY: readonly CommandEntry[] = [
   { subs: ['models'], handle: handleModels },
   {
     subs: [
-      'mode', 'sandbox', 'agent', 'settings', 'transport', 'effort',
+      'mode', 'sandbox', 'agent', 'settings', 'transport', 'wakeup', 'effort',
       'dispatch', 'dispatch-retries',
       'parallel', 'max-concurrent',
       'workspace',
@@ -48,6 +49,7 @@ export const COMMAND_REGISTRY: readonly CommandEntry[] = [
   { subs: ['btw', 'fork', 'grill', 'grill-me', 'learn', 'compact'], handle: handleSlashBridge },
   { subs: ['plugins', 'mcp', 'agents', 'skills', 'sync-ecosystem', 'sync'], handle: handleEcosystem },
   { subs: ['doctor'], handle: handleDoctor },
+  { subs: ['cache-stats', 'cache'], handle: handleCacheStats },
 ]
 
 /** Route one parsed invocation to its group handler; `help`/unknown returns HELP. */

@@ -65,6 +65,8 @@ test('console dictionary keys exist in every shipped language', () => {
     'config.imageCopyFailed',
     'config.showHeaderBadge', 'config.showHeaderBadgeDesc',
     'config.showTranslateAction', 'config.showTranslateActionDesc',
+    'config.translateDisplay', 'config.translateDisplayDesc', 'config.translateDisplayCard', 'config.translateDisplayReplace',
+    'tsl.showTranslation',
     'config.poolWideCatalog', 'config.poolWideCatalogDesc',
   ];
   for (const [lang, dict] of Object.entries(languages)) {
@@ -107,6 +109,8 @@ test('settings row exposes image generation model/effort and the CLI command', (
   const source = readFileSync(join(root, 'dist', 'client.js'), 'utf8');
   assert.match(source, /setCfg\(["']imageModel["']/);
   assert.match(source, /setCfg\(["']imageEffort["']/);
+  assert.match(source, /setCfg\(["']btwModel["']/);
+  assert.match(source, /setCfg\(["']btwEffort["']/);
   assert.match(source, /config\.image/);
   assert.match(source, /dsh-agy-image/);
   assert.match(source, /config\.imageCopy/);

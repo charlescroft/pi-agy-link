@@ -6,12 +6,12 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
 import { apply } from '../src/index.ts'
+import { sandboxEnv } from './helpers/sandbox-env.ts'
 
 // Exercise the actual scope owner, not a manual bridge.close()/restore call.
 test('disposing a ready plugin clears background timers, closes MCP and restores config', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'agy-ready-disposal-'))
-  const previous = process.env.DSH_HOME
-  process.env.DSH_HOME = dir
+  const restoreEnv = sandboxEnv(dir)
   // The production default is the agy global registry; redirect it into the
   // temp dir so the test never mutates the developer's ~/.gemini.
   const file = join(dir, 'gemini', 'mcp_config.json')
@@ -47,7 +47,10 @@ test('disposing a ready plugin clears background timers, closes MCP and restores
     // warmup scheduler is interval-only (no boot pass, so an upgrade never
     // probes on stale pool.json rows).
     const boots = timeouts.mock.calls.filter(c => [4000, 5000].includes(Number(c.arguments[1])))
-    assert.equal(sweeps.length, 4, 'media TTL, quota refresh, warmup and the catalog TTL refresh are all >= 60s')
+    // media TTL, quota refresh, warmup, catalog TTL, the deferred boot-maintenance
+    // interval (30 min), and the 2-minute fast self-heal for accounts flagged as
+    // 需重新登录 (AUTH_FAST_REVERIFY_MS).
+    assert.equal(sweeps.length, 6, 'media TTL, quota refresh, warmup, catalog TTL, maintenance and auth re-verify are all >= 60s')
     assert.equal(boots.length, 2)
     for (const call of [...sweeps, ...boots]) assert.equal((call.result as NodeJS.Timeout).hasRef(), false)
     await ctx.fiber.dispose()
@@ -57,8 +60,7 @@ test('disposing a ready plugin clears background timers, closes MCP and restores
     for (const call of boots) assert.ok(clearTimeouts.mock.calls.some(c => c.arguments[0] === call.result))
   } finally {
     await ctx.fiber.dispose()
-    if (previous === undefined) delete process.env.DSH_HOME
-    else process.env.DSH_HOME = previous
+    restoreEnv()
     rmSync(dir, { recursive: true, force: true })
   }
 })

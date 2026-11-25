@@ -3,7 +3,18 @@ import type { CommandResult } from '@deepseek-ai/dsh-commands'
 import { classifyToolError } from '../recording.ts'
 import { formatTokenCount } from '../../common/compaction.ts'
 import { resolveEffectiveCompactLimit } from '../../common/compact-threshold.ts'
-import { ok, type CommandDeps } from './shared.ts'
+import { ok, type AcpStatusView, type CommandDeps } from './shared.ts'
+import { cacheMetrics, formatCacheBucket } from '../cache-metrics.ts'
+import { buildOrchestratorSettingsObject } from '../../common/orchestrator.ts'
+
+/** One-line ACP pool summary, including drains and credential-slot recoveries. */
+function describeAcp(s: AcpStatusView): string {
+  const parts = [`${s.activeProcesses} proc`, `${s.sessions} session(s)`]
+  if ((s.drainingProcesses ?? 0) > 0) parts.push(`${s.drainingProcesses} draining`)
+  if ((s.slotOverwriteDetectedCount ?? 0) > 0) parts.push(`slot overwrites: ${s.slotOverwriteDetectedCount}`)
+  if (s.lastSlotRecoveryAt != null) parts.push(`slot recovered ${new Date(s.lastSlotRecoveryAt).toISOString()}`)
+  return ` (${parts.join(', ')})`
+}
 
 export async function renderStatus(deps: CommandDeps): Promise<string> {
   const cfg = deps.cfg()
@@ -28,6 +39,7 @@ export async function renderStatus(deps: CommandDeps): Promise<string> {
   const errorKinds = last?.toolErrors.map(classifyToolError) ?? []
   const hasHeadlessPermissionDenial = errorKinds.includes('approval')
   const budget = resolveEffectiveCompactLimit(cfg)
+  const orchestrator = buildOrchestratorSettingsObject(cfg)
   const lines = [
     '**dsh-agy-link status**',
     '- agy binary: ' + (bin ?? 'not found — install via https://antigravity.google/docs/cli/install'),
@@ -35,9 +47,13 @@ export async function renderStatus(deps: CommandDeps): Promise<string> {
     '- auth: ' + (auth ? auth.phase + (auth.message ? ' — ' + auth.message : '') : 'unknown'),
     '- permission mode: ' + cfg.permissionMode + (cfg.permissionMode === 'skip' ? ' — WARNING: agy runs tools without approval' : ''),
     '- sandbox: ' + (cfg.sandbox ? 'on' : 'off'),
-    '- transport: ' + cfg.transport + (cfg.transport === 'acp' && deps.acpStatus ? (() => { const s = deps.acpStatus(); return ` (${s.activeProcesses} proc, ${s.sessions} session(s))`; })() : ''),
+    '- transport: ' + cfg.transport + (cfg.transport === 'acp' && deps.acpStatus ? describeAcp(deps.acpStatus()) : ''),
+    '- background wakeup: ' + (cfg.backgroundWakeup ? 'on' : 'off') + (deps.backgroundStatus ? (() => { const w = deps.backgroundStatus(); return ` (watches: ${w.activeWatches}, timers: ${w.pendingTimers}, tasks: ${w.pendingTasks})`; })() : ''),
     ...(cfg.agent.trim() !== '' ? ['- agent: ' + cfg.agent.trim()] : []),
-    ...(cfg.agySettings.trim() !== '' ? ['- settings override: ' + cfg.agySettings.trim()] : ''),
+    ...(cfg.agySettings.trim() !== '' ? ['- settings override: ' + cfg.agySettings.trim()] : []),
+    ...(orchestrator
+      ? [`- orchestrator: planner=${orchestrator.planner ?? '(auto)'}, executor=${orchestrator.executor ?? '(auto)'}`]
+      : []),
     '- workspace: ' + (cfg.workspaceRoot !== '' ? cfg.workspaceRoot : '(session cwd / process cwd)'),
     '- default model: ' + (cfg.defaultModel === '' ? '(agy default)' : cfg.defaultModel),
     '- default effort: ' + (cfg.defaultEffort === '' ? '(model default)' : cfg.defaultEffort),
@@ -45,6 +61,7 @@ export async function renderStatus(deps: CommandDeps): Promise<string> {
     `- network & slim: apiRetries=${cfg.modelApiMaxRetries}, proxy=${cfg.proxyUrl ? 'configured' : 'none'}, slimGuardrails=${cfg.slimPromptRules ? 'on' : 'off'}`,
     '- catalog: ' + cat.models.length + ' models — ' + cat.source + (cat.lastError === undefined ? '' : ' — last error: ' + cat.lastError),
     '- conversation bindings: ' + bindings,
+    '- cache: ' + (cacheMetrics.snapshot().today.turns === 0 ? 'no ACP turns yet' : formatCacheBucket(cacheMetrics.snapshot().today)),
     '- last run process: ' + (last ? (last.processOk ? 'ok' : last.processCode) + ' — ' + last.model + ' in ' + Math.round(last.durationMs / 100) / 10 + 's' : 'none yet'),
     ...(last?.tokenSpeed !== undefined && (last.tokenSpeed.measuredSteps > 0 || last.tokenSpeed.outputTokens > 0)
       ? [
@@ -62,7 +79,7 @@ export async function renderStatus(deps: CommandDeps): Promise<string> {
           ...(errorKinds.includes('system_protection')
             ? ['- Guidance: `system_protection` — AGY hardcoded system protection remains enforced; do not attempt a bypass.']
             : []),
-          ...(hasHeadlessPermissionDenial && (cfg.permissionMode === 'plan' || cfg.permissionMode === 'accept-edits')
+          ...(hasHeadlessPermissionDenial && cfg.permissionMode !== 'skip'
             ? ['- Note: in headless operation, agy can automatically deny a tool under this mode; the raw denial above is not evidence of a human approval or denial.']
             : []),
         ]

@@ -116,6 +116,11 @@ export class LlmError extends Error {
   }
 }
 
+export function boundContextSummary(summary: string, maxChars = 160): string {
+  const s = summary.replace(/\s+/g, ' ').trim()
+  return s.length <= maxChars ? s : s.slice(0, Math.max(0, maxChars - 1)) + '…'
+}
+
 export function createUserMessage(init: {
   content: string | MessagePart[]
   source?: { kind?: string; [key: string]: unknown }

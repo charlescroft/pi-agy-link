@@ -3,11 +3,10 @@
 // budget; the switches are pure presentation — the single source of truth is
 // the /status snapshot (see .spec/ui-visibility.md).
 import { h } from '../react.ts';
-import { S } from '../styles.ts';
 import type { Translator } from '../hooks/useTranslation.ts';
 import type { StatusPayload } from '../status.ts';
 import { Button } from '../ui/Button.ts';
-import { Row } from '../ui/Row.ts';
+import { Row, rowCaption } from '../ui/Row.ts';
 import { segGroup } from '../ui/SegGroup.ts';
 
 interface VisibilityRowOptions {
@@ -22,10 +21,8 @@ interface VisibilityRowOptions {
 
 function visibilityRow(o: VisibilityRowOptions): unknown {
 	return h(Row, {
-		left: h('div', { style: { display: 'flex', flexDirection: 'column' } },
-			h('span', { style: { color: 'var(--agy-text-primary)', fontWeight: 600, fontSize: '12.5px' } }, o.t(o.label)),
-			h('span', { style: S.muted }, o.t(o.desc)),
-		),
+		key: 'vis-' + o.key,
+		left: rowCaption(o.t(o.label), o.t(o.desc)),
 		right: segGroup([
 			h(Button, {
 				variant: o.visible ? 'segActive' : 'seg',
@@ -41,8 +38,34 @@ function visibilityRow(o: VisibilityRowOptions): unknown {
 	});
 }
 
-/** Returns two rows; React flattens the array inside the parent's children. */
-export function renderVisibilityRows(args: {
+/** Card under the reply, or the translation shown in the reply's place (display only). */
+function translateDisplayRow(o: {
+	t: Translator;
+	mode: 'card' | 'replace';
+	loadingAction: string | null;
+	setCfg: (key: string, value: unknown) => Promise<void>;
+}): unknown {
+	const busy = o.loadingAction === 'config:translateDisplay';
+	return h(Row, {
+		key: 'vis-translateDisplay',
+		left: rowCaption(o.t('config.translateDisplay'), o.t('config.translateDisplayDesc')),
+		right: segGroup([
+			h(Button, {
+				variant: o.mode === 'card' ? 'segActive' : 'seg',
+				disabled: busy,
+				onClick: () => void o.setCfg('translateDisplay', 'card'),
+			}, o.t('config.translateDisplayCard')),
+			h(Button, {
+				variant: o.mode === 'replace' ? 'segActive' : 'seg',
+				disabled: busy,
+				onClick: () => void o.setCfg('translateDisplay', 'replace'),
+			}, o.t('config.translateDisplayReplace')),
+		]),
+	});
+}
+
+/** Translation action button + card/replace display mode rows. */
+export function renderTranslateVisibilityRows(args: {
 	t: Translator;
 	status: StatusPayload;
 	loadingAction: string | null;
@@ -52,17 +75,42 @@ export function renderVisibilityRows(args: {
 	return [
 		visibilityRow({
 			...common,
-			label: 'config.showHeaderBadge',
-			desc: 'config.showHeaderBadgeDesc',
-			key: 'showHeaderBadge',
-			visible: args.status.showHeaderBadge !== false,
-		}),
-		visibilityRow({
-			...common,
 			label: 'config.showTranslateAction',
 			desc: 'config.showTranslateActionDesc',
 			key: 'showTranslateAction',
 			visible: args.status.showTranslateAction !== false,
 		}),
+		translateDisplayRow({ ...common, mode: args.status.translateDisplay === 'replace' ? 'replace' : 'card' }),
+	];
+}
+
+/** Conversation header badge visibility row. */
+export function renderHeaderBadgeRow(args: {
+	t: Translator;
+	status: StatusPayload;
+	loadingAction: string | null;
+	setCfg: (key: string, value: unknown) => Promise<void>;
+}): unknown {
+	return visibilityRow({
+		t: args.t,
+		loadingAction: args.loadingAction,
+		setCfg: args.setCfg,
+		label: 'config.showHeaderBadge',
+		desc: 'config.showHeaderBadgeDesc',
+		key: 'showHeaderBadge',
+		visible: args.status.showHeaderBadge !== false,
+	});
+}
+
+/** Returns the display rows; React flattens the array inside the parent's children. */
+export function renderVisibilityRows(args: {
+	t: Translator;
+	status: StatusPayload;
+	loadingAction: string | null;
+	setCfg: (key: string, value: unknown) => Promise<void>;
+}): unknown[] {
+	return [
+		renderHeaderBadgeRow(args),
+		...renderTranslateVisibilityRows(args),
 	];
 }

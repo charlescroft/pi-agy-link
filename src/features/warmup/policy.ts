@@ -3,6 +3,7 @@
 // Zero direct HTTP endpoints or spoofed headers — probes run exclusively via
 // the official `agy` CLI binary.
 import type { FamilyQuotaInfo, ManagedAccount, ModelFamily } from '../../common/pool-types.ts'
+import type { WarmupWindowMode } from '../../common/types.ts'
 import { isFamilyCooling } from '../../common/quota-bench.ts'
 import { PREFERRED_CLAUDE, PREFERRED_GEMINI_FLASH, PREFERRED_OPENAI } from '../../common/model-lineup.ts'
 
@@ -78,9 +79,42 @@ export const THIRTY_DAYS_MS = 30 * 24 * 3600 * 1000
  */
 export const FAILURE_BACKOFF_MS = 30 * 60 * 1000
 
+/**
+ * A model the CLI reports as retired / unknown / unavailable is not a transient
+ * failure: the family is parked for a day instead of being re-probed every
+ * 30 minutes (which is 48 probes/day on a model that cannot answer at all).
+ */
+export const MODEL_UNAVAILABLE_PARK_MS = 24 * 3600 * 1000
+
+/**
+ * A "successful" probe does not prove the window started: a probe that never
+ * reached the model (e.g. agy stalled on dead MCP servers) leaves the window
+ * idle. When the quota keeps sliding after a recorded warmup, the long success
+ * cooldown must not hide it for days; retry, but at most this often.
+ */
+export const SLIDING_IDLE_RETRY_MS = 2 * 3600 * 1000
+
+export function isModelUnavailableError(text: string): boolean {
+  return /no longer available|is not available|is retired|unknown model|model not found|not recognized|unsupported model/i.test(text)
+}
+
 /** 1.5–3s randomized gap: a metronomic interval is itself a risk-control signal. */
 export function warmupDelayMs(): number {
   return 1500 + Math.floor(Math.random() * 1500)
+}
+
+/**
+ * Gap between two ACCOUNTS in one run.
+ *
+ * Probing account after account a couple of seconds apart is the single most
+ * farm-like shape a warmup can produce: N Google accounts touched from one
+ * egress IP inside a minute. Real usage never looks like that, so the gap is
+ * minutes, not seconds (30–120s, randomized).
+ */
+export function warmupAccountGapMs(random: () => number = Math.random): number {
+  const min = 30_000
+  const spread = 90_000
+  return min + Math.floor(random() * spread)
 }
 
 /** One family/model the service should probe this run. */
@@ -89,6 +123,9 @@ export interface WarmupTarget {
   model: string
   historyKey: string
   failureKey: string
+  window?: 'weekly' | '5h'
+  extraHistoryKeys?: string[]
+  slidingIdle?: boolean
 }
 
 export type WarmupPlan =
@@ -120,16 +157,25 @@ function warmupDue(params: {
   ignoreFailureBackoff?: boolean
   now: number
   historyKey: string
+  slidingIdle?: boolean
   isCoolingDown(key: string, cooldownMs: number): boolean
 }): { shouldWarm: boolean; failureKey: string } {
-  const { quota, force, ignoreFailureBackoff, now, historyKey, isCoolingDown } = params
+  const { quota, force, ignoreFailureBackoff, now, historyKey, slidingIdle, isCoolingDown } = params
   let shouldWarm = false
-  const hasRecentWarmup = isCoolingDown(historyKey, SIX_DAYS_MS)
+  // `ignoreFailureBackoff` is only sent by the manual warmup button. A user who
+  // clicks "warm up" on a window that is still idle (100%) must get a probe:
+  // the success cooldown only records that a probe ran, not that the window
+  // started, so it must not swallow the click. Active windows never reach here.
+  const hasRecentWarmup = !ignoreFailureBackoff && isCoolingDown(historyKey, SIX_DAYS_MS)
 
   if (force) {
     shouldWarm = true
+  } else if (hasRecentWarmup && slidingIdle) {
+    shouldWarm = !isCoolingDown(historyKey, SLIDING_IDLE_RETRY_MS)
   } else if (!hasRecentWarmup) {
-    if (!quota.weeklyResetTime) {
+    if (slidingIdle) {
+      shouldWarm = true
+    } else if (!quota.weeklyResetTime) {
       shouldWarm = true
     } else {
       const resetTs = Date.parse(quota.weeklyResetTime)
@@ -151,20 +197,66 @@ function warmupDue(params: {
   return { shouldWarm, failureKey }
 }
 
+function warmup5hDue(params: {
+  quota: FamilyQuotaInfo
+  force: boolean
+  ignoreFailureBackoff?: boolean
+  now: number
+  historyKey: string
+  slidingIdle?: boolean
+  isCoolingDown(key: string, cooldownMs: number): boolean
+}): { shouldWarm: boolean; failureKey: string } {
+  const { quota, force, ignoreFailureBackoff, now, historyKey, slidingIdle, isCoolingDown } = params
+  let shouldWarm = false
+  // Manual click: see warmupDue.
+  const hasRecentWarmup = !ignoreFailureBackoff && isCoolingDown(historyKey, FOUR_HOURS_MS)
+
+  if (force) {
+    shouldWarm = true
+  } else if (hasRecentWarmup && slidingIdle) {
+    shouldWarm = !isCoolingDown(historyKey, SLIDING_IDLE_RETRY_MS)
+  } else if (!hasRecentWarmup) {
+    if (slidingIdle) {
+      shouldWarm = true
+    } else if (!quota.resetTime) {
+      shouldWarm = true
+    } else {
+      const resetTs = Date.parse(quota.resetTime)
+      if (isNaN(resetTs)) {
+        shouldWarm = true
+      } else {
+        const remainingMs = resetTs - now
+        if (now >= resetTs - 60_000 || remainingMs >= FOUR_HOURS_MS) {
+          shouldWarm = true
+        }
+      }
+    }
+  }
+
+  const failureKey = `${historyKey}:failed`
+  if (shouldWarm && !force && !ignoreFailureBackoff && isCoolingDown(failureKey, FAILURE_BACKOFF_MS)) {
+    shouldWarm = false
+  }
+  return { shouldWarm, failureKey }
+}
+
 /**
  * Pure target planner for one account: honors the configured/monitored model
- * list, skips families already cooling or not yet due, and falls back to a
- * forced Google probe when a manual/forced run finds no weekly target.
+ * list, supports weekly + 5h rolling windows and sliding-idle reset detection,
+ * skips families already cooling or not yet due, and falls back to a forced
+ * Google probe when a manual/forced run finds no target.
  */
 export function planWarmupTargets(params: {
   account: ManagedAccount
   force: boolean
   ignoreFailureBackoff?: boolean
   configuredModels: readonly string[] | undefined
+  windows?: WarmupWindowMode
+  slidingIdleKeys?: ReadonlySet<string>
   now: number
   isCoolingDown(key: string, cooldownMs: number): boolean
 }): WarmupPlan {
-  const { account, force, ignoreFailureBackoff, configuredModels, now, isCoolingDown } = params
+  const { account, force, ignoreFailureBackoff, configuredModels, windows = 'weekly', slidingIdleKeys, now, isCoolingDown } = params
   const identity = account.email || account.id
 
   if (configuredModels !== undefined && configuredModels.length === 0) {
@@ -174,20 +266,50 @@ export function planWarmupTargets(params: {
   const quotas = account.quotas ?? {}
   const families = Object.keys(quotas) as ModelFamily[]
   const targets: WarmupTarget[] = []
+  const byFamilyModel = new Map<string, WarmupTarget>()
+  const checkWeekly = windows === 'weekly' || windows === 'both'
+  const check5h = windows === '5h' || windows === 'both'
 
   for (const fam of families) {
     const q: FamilyQuotaInfo | undefined = quotas[fam]
     if (!q) continue
     if (!force && isFamilyCooling(account, fam, now)) continue
+    // Parked: the model itself is gone upstream (see MODEL_UNAVAILABLE_PARK_MS).
+    if (!force && isCoolingDown(`${identity}:${fam}:parked`, MODEL_UNAVAILABLE_PARK_MS)) continue
+    const model = pickWarmupModelForFamily(fam, monitored, account)
 
-    const weeklyFrac = q.weeklyFraction
-    if (weeklyFrac === undefined || weeklyFrac < 0.999) continue
+    if (checkWeekly) {
+      const weeklyFrac = q.weeklyFraction
+      if (weeklyFrac !== undefined && weeklyFrac >= 0.999) {
+        const historyKey = `${identity}:${fam}:weekly`
+        const slidingIdle = slidingIdleKeys?.has(historyKey) === true
+        const { shouldWarm, failureKey } = warmupDue({ quota: q, force, ignoreFailureBackoff, now, historyKey, slidingIdle, isCoolingDown })
+        if (shouldWarm) {
+          const target: WarmupTarget = { family: fam, model, historyKey, failureKey, window: 'weekly', ...(slidingIdle ? { slidingIdle: true } : {}) }
+          targets.push(target)
+          byFamilyModel.set(`${fam}:${model}`, target)
+        }
+      }
+    }
 
-    const historyKey = `${identity}:${fam}:weekly`
-    const { shouldWarm, failureKey } = warmupDue({ quota: q, force, ignoreFailureBackoff, now, historyKey, isCoolingDown })
-    if (shouldWarm) {
-      const model = pickWarmupModelForFamily(fam, monitored, account)
-      targets.push({ family: fam, model, historyKey, failureKey })
+    if (check5h) {
+      const fiveHFrac = q.remainingFraction
+      if (fiveHFrac !== undefined && fiveHFrac >= 0.999) {
+        const historyKey = `${identity}:${fam}:5h`
+        const slidingIdle = slidingIdleKeys?.has(historyKey) === true
+        const { shouldWarm, failureKey } = warmup5hDue({ quota: q, force, ignoreFailureBackoff, now, historyKey, slidingIdle, isCoolingDown })
+        if (shouldWarm) {
+          const existing = byFamilyModel.get(`${fam}:${model}`)
+          if (existing) {
+            existing.extraHistoryKeys = [...(existing.extraHistoryKeys ?? []), historyKey]
+            if (slidingIdle) existing.slidingIdle = true
+          } else {
+            const target: WarmupTarget = { family: fam, model, historyKey, failureKey, window: '5h', ...(slidingIdle ? { slidingIdle: true } : {}) }
+            targets.push(target)
+            byFamilyModel.set(`${fam}:${model}`, target)
+          }
+        }
+      }
     }
   }
 
@@ -198,6 +320,7 @@ export function planWarmupTargets(params: {
       model: fallbackModel,
       historyKey: `${identity}:google:forced:${Math.floor(now / SIX_DAYS_MS)}`,
       failureKey: `${identity}:google:forced:${Math.floor(now / SIX_DAYS_MS)}:failed`,
+      window: 'weekly',
     })
   }
 

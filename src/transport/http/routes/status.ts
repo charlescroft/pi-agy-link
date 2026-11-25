@@ -4,6 +4,8 @@ import { sanitizeCatalogEntries } from '../../../host/models.ts'
 import { resolveEffectiveCompactLimit } from '../../../common/compact-threshold.ts'
 import { mergeCatalogWithQuotaModels, quotaCatalogForAccount } from '../../../domain/models/quota-catalog.ts'
 import type { ManagedAccount } from '../../../common/pool-types.ts'
+import { cacheMetrics } from '../../../host/cache-metrics.ts'
+import { snapshotSubagents } from '../../../features/subagent/live.ts'
 
 /**
  * The selectable universe the Settings ticks describe.
@@ -23,7 +25,7 @@ function selectableModels(
 }
 
 function handleStatus(services: HostServices, req: unknown, res: unknown): void {
-  const { getConfig, bin, store, pool, quota, warmup, catalog, auth, poolAuth, adapter, acpPool, translation, lastRun } = services
+  const { getConfig, bin, store, pool, quota, warmup, catalog, auth, poolAuth, adapter, acpPool, backgroundWakeup, translation, lastRun } = services
   const { version: versionCache, dormantReason } = services.status
       runRoute(res, async () => {
         const cfg = getConfig()
@@ -78,11 +80,20 @@ function handleStatus(services: HostServices, req: unknown, res: unknown): void 
           agySettings: cfg.agySettings,
           transport: cfg.transport,
           acpStatus: typeof acpPool?.status === 'function' ? acpPool.status() : null,
+          backgroundWakeup: cfg.backgroundWakeup,
+          mcpBridge: cfg.mcpBridge,
+          backgroundWakeupTtlMinutes: cfg.backgroundWakeupTtlMinutes,
+          backgroundWakeupMaxPerSession: cfg.backgroundWakeupMaxPerSession,
+          backgroundWakeState: typeof backgroundWakeup?.status === 'function' ? backgroundWakeup.status() : null,
           imageTool: cfg.imageTool,
           syncAccountCustomizations: cfg.syncAccountCustomizations,
           workspaceRoot: cfg.workspaceRoot,
           defaultModel: cfg.defaultModel,
           defaultEffort: cfg.defaultEffort,
+          orchestratorPlannerModel: cfg.orchestratorPlannerModel,
+          orchestratorPlannerEffort: cfg.orchestratorPlannerEffort,
+          orchestratorExecutorModel: cfg.orchestratorExecutorModel,
+          orchestratorExecutorEffort: cfg.orchestratorExecutorEffort,
           askTool: cfg.askTool,
           autoCompactOverride: cfg.autoCompactOverride,
           contextBudget: resolveEffectiveCompactLimit(cfg),
@@ -97,6 +108,8 @@ function handleStatus(services: HostServices, req: unknown, res: unknown): void 
           // ~55s serial cascade showed no progress at all.
           quotaRefreshing: typeof quota?.refreshingAccounts === 'function' ? quota.refreshingAccounts() : [],
           warmupState: typeof warmup?.status === 'function' ? warmup.status() : null,
+          // Live agy-internal subagents per session (header badge). Empty when idle.
+          subagents: snapshotSubagents(),
           catalog: { source: activeCat.source, count: catalogCount, lastError: activeCat.lastError ?? cat.lastError ?? null },
           // Dynamically reflects models supported by the currently active account (e.g. hides Argon when active lacks Argon)
           catalogModels: sanitizedCatalogModels,
@@ -105,7 +118,10 @@ function handleStatus(services: HostServices, req: unknown, res: unknown): void 
           selectedModels: cfg.selectedModels,
           autoWarmup: cfg.autoWarmup,
           warmupModels: cfg.warmupModels,
+          warmupWindows: cfg.warmupWindows,
+          warmupMaxProbesPerRun: cfg.warmupMaxProbesPerRun,
           autoTranslate: cfg.autoTranslate,
+          translateDisplay: cfg.translateDisplay,
           translateModel: cfg.translateModel,
           translateEffort: cfg.translateEffort,
           translateTargetLanguage: cfg.translateTargetLanguage,
@@ -115,9 +131,12 @@ function handleStatus(services: HostServices, req: unknown, res: unknown): void 
           imageModel: cfg.imageModel,
           imageEffort: cfg.imageEffort,
           imageOutputDir: cfg.imageOutputDir,
+          btwModel: cfg.btwModel,
+          btwEffort: cfg.btwEffort,
           translateState: { pending: translation.pendingFor(), stats: translation.stats() },
           bindings: Object.keys(store.all()).length,
           effortUnsupported: adapter.effortUnsupportedModels(),
+          cacheStats: cacheMetrics.snapshot(),
               lastRun,
         })
       })

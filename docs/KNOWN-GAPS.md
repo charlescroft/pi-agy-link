@@ -40,6 +40,43 @@ Deliberate v1 boundaries and upstream-behavior notes.
     headless) running agy at the same moment can still interleave slot writes;
     avoid driving two hosts at once.
 
+## ACP transport (default)
+
+`agy acp` is a long-lived JSON-RPC process per account and session, and it is
+the default transport: `transport` resolves to `acp` unless you opt back into
+the one-shot CLI with `/agy config transport cli`, `/agy transport cli`,
+`DSH_AGY_TRANSPORT=cli` or Settings → Runtime controls. A pre-stream ACP
+failure (or an ACP turn that produces nothing) still falls back to `cli` for
+that turn. ACP is what makes background work survive a turn: a `run_command`,
+an `invoke_subagent` or a
+`schedule` timer keeps running inside the process after `session/prompt` returns
+and pushes its result later as `tool_call_update` / `agent_message_chunk`.
+
+- **Only `pending` / `in_progress` at turn end counts as background work.** ACP
+  never reports `RUNNING`; the CLI's flag does not exist here. A tool call whose
+  final update already arrived (`completed` / `failed` / `cancelled`) is NOT
+  reported, so a finished job cannot produce a spurious wakeup.
+- **Autonomous reports are presented, not re-run (scheme A).** agy's own
+  post-turn text is merged over a short silence window (700 ms after the last
+  chunk, 350 ms after `usage_update`) and written into the transcript as a
+  plugin record, which the chat renders as a card. No extra turn, no extra
+  quota. Two exceptions still wake the session with a real turn: an armed Goal
+  (it must advance) and a silent completion with no text at all.
+- **A session that cannot be restored is rebuilt, never silently emptied.**
+  `session/load` succeeds even for an id that does not exist, so a restore only
+  counts when the server actually replayed events or reported cached reads.
+  Otherwise the binding is dropped, the full history digest is delivered to a
+  fresh session, and the transcript shows a reset notice.
+- **A turn with no output is a failure, not an empty success.** The per-process
+  `--log-file` slice is classified (network / auth) before falling back to
+  `cli -p`, so a dead proxy can no longer look like a completed turn.
+- **One credential slot, three guards.** The slot document's `id_token_email`
+  is checked before a fast path and after every install; the identity agy
+  prints in its own log (`applyAuthResult: email=...`) is verified after the
+  process starts, with one reinstall-and-retry; and the primary credential is
+  re-asserted once a drained secondary process exits. A process that still
+  reports the wrong account is refused instead of billing it.
+
 ## Credential injection: what agy actually supports (verified 2026-10-17)
 
 The clean fix for the Windows boundary above would be per-process credential
@@ -182,6 +219,27 @@ reference-counted slot is the strongest isolation the plugin can provide.
   (upstream issue #36).
 - First unauthenticated call takes ~60-70s to fail (agy waits for a pasted
   code); later failures are faster.
+- **A third-party MCP server registered directly in agy used to kill every
+  turn with `INVALID_ARGUMENT` — wrapped now, with one gap left.**
+  `<agy home>/.gemini/config/mcp_config.json` is agy's own registry; servers
+  listed there are loaded by agy itself, and the tool schemas they return are
+  forwarded to Gemini verbatim. Google's validator rejects the WHOLE request
+  when one declaration has an array without `items`
+  (`GenerateContentRequest.tools[0].function_declarations[N].parameters
+  .properties[args].items: missing field`). Measured 2026-11-23: godot-mcp
+  3.1.0 declares 12 such arrays (`args`, `vertices`, `normals`, `uvs`,
+  `indices`, `points`, `methods`, `cells`, `tracks`). The **schema doctor**
+  (`dist/mcp-sanitize.mjs` + `writeMcpConfig()` wrapping) now proxies every
+  foreign stdio entry and repairs `tools/list`, and drops agy's stale per-tool
+  descriptors so the next spawn refetches; verified 0 item-less arrays across
+  all 217 declared tools. Remaining gap: entries the plugin cannot wrap —
+  `url`-based (http/sse) servers, a spec larger than
+  `MAX_WRAPPED_SPEC_CHARS`, and a plugin that is removed while wrapped entries
+  are still in a foreign host's registry (they are unwrapped once the last
+  `dsh-tools-*` entry leaves, and every wrapper carries its original spec, so
+  recovery never needs the plugin). For those, dropping the duplicate entries
+  from agy's registry remains the manual mitigation (DSH's MCP bundles expose
+  the same tools through the hardened bridge).
 
 ## Fallbacks
 

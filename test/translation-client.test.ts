@@ -155,7 +155,7 @@ interface Definition {
   kind: string
   match: (event: unknown) => unknown
   start: (context: unknown, match: unknown) => Record<string, unknown>
-  update: (context: { state?: unknown }) => unknown
+  update: (context: { state?: unknown }, match: unknown) => unknown
   buildViewNode: (context: {
     key: string
     id: string
@@ -209,6 +209,75 @@ test('client registers the translation conversation definition', () => {
   assert.equal(matched?.id, '7')
   assert.equal(matched?.role, 'start')
   assert.equal(definition.match({ type: 'assistant/message', seq: 7 }), null)
+})
+
+test('a re-translation of the same reply replaces its card instead of stacking a second one', () => {
+  const { definitions } = mount()
+  const definition = definitions.find((d) => d.kind === 'agy-translation')!
+  const rec = (seq: number, text: string) => ({ type: 'plugin:agy-link/translation', seq, data: { messageId: 'm1', anchorSeq: 42, text } })
+  const first = definition.match(rec(60, '口语版')) as { id: string }
+  const again = definition.match(rec(70, '结构版')) as { id: string }
+  assert.equal(first.id, again.id, 'both records of one reply map to one node')
+  assert.notEqual((definition.match({ ...rec(80, 'x'), data: { messageId: 'm2', text: 'x' } }) as { id: string }).id, first.id)
+  const state = definition.start({}, { event: rec(60, '口语版') })
+  const updated = definition.update({ state }, { event: rec(70, '结构版') }) as Record<string, unknown>
+  assert.equal(updated.text, '结构版')
+  assert.equal(updated.anchorSeq, 42)
+  assert.equal(definition.update({ state: updated }, { event: rec(90, '  ') }), updated, 'an empty record keeps the last good text')
+})
+
+test('definitions register once uiConversation is provided after the client applied', () => {
+  // The client boot entry only waits for slots/locale, so the host can apply this
+  // plugin before dsh-client-ui-conversation provides its service. Registration
+  // must follow the service instead of looking it up once.
+  const registered: string[] = []
+  const unregistered: string[] = []
+  // Shaped like the host's ConversationEventRegistry: `register` reads `this`,
+  // so a detached call (`const r = events.register; r(def)`) fails here too.
+  class Registry {
+    add(definition: Definition) {
+      registered.push(definition.kind)
+      return () => void unregistered.push(definition.kind)
+    }
+    register(definition: Definition) {
+      return this.add(definition)
+    }
+  }
+  const conversation = { events: new Registry() }
+  let provided = false
+  const pending: Array<(scope: unknown) => unknown> = []
+  const scopeEffects: Array<() => void> = []
+  const scope = {
+    get: (name: string) => (name === 'uiConversation' && provided ? conversation : undefined),
+    effect(setup: () => () => void) {
+      scopeEffects.push(setup())
+    },
+  }
+  const ctx = {
+    locale: { register: () => () => undefined, bind: () => (key: string) => key, addLanguage: () => () => undefined, subscribe: () => () => undefined },
+    get: scope.get,
+    inject(deps: string[], apply: (scope: unknown) => unknown) {
+      // The bundle runs in a vm context: copy its array into this realm before a strict compare.
+      assert.deepEqual([...deps], ['uiConversation'])
+      pending.push(apply)
+      return { dispose: () => undefined }
+    },
+    effect(callback: () => (() => void) | void) {
+      callback()
+    },
+    slots: { inject: (_name: string, callback: () => () => void) => void callback(), register: () => () => undefined },
+  }
+  loadPlugin().plugin.apply(ctx)
+  assert.deepEqual(registered, [], 'nothing can register before the service exists')
+  assert.equal(pending.length, 2, 'translation and ACP definitions both wait for uiConversation')
+
+  provided = true
+  for (const apply of pending) apply(scope)
+  assert.deepEqual(registered.sort(), ['agy-acp-notice', 'agy-acp-report', 'agy-translation'])
+
+  // The service going away disposes the scope effects, which must unregister.
+  for (const dispose of scopeEffects) dispose()
+  assert.deepEqual(unregistered.sort(), ['agy-acp-notice', 'agy-acp-report', 'agy-translation'])
 })
 
 test('definition projects the record into a node anchored at the reply', () => {
@@ -400,7 +469,9 @@ test('the style sheet refreshes itself when a reload left a stale tag behind', (
   // rules of an already-installed (older) sheet were never replaced and newly
   // added rules — like the hover hint — silently never applied.
   assert.match(source, /const existing = doc\.getElementById\(STYLE_ID\)/)
-  assert.match(source, /if \(existing\.textContent !== CSS\) existing\.textContent = CSS/)
+  // The ACP card sheet now sits in the same bundle, so tsdown suffixes the two
+  // module-level stylesheet constants (CSS / CSS$1) — match the guard loosely.
+  assert.match(source, /if \(existing\.textContent !== CSS\$?\d*\) existing\.textContent = CSS\$?\d*/)
   assert.match(source, /STYLE_ID = ["']dsh-agy-link-tsl-css-v2["']/)
 })
 
@@ -411,7 +482,9 @@ test('action state survives a remount and re-derives from the session record', (
   assert.match(source, /ACTION_STATE = /)
   assert.match(source, /ACTION_INFLIGHT = /)
   assert.match(source, /agy-link\/translate\/state/)
-  assert.match(source, /state === ["']ready["'] \? ["']done["']/)
+  assert.match(source, /state === ["']ready["']\)\s*\{?\s*setActionState\(key, ["']done["']\)/)
+  // A busy answer keeps probing until the record lands (behaviour: client-dom.test.ts).
+  assert.match(source, /setTimeout\(probe, BUSY_POLL_MS\)/)
 })
 
 test('a panel remount mid-flight still settles to done (no forever spinner)', async () => {

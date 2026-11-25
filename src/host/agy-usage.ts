@@ -154,7 +154,13 @@ export function usageGroupsToFamilies(
     const name = group.name.toLowerCase()
     const desc = (group.description ?? '').toLowerCase()
     const hasArgonBucket = group.buckets.some((b) => b.id.toLowerCase().includes('argon'))
-    const isArgon = name.includes('argon') || desc.includes('argon') || hasArgonBucket
+    // A dedicated Argon POOL is proven only by the group NAME or a bucket id —
+    // a shared "Gemini Models" group's description merely ENUMERATES its members
+    // ("… Gemini 4 Argon …"), which is evidence of family membership, not of a
+    // separate pool. Using it here misfiled the whole Gemini pool as argon on the
+    // CLI path, freezing `google` at an old snapshot and cooling the wrong family
+    // (issue #169 — the CLI twin of #130/#131).
+    const isArgon = name.includes('argon') || hasArgonBucket
     const isGoogle = !isArgon && (name.includes('gemini') || desc.includes('gemini'))
     const is3P = name.includes('claude') || name.includes('gpt') || desc.includes('claude') || desc.includes('gpt')
 
@@ -177,8 +183,15 @@ export function usageGroupsToFamilies(
         weeklyFrac = bucket.remainingFraction
         weeklyReset = bucket.resetTime
       } else if (w.includes('5h') || w.includes('five')) {
-        fiveHourFrac = bucket.remainingFraction
-        fiveHourReset = bucket.resetTime
+        // Free accounts emit a protobuf zero-timestamp sentinel (`1970-01-01T00:00:00Z`)
+        // on `3p-5h` to signal "no 5-hour bucket". Ignore that sentinel so weekly-only
+        // cards reflect the real quota structure instead of a fake 100% 5h bar.
+        const resetMs = bucket.resetTime ? Date.parse(bucket.resetTime) : Number.NaN
+        const isEpochZero = Number.isFinite(resetMs) && resetMs <= 86_400_000
+        if (!isEpochZero) {
+          fiveHourFrac = bucket.remainingFraction
+          fiveHourReset = bucket.resetTime
+        }
       }
     }
 

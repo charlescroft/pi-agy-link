@@ -9,6 +9,9 @@
 // unchanged.
 import {
   accountHasArgon,
+  argonSharesGoogleGroup,
+  baseModelSlug,
+  effectiveFamilyCooldown,
   type FamilyQuotaInfo,
   type ManagedAccount,
   type ModelFamily,
@@ -24,7 +27,7 @@ import { computeQuotaPacing, FIVE_HOUR_WINDOW_MS, WEEKLY_WINDOW_MS } from '../..
 export { isQuotaBenched, LOW_QUOTA_5H, LOW_QUOTA_WEEKLY }
 
 /** Why a pool account cannot serve a family right now (diagnostics only). */
-export type AccountIneligibilityReason = 'disabled' | 'auth' | 'cooldown' | 'quota' | 'unsupported' | 'model-unsupported'
+export type AccountIneligibilityReason = 'disabled' | 'auth' | 'cooldown' | 'quota' | 'unsupported' | 'model-unsupported' | 'model-cooldown'
 
 /**
  * The slice of the pool the Argon check needs: whether an account has itself
@@ -34,6 +37,7 @@ export type AccountIneligibilityReason = 'disabled' | 'auth' | 'cooldown' | 'quo
 export interface DedicatedGroupSource {
   hasDedicatedGroup?: (id: string, family: ModelFamily) => boolean
   isModelSupported?: (acc: ManagedAccount, model: string) => boolean
+  catalogForAccount?: (id: string) => { source?: string; models?: readonly { id: string }[] } | undefined
 }
 
 /**
@@ -52,16 +56,70 @@ export function explainIneligibility(
 ): AccountIneligibilityReason | null {
   if (!acc.enabled) return 'disabled'
   if (isAccountCriticalAuth(acc)) return 'auth'
-  if (family === 'argon' && !accountHasArgon(acc, pool)) return 'unsupported'
+  if (family === 'argon' && !accountHasArgon(acc, pool, pool?.catalogForAccount?.(acc.id))) return 'unsupported'
   // "This model is not in the account's catalog" is NOT the same diagnosis as
   // "the account has no access to this family / plan" (issues #120, #122).
   if (model && pool?.isModelSupported && !pool.isModelSupported(acc, model)) {
     return 'model-unsupported'
   }
-  const cd = acc.cooldowns?.[family]
+  const cd = effectiveFamilyCooldown(acc, family)
   if (cd && cd.cooldownUntil > now) return 'cooldown'
+  // A model-scoped cooldown (e.g. the image model's own 429) removes the
+  // account only for THAT model — other models in the family stay usable.
+  if (model) {
+    const mcd = acc.modelCooldowns?.[baseModelSlug(model)]
+    if (mcd && mcd.cooldownUntil > now) return 'model-cooldown'
+  }
   if (isQuotaBenched(acc, family, now, model)) return 'quota'
   return null
+}
+
+/**
+ * Pick an eligible account WITHOUT mutating any active pointer.
+ *
+ * Used by cross-model requests (image generation): rotating a model-scoped
+ * bucket must never steal the family's sticky account from a chat turn.
+ */
+export function pickEligibleAccount(
+  accounts: readonly ManagedAccount[],
+  pool: DedicatedGroupSource | null | undefined,
+  input: {
+    family: ModelFamily
+    model?: string
+    quotaModel?: string
+    avoid?: readonly string[]
+    activeId?: string
+    now: number
+  },
+): ManagedAccount | null {
+  const skip = new Set(input.avoid ?? [])
+  const candidates = accounts.filter(
+    (acc) =>
+      !skip.has(acc.id) &&
+      explainIneligibility(acc, input.family, input.now, pool, input.model) === null &&
+      (input.quotaModel === undefined || input.quotaModel === '' ||
+        isModelQuotaClear(acc, input.family, input.quotaModel, input.now)),
+  )
+  if (candidates.length === 0) return null
+  return (
+    candidates.find((acc) => acc.id === input.activeId) ??
+    orderByExpiry(accounts, candidates, input.family, input.activeId, input.now)[0] ??
+    null
+  )
+}
+
+/**
+ * True when a specific MODEL's quota bucket still has room on this account.
+ *
+ * Used for cross-model eligibility: an image request must pick an account whose
+ * IMAGE bucket is healthy even though the driving chat model lives in the same
+ * `google` family. Family-level checks alone cannot see that.
+ */
+export function isModelQuotaClear(acc: ManagedAccount, family: ModelFamily, model: string, now: number): boolean {
+  if (model.trim() === '') return true
+  const mcd = acc.modelCooldowns?.[baseModelSlug(model)]
+  if (mcd && mcd.cooldownUntil > now) return false
+  return !isQuotaBenched(acc, family, now, model)
 }
 
 /**
@@ -78,7 +136,12 @@ export function isAccountEligible(
 }
 
 function effectiveFamilyQuota(acc: ManagedAccount, family: ModelFamily): FamilyQuotaInfo | undefined {
-  return acc.quotas?.[family] ?? (family === 'argon' ? acc.quotas?.google : undefined)
+  // Argon reads its own quota row when present, and only uses `google` when
+  // `google.description` explicitly names Argon (agy 1.5.15 shared Gemini pool).
+  if (family === 'argon' && argonSharesGoogleGroup(acc)) {
+    return acc.quotas?.google
+  }
+  return acc.quotas?.[family]
 }
 
 /** Reset timestamps within 5m belong to the same reset cohort (avoids 1-60s clock jitter). */
@@ -153,7 +216,7 @@ export function orderByExpiry(
         fiveHourRemaining,
         weeklyKnown: Number.isFinite(weeklyRemaining),
         fiveHourKnown: Number.isFinite(fiveHourRemaining),
-        failures: acc.cooldowns?.[family]?.consecutiveFailures ?? 0,
+        failures: effectiveFamilyCooldown(acc, family)?.consecutiveFailures ?? 0,
         surplus: candidateSurplusScore(q, now),
       }
     })

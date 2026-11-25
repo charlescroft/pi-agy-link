@@ -9,6 +9,12 @@ import { Err, PROVIDER_ID, type PluginConfig } from '../common/types.ts'
 import type { MediaRefLike } from './media.ts'
 import type { TranslationRunnerRequest, TranslationRunnerResult } from '../features/translation/types.ts'
 import type { TranslationWorkerPool } from '../features/translation/worker.ts'
+import { BtwService, type BtwContextSnapshot, type BtwOneShotRequest, type BtwOneShotResult } from '../features/btw/service.ts'
+import { extractLiveRunProgress, extractRecentHistory, type SessionLike } from './commands/slash-context.ts'
+import { runAgyOnce } from './oneshot.ts'
+import type { AccountPoolManager } from './pool.ts'
+import type { ModelCatalog } from './models.ts'
+import type { CommandDeps } from './commands/shared.ts'
 
 /** Cross-session concurrency limiter (ADR-12). max() <= 0 means unlimited. */
 export class Semaphore {
@@ -126,6 +132,57 @@ export function resolveSessionPlanMode(ctx: Context, sessionId: string): boolean
     if (!state || typeof state !== 'object') return undefined
     if (typeof state.pending === 'boolean') return state.pending
     return typeof state.active === 'boolean' ? state.active : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Resolve the session's latest selected Antigravity model from `model/selection`
+ * session events so background compaction honors user model switches when DSH
+ * passes stale `lastUsed` metadata.
+ *
+ * Split out of `resolveSessionPendingModel` so a caller that already holds the
+ * session object (the HTTP session-view route) can read the SAME event stream
+ * without reaching for `ctx`.
+ */
+export function latestAgyModelOf(session: unknown): string | undefined {
+  try {
+    type SessionWithEvents = {
+      log?: readonly { type: string; data?: unknown }[]
+      snapshotEvents?(): readonly { type: string; data?: unknown }[]
+      ownEvents?(): readonly { type: string; data?: unknown }[]
+      events?: readonly { type: string; data?: unknown }[]
+    }
+    if (!session) return undefined
+    const s = session as SessionWithEvents
+    const evs = s.snapshotEvents?.() ?? s.ownEvents?.() ?? s.log ?? s.events
+    if (!evs) return undefined
+    for (let i = evs.length - 1; i >= 0; i--) {
+      const ev = evs[i]
+      if (ev?.type !== 'model/selection' || !ev.data || typeof ev.data !== 'object') continue
+      const d = ev.data as { provider?: unknown; model?: unknown }
+      if (d.provider !== PROVIDER_ID) return undefined
+      return typeof d.model === 'string' && d.model.trim() !== '' ? d.model.trim() : undefined
+    }
+    return undefined
+  } catch {
+    return undefined
+  }
+}
+
+export function resolveSessionPendingModel(ctx: Context, sessionId: string): string | undefined {
+  if (sessionId === '') return undefined
+  try {
+    type SessionWithEvents = {
+      log?: readonly { type: string; data?: unknown }[]
+      snapshotEvents?(): readonly { type: string; data?: unknown }[]
+      ownEvents?(): readonly { type: string; data?: unknown }[]
+      events?: readonly { type: string; data?: unknown }[]
+    }
+    const sessions = (ctx.get('sessions') as { get(id: unknown): SessionWithEvents | undefined } | undefined)
+      ?? (ctx as unknown as { sessions?: { get(id: unknown): SessionWithEvents | undefined } }).sessions
+    return latestAgyModelOf(sessions?.get(sessionId))
   } catch {
     return undefined
   }
@@ -300,3 +357,55 @@ export async function runTranslationStream(
     clearTimeout(timer)
   }
 }
+
+export function resolveBtwContextSnapshot(opts: {
+  cfg: () => PluginConfig
+  sessions: () => { get(id: unknown): unknown } | undefined
+  activeRun: CommandDeps['activeRun']
+  sessionId: string
+}): BtwContextSnapshot {
+  const session = opts.sessions()?.get(opts.sessionId) as SessionLike | undefined
+  const cwd = typeof session?.header?.cwd === 'string' && session.header.cwd.trim() !== ''
+    ? session.header.cwd.trim()
+    : (opts.cfg().workspaceRoot.trim() || process.cwd())
+  return {
+    workspaceRoot: cwd,
+    historyText: extractRecentHistory(session),
+    liveProgress: extractLiveRunProgress({ cfg: opts.cfg, activeRun: opts.activeRun } as CommandDeps, opts.sessionId),
+  }
+}
+
+export function createBtwServiceForHost(opts: {
+  cfg: () => PluginConfig
+  bin: () => string | null
+  pool: AccountPoolManager
+  catalog: ModelCatalog
+  semaphore: Semaphore
+  log: (msg: string) => void
+  effortUnsupported: () => readonly string[]
+  onEffortUnsupported: (model: string) => void
+  sessions: () => { get(id: unknown): unknown } | undefined
+  activeRun: CommandDeps['activeRun']
+}): BtwService {
+  return new BtwService({
+    cfg: opts.cfg,
+    catalog: () => opts.catalog,
+    resolveContext: (sessionId) => resolveBtwContextSnapshot({
+      cfg: opts.cfg,
+      sessions: opts.sessions,
+      activeRun: opts.activeRun,
+      sessionId,
+    }),
+    runOnce: (req) => runAgyOnce({
+      cfg: opts.cfg,
+      bin: opts.bin,
+      pool: () => opts.pool,
+      acquire: (sig) => opts.semaphore.acquire(sig),
+      log: opts.log,
+      effortUnsupported: opts.effortUnsupported,
+      onEffortUnsupported: opts.onEffortUnsupported,
+    }, req),
+  })
+}
+
+export type { BtwOneShotRequest, BtwOneShotResult }

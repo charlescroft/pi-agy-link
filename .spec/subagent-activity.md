@@ -21,6 +21,13 @@ createAttemptRecorder(deps, cfg, account, initialConversationId)   src/provider/
 - `EventMapper` 把 `stepKind:'subagent'` 收敛成一条 `[agy subagent]` 横幅 + 逐行进度，避免每个子代理各起一个 reasoning 块；来自 `TaskActivityTracker` 的 `[后台任务 · <taskId>]` / `[后台通知 · <sender>]` 事件走同一通道并喂活看门狗。
 - `SubagentTracker` 现在同时委托 `TaskActivityTracker`（`src/features/subagent/task-activity.ts`）增量 tail 主会话 `.system_generated/tasks/*.log` 与 `.system_generated/messages/{,undelivered/}*.json`，并在 `runAcpAttempt` 与 `runAgyAttempt` 两条传输路径统一启用；`RUNNING` 工具卡片在 `presentMirrorResult` 与 `EventMapper` 保留可结束切卡语义的同时补充后台任务日志/定时器提示。
 
+## 表头可见性（2026-11-23）
+
+- 表头只展示**正在运行**的子代理：`SubagentControl` 在 `running.length === 0` 时返回 `null`，会话空闲时表头不出现计数胶囊。
+- 面板只列运行中的行；**不再有「已结束 N / 展开已结束」**。agy 的子代理描述符会长期保留且状态永远是 `SUBAGENT_STATE_ALIVE`，按描述符做历史列表会让空闲会话永久挂着一个「已结束 45」的面板。
+- 计数格式与 DSH 自带后台任务对齐：`● N`（仅运行数，不含历史总数）；面板标题 `子代理 · N`。
+- 为什么不直接注册成 DSH job：job registry 的 `running + stopping` 上限与 bash 后台任务共享（默认 10），每次结算还会通知 owner（这里是 agy），会注入 agy 从未发起的「后台任务完成」。agy 一轮可起 10+ 子代理，注册会撞 `JOB_LIMIT_REACHED` 并污染模型上下文；因此只复用观感，不共用账本。
+
 ## 2. 不变式
 
 - **增量 tail、UTF-8 跨块安全与续接历史隔离**：每个子代理（以及父对话自身日志 `pollParentTranscript()`）记录 `offset` / `rest` 与 `StringDecoder('utf8')`，按实际 `bytesRead` 切片解码，防止多字节中文在 500ms 轮询边界被截断成乱码或混入未初始化内存。当续接已有会话（无论 `initialConversationId` 在 `start()` 时已就绪还是通过 `setConversationId()` 滞后到达）时，`baselineExisting()` 将父对话日志、既有子代理描述符与 `transcript.jsonl` 基线定在当前状态与末尾字节（EOF），**绝不把历史 `SUBAGENT_STATE_ALIVE` 或历史 `SYSTEM_MESSAGE` 报错残留误报为本轮事件或重复触发切号**；本轮新产生的文件或追加的新行正常从新增处发出。
@@ -49,3 +56,12 @@ DSH 会在工具结果之后追加**宿主生成**的上下文消息。各生产
 - **实时可见**：转后台的 `run_command` 任务日志（`.system_generated/tasks/*.log`）与完成/取消通知（`.system_generated/messages/{,undelivered/}*.json`）必须被增量跟随，而不是等到回合结束；ACP 运行同样要启用 tracker（`runAcpAttempt` 曾漏配）。跟随实现需满足：UTF-8 多字节安全、单次读取有界、续跑时以 EOF 为基线（避免重放历史）、消息按 id 去重、`stop()` 做最终同步 flush。
 - **中断横幅只对真正被中断的回合**：前一轮**已产出可消费结果**（`hasConsumableResult`）时，收尾超过 1.5 秒只是正常 shutdown，**不得**设置 `binding.interrupted` 或注入「上一轮被中断」文案——否则会对一个已经作答的回合说谎，并污染下一轮的上下文。
 - 锚点：`test/background-task-visibility.test.ts`（371 行：跟随、去重、续跑基线、可消费结果不标中断）。
+
+## 跨轮后台唤醒（PR #164，取代 #156）
+
+回合结束后，agy 的后台工作（`schedule` 定时器、游离任务/子代理、持久 ACP 更新）可能才完成。唤醒机制可以把空闲会话重新拉起来，但**默认必须关闭**。
+
+- **默认 `backgroundWakeup: false`**：会话在回合结束后自己说话属于行为变更，必须由用户显式开启（设置页 / `/agy wakeup on` / `DSH_AGY_BACKGROUND_WAKEUP=1`）。
+- 护栏（缺一不可）：30 分钟 TTL、每会话在两次真人回合之间最多 12 次唤醒、归档会话跳过、活跃 run 阻止唤醒、消息 id 去重、忽略语言服务器重启通知（否则已死的 CLI 子代理会造成重试循环）。
+- 判定「空闲」与真正 `followup()` 之间存在竞态窗口，注入策略需保证不与用户正在进行的回合交错。
+- 锚点：`test/background-followup-wakeup.test.ts` 等三片的用例。

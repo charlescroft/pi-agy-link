@@ -15,9 +15,11 @@ import { TranslationService, TRANSLATION_RECORD_TYPE, type TranslationRecord } f
 import { TranslationWorkerPool } from '../features/translation/worker.ts'
 import { ModelCatalog } from './models.ts'
 import { RunRegistry } from './recording.ts'
-import { resolveAgyBin, probeProcess, isolatedHomeEnv } from './runner.ts'
+import { resolveAgyBin, probeProcess, isolatedHomeEnv, parseVersion } from './runner.ts'
+import { supportsSshIsolation } from '../runtime/agy/env.ts'
 import { SessionStore } from './sessions.ts'
 import { AccountPoolManager } from './pool.ts'
+import { AccountQuotaRefresher } from '../features/quota/freshness.ts'
 import { PoolAuthFlow } from './pool-auth.ts'
 import { QuotaService } from './quota.ts'
 import { createEffortUnsupportedStore } from './effort-unsupported-store.ts'
@@ -30,19 +32,32 @@ import { ImageService, runViaAdapter } from './image.ts'
 import { EcosystemService } from '../features/ecosystem/index.ts'
 import { AcpSessionPool, runAcpAttempt } from '../features/acp/index.ts'
 import { createPoolQuotaHooks } from '../provider/quota-failover.ts'
-import { agyMcpConfigPath, registerBridgeMcpConfig, type McpBridge } from './mcp-bridge.ts'
+import { PREFERRED_IMAGE_QUOTA_MODEL } from '../common/model-lineup.ts'
+import { BackgroundWakeWatcher, type AgentLike } from '../features/background/watcher.ts'
+import { agyMcpConfigPath, registerBridgeMcpConfig, type BridgeRegistryState } from './mcp-bridge.ts'
 import { readAccountCredential } from './credential-backup.ts'
-import { acquireCredentialSlot, defaultSlotIo, readPrimaryCredential } from './credential-slot.ts'
-import { installSlotOrThrow } from '../domain/credentials/lease.ts'
+import { acquireCredentialSlot, readPrimaryCredential, recoverPrimaryCredential, reinstallCredential } from './credential-slot.ts'
+import { buildCliQuotaDeps } from './quota-cli-deps.ts'
+import { ACP_REPORT_RECORD_TYPE, createSessionRecords } from './session-records.ts'
 import {
   Semaphore,
+  createBtwServiceForHost,
   findSessionLogFile,
   readSessionImage,
   resolveSessionGoal,
+  resolveSessionPendingModel,
   resolveSessionPlanMode,
   runTranslationStream,
   syncSessionModelSelection,
 } from './service-helpers.ts'
+
+function safeCtxGet<T>(ctx: Context, name: string): T | undefined {
+  try {
+    return ctx.get(name as never) as T | undefined
+  } catch {
+    return undefined
+  }
+}
 
 export function createHostServices(ctx: Context, entryConfig: Record<string, unknown> = {}) {
   const tag = '[dsh-agy-link] '
@@ -83,6 +98,19 @@ export function createHostServices(ctx: Context, entryConfig: Record<string, unk
     return binCache
   }
   const version = () => versionCache
+  // One `agy --version` probe shared by the boot probe and lease acquisition
+  // (a lease must never guess whether SSH isolation applies). A failed probe
+  // rejects and is retried by the next caller.
+  let versionProbe: Promise<string | null> | null = null
+  const resolveVersion = (): Promise<string | null> => {
+    if (versionCache !== null) return Promise.resolve(versionCache)
+    const b = bin()
+    if (!b) return Promise.resolve(null)
+    versionProbe ??= probeProcess(b, ['--version'], 10_000, undefined, undefined, getConfig().suppressAgyAutoUpdate)
+      .then((v) => (versionCache = parseVersion(v.stdout)))
+      .finally(() => { versionProbe = null })
+    return versionProbe
+  }
   const store = new SessionStore(join(stateDir(), 'sessions.json'))
   const pool = new AccountPoolManager()
   for (const account of pool.getAccounts()) {
@@ -94,31 +122,49 @@ export function createHostServices(ctx: Context, entryConfig: Record<string, unk
     pool,
     () => getConfig().proxyUrl || detectSystemProxy() || '',
     version,
-    {
+    // On Windows the CLI reads Credential Manager, so a token refreshed for the
+    // safety window has to land in the slot too — QuotaService already holds
+    // credentialSlotMutex for this read. Other platforms have no slot: agy reads
+    // the token document itself, which the refresh just rewrote.
+    buildCliQuotaDeps({
       bin: () => bin(),
       viaCli: () => getConfig().quotaViaCli,
       preemptAutoUpdate: () => getConfig().suppressAgyAutoUpdate,
-      // On Windows the CLI reads Credential Manager, so a token refreshed for
-      // the safety window has to land in the slot too — QuotaService already
-      // holds credentialSlotMutex for this read. Other platforms have no slot:
-      // agy reads the token document itself, which the refresh just rewrote.
-      ...(process.platform === 'win32'
-        ? {
-            syncSlot: () => {
-              const raw = readPrimaryCredential(pool.dir)?.raw
-              if (raw === undefined || raw === '') return false
-              try {
-                installSlotOrThrow(defaultSlotIo(), raw, log, 'quota token refresh')
-                return true
-              } catch {
-                return false
-              }
-            },
-          }
-        : {}),
+      poolDir: () => pool.dir,
+      respectExternalSignIn: () => getConfig().respectExternalSignIn,
       log,
-    },
+    }),
   )
+  // Keep the account actually in use fresh. `recordSuccess`/a switch fires
+  // `onAccountUsed`; we refresh just that account (throttled) instead of waiting
+  // for the next full sweep, so the panel reflects real consumption within
+  // minutes. Fire-and-forget: a quota probe must never delay or fail a turn.
+  const quotaRefresher = new AccountQuotaRefresher(async (accountId) => {
+    const acc = pool.getAccount(accountId)
+    if (acc === undefined) return
+    await quota.refreshAccountQuota(acc, false)
+  })
+  const semaphore = new Semaphore(() => getConfig().maxConcurrent)
+
+  const getDiscoveryEnv = (account?: ManagedAccount): NodeJS.ProcessEnv => {
+    const env = buildAgyEnv({
+      ...(account === undefined ? {} : { account }),
+      cfg: getConfig(),
+      telemetryFlags: true,
+    })
+    // Prevent a user's AI Studio API key in shell env from polluting `agy models`
+    // subscription model discovery.
+    delete env.GEMINI_API_KEY
+    delete env.GOOGLE_API_KEY
+    return env
+  }
+
+  const effortStore = createEffortUnsupportedStore({ stateDir, notifyPicker, log })
+
+  // Constructed after `effortStore` so the probe can honour (and extend) the
+  // learned `--effort` refusal list: agy rejects the whole invocation when the
+  // flag is not valid for a model, and a warmup that never learns will fail for
+  // that family forever (observed on claude-sonnet-5-5, 2026-11-23).
   const warmup = new WarmupService(
     pool,
     quota,
@@ -127,18 +173,12 @@ export function createHostServices(ctx: Context, entryConfig: Record<string, unk
     getConfig,
     log,
     undefined,
-    { bin: () => bin() },
+    {
+      bin: () => bin(),
+      effortUnsupported: () => effortStore.read(),
+      onEffortUnsupported: (model) => effortStore.remember(model),
+    },
   )
-  const semaphore = new Semaphore(() => getConfig().maxConcurrent)
-
-  const getDiscoveryEnv = (account?: ManagedAccount): NodeJS.ProcessEnv =>
-    buildAgyEnv({
-      ...(account === undefined ? {} : { account }),
-      cfg: getConfig(),
-      telemetryFlags: true,
-    })
-
-  const effortStore = createEffortUnsupportedStore({ stateDir, notifyPicker, log })
 
   const sessionWorkspace = (sessionId: string): string | undefined => {
     const sessions = ctx.get('sessions') as { get(id: unknown): { header?: { cwd?: string } } | undefined } | undefined
@@ -159,23 +199,10 @@ export function createHostServices(ctx: Context, entryConfig: Record<string, unk
     (ctx.get('sessions') as SessionsServiceLike | undefined) ?? ((ctx as unknown as { sessions?: SessionsServiceLike }).sessions)
   const sessionAuto = new Map<string, boolean>()
 
-  type AppendPluginRecord = (session: unknown, type: string, data: unknown) => number
-  let appendPluginRecordPromise: Promise<AppendPluginRecord | null> | null = null
-  const loadAppendPluginRecord = (): Promise<AppendPluginRecord | null> => {
-    if (appendPluginRecordPromise === null) {
-      appendPluginRecordPromise = (async () => {
-        try {
-          const spec = '@deepseek-ai/dsh-session'
-          const mod = (await import(spec)) as { appendPluginRecord?: AppendPluginRecord }
-          return typeof mod.appendPluginRecord === 'function' ? mod.appendPluginRecord : null
-        } catch (e) {
-          log('translation records unavailable: ' + String(e))
-          return null
-        }
-      })()
-    }
-    return appendPluginRecordPromise
-  }
+  const { appendRecordTo, appendPluginRecordTo, appendAcpNotice } = createSessionRecords({
+    session: (id) => sessionsSvc()?.get(id),
+    log,
+  })
 
   const status = {
     get version(): string | null { return versionCache },
@@ -217,6 +244,7 @@ export function createHostServices(ctx: Context, entryConfig: Record<string, unk
           process.platform === 'win32'
           && process.env.NODE_TEST_CONTEXT === undefined
           && Boolean(acc && acc.dir && !acc.systemHome)
+          && !supportsSshIsolation(version())
         const lease = needsWinSlot
           ? await acquireCredentialSlot(acc, pool, {
               baseDir: pool.dir,
@@ -225,6 +253,7 @@ export function createHostServices(ctx: Context, entryConfig: Record<string, unk
               signal,
               dispatchTimeoutMs: 8_000,
               parallel: getConfig().parallelSameAccount,
+              respectExternalSignIn: getConfig().respectExternalSignIn,
             })
           : undefined
         try {
@@ -270,12 +299,14 @@ export function createHostServices(ctx: Context, entryConfig: Record<string, unk
 
   pool.setCatalog(catalog)
   pool.onAccountSwitch = (newActiveId: string) => {
-    if (process.platform === 'win32') acpPool.evictOtherAccounts(newActiveId)
+    if (process.platform === 'win32' && !supportsSshIsolation(version())) {
+      acpPool.evictOtherAccounts(newActiveId)
+    }
     notifyPicker()
     void catalog.forceRefreshAndNotify(newActiveId).catch(() => undefined)
   }
 
-  const bridgeState: { bridge: McpBridge | null; restores: Array<() => void> } = { bridge: null, restores: [] }
+  const bridgeState: BridgeRegistryState = { bridge: null, restores: [], log }
   const ecosystem = new EcosystemService({ pool, getConfig, log })
   const auth = new AuthHelper(bin, () => getConfig().suppressAgyAutoUpdate)
   const poolAuth = new PoolAuthFlow(pool, quota, log, {
@@ -298,9 +329,114 @@ export function createHostServices(ctx: Context, entryConfig: Record<string, unk
   })
   const runs = new RunRegistry()
   const webServerPort: { current?: number } = {}
-  const acpPool = new AcpSessionPool({ bin, cfg: getConfig, log })
+  // Gate 3: an account switch (or a crashed secondary) can leave the machine-wide
+  // Windows credential slot holding another account's login. Once no run holds it
+  // any more, put the primary back — otherwise the user's next turn silently
+  // authenticates as someone else and spends their quota.
+  let restoringSlot = false
+  const restorePrimarySlot = async (trigger: string): Promise<void> => {
+    if (restoringSlot || process.platform !== 'win32') return
+    restoringSlot = true
+    try {
+      const res = await recoverPrimaryCredential(pool, {
+        baseDir: pool.dir,
+        log,
+        respectExternalSignIn: getConfig().respectExternalSignIn,
+        ...(getConfig().proxyUrl?.trim() ? { proxyUrl: getConfig().proxyUrl.trim() } : {}),
+      })
+      if (res.reason === 'restored') {
+        acpPool.noteSlotRecovery()
+        log('[agy-link] restored the primary credential in the Windows slot (' + trigger + ')')
+      }
+    } catch (e) {
+      log('credential slot recovery failed (' + trigger + '): ' + String(e))
+    } finally {
+      restoringSlot = false
+    }
+  }
+  const acpPool = new AcpSessionPool({
+    bin,
+    cfg: getConfig,
+    log,
+    // A drained process that ran out of budget is killed mid-flight; say so in
+    // the conversation instead of letting the background task vanish silently.
+    onDrainExpired: (info) => {
+      // Only the deadline branch speaks: a drain that ends on its own is the
+      // normal path, and warning about it would be a false alarm. The target's
+      // sessionKey is the DSH session (info.sessions holds agy's UUIDs, which
+      // the transcript service cannot resolve).
+      for (const target of info.targets) {
+        appendAcpNotice(target.sessionKey, {
+          kind: 'acp-drain-aborted',
+          text: '因账号切换，旧账号上仍在运行的后台任务已被中止。\nBackground tasks on the previous account were stopped because the credential slot switched accounts.',
+        })
+      }
+    },
+    // Gate 3: once the last process of the OLD account is gone, nothing else can
+    // legitimately own the machine-wide slot — put the primary back so the next
+    // interactive turn authenticates as the user's own account.
+    onDrainClosed: () => {
+      void restorePrimarySlot('drain-closed')
+    },
+    onIdle: () => {
+      void restorePrimarySlot('idle')
+    },
+  })
+  let adapter!: AgyAdapter
+  const backgroundWakeup = new BackgroundWakeWatcher({
+    getConfig,
+    log,
+    getActiveRun: (sessionId) => adapter.getActiveRun(sessionId),
+    retainAcpSession: (sid, sessionKey) => acpPool.retainSession(sid, sessionKey),
+    isArchived: (sessionId) => {
+      try {
+        const reg = safeCtxGet<{ archivedSessionIds?: Iterable<string> | { has?: (id: string) => boolean } }>(ctx, 'workspaceRegistry')
+        const archived = reg?.archivedSessionIds
+        if (!archived) return false
+        if (typeof (archived as { has?: (id: string) => boolean }).has === 'function') {
+          return (archived as { has: (id: string) => boolean }).has(sessionId)
+        }
+        for (const id of archived as Iterable<string>) {
+          if (id === sessionId) return true
+        }
+      } catch {
+        // ignore optional workspaceRegistry errors
+      }
+      return false
+    },
+    resolveAgent: async (sessionId) => {
+      try {
+        const agents = safeCtxGet<{ get?: (id: unknown) => unknown }>(ctx, 'agents')
+        const live = agents?.get?.(sessionId) as AgentLike | undefined
+        if (live && typeof live.followup === 'function') return live
+        const ctrl = safeCtxGet<{
+          resolveAgent?: (id: string) => Promise<{ agent?: AgentLike } | null | undefined>
+        }>(ctx, 'sessionController')
+        if (ctrl && typeof ctrl.resolveAgent === 'function') {
+          const res = await ctrl.resolveAgent(sessionId)
+          if (res && typeof res === 'object' && res.agent && typeof res.agent.followup === 'function') {
+            return res.agent
+          }
+        }
+      } catch (err) {
+        log('background-wakeup resolveAgent error: ' + String(err))
+      }
+      return null
+    },
+    // 方案 A: the ACP turn already produced its own report; write it straight
+    // into the transcript so no model turn is spent repeating it.
+    presentAcpReport: async (sessionId, text) => {
+      const seq = await appendPluginRecordTo(sessionId, ACP_REPORT_RECORD_TYPE, { text, at: Date.now() })
+      // The seq travels back to the watcher, which uses it to recognise the same
+      // narration when agy also writes it to .system_generated/messages.
+      return seq === null ? false : seq
+    },
+    hasArmedGoal: (sessionId) => resolveSessionGoal(ctx, sessionId) != null,
+  })
 
-  const adapter = new AgyAdapter({
+  let mirrorToolCheck: ((sessionId?: string) => boolean) | undefined = undefined
+
+  adapter = new AgyAdapter({
     getConfig,
     catalog,
     store,
@@ -309,9 +445,12 @@ export function createHostServices(ctx: Context, entryConfig: Record<string, unk
     acquire: (signal) => semaphore.acquire(signal),
     log,
     runs,
+    isMirrorToolAvailable: (sessionId) => (mirrorToolCheck ? mirrorToolCheck(sessionId) : true),
     getMediaBaseUrl: () => (webServerPort.current ? `http://127.0.0.1:${webServerPort.current}/plugins/agy-link/media` : null),
     // Non-forced: honours per-account cooldowns so a heal cannot stampede the
     // pool. Catalog re-discovery repairs `agy models` in the same pass.
+    onAccountUsed: (accountId) => { quotaRefresher.trigger(accountId) },
+    ensureFreshToken: (acc) => quota.getValidAccessToken(acc).then((t) => t !== null).catch(() => false),
     refreshQuota: async () => {
       await quota.refreshAllQuotas(false).catch(() => undefined)
       await catalog.forceRefreshAndNotify().catch(() => undefined)
@@ -322,11 +461,32 @@ export function createHostServices(ctx: Context, entryConfig: Record<string, unk
     sessionCwd: (sessionId) => sessionWorkspace(sessionId),
     sessionGoal: (sessionId) => resolveSessionGoal(ctx, sessionId),
     sessionPlanMode: (sessionId) => resolveSessionPlanMode(ctx, sessionId),
+    sessionPendingModel: (sessionId) => resolveSessionPendingModel(ctx, sessionId),
     syncSessionModel: (sessionId, model, effort) => syncSessionModelSelection(ctx, sessionId, model, effort),
     onRun: (info) => { lastRun = info },
     onParser: (p) => { lastParser = p },
     readImage: (ref) => readSessionImage(ctx, dshHome(), ref),
     runAcp: (attemptDeps, attemptInput, slot) => runAcpAttempt(acpPool, attemptDeps, attemptInput, slot),
+    agyVersion: version,
+    backgroundObserver: backgroundWakeup,
+    appendAcpNotice,
+    noteAcpReport: (sessionKey, text, seq) => backgroundWakeup.noteAcpReport(sessionKey, text, seq),
+    // Gate 2 recovery: agy proved it loaded a different account than the one we
+    // dispatched, so the slot must be rewritten before the single retry.
+    reinstallCredentialSlot: (account) => {
+      if (process.platform !== 'win32') return false
+      // The primary has no isolated dir: its token lives in the durable primary
+      // store, so read that instead. Falling through to null here used to make
+      // the whole gate-2 self-heal a no-op for the user's own account.
+      const raw =
+        account.systemHome || !account.dir
+          ? (readPrimaryCredential(pool.dir)?.raw ?? null)
+          : readAccountCredential(join(account.dir, '.gemini', 'antigravity-cli', 'antigravity-oauth-token'), log)
+      if (raw === null || raw === '') return false
+      const ok = reinstallCredential(raw, { baseDir: pool.dir, log }, account.alias || account.id)
+      if (ok) acpPool.noteSlotOverwrite()
+      return ok
+    },
   })
 
   const translationWorkers = new TranslationWorkerPool({
@@ -355,32 +515,8 @@ export function createHostServices(ctx: Context, entryConfig: Record<string, unk
     poolQuotaHops: quotaHooks.poolQuotaHops,
     log,
     run: (req) => runTranslationStream(ctx, getConfig, log, req, translationWorkers),
-    appendRecord: async (sessionId, record: TranslationRecord) => {
-      const session = sessionsSvc()?.get(sessionId)
-      if (session === undefined) return null
-      const append = await loadAppendPluginRecord()
-      if (append !== null) {
-        try {
-          const res = append(session, TRANSLATION_RECORD_TYPE, record)
-          if (typeof res === 'number') return res
-        } catch (e) {
-          log('failed to persist translation record via appendPluginRecord: ' + String(e))
-        }
-      }
-      try {
-        if (typeof session.append === 'function') {
-          const res = session.append(TRANSLATION_RECORD_TYPE, record)
-          if (typeof res === 'number') return res
-          if (res !== null && typeof res === 'object' && typeof (res as { seq?: unknown }).seq === 'number') {
-            return (res as { seq: number }).seq
-          }
-          return 0
-        }
-      } catch (e) {
-        log('failed to persist translation record via session.append: ' + String(e))
-      }
-      return null
-    },
+    appendRecord: (sessionId, record: TranslationRecord) =>
+      appendRecordTo(sessionId, TRANSLATION_RECORD_TYPE, record, 'persist translation record'),
   })
 
   const setOverride = (key: string, value: unknown): void => {
@@ -428,12 +564,23 @@ export function createHostServices(ctx: Context, entryConfig: Record<string, unk
     run: (call) => runViaAdapter(adapter, call),
     catalog: () => catalog.get(),
     ...quotaHooks,
+    // Prefer the advertised image model, fall back to the one agy 1.5.x ships.
+    imageQuotaModel: () =>
+      catalog.get().models.find((m) => /image/i.test(m.id))?.id ?? PREFERRED_IMAGE_QUOTA_MODEL,
     log,
   })
 
+  const btw = createBtwServiceForHost({
+    cfg: getConfig, bin, pool, catalog, semaphore, log,
+    effortUnsupported: () => effortStore.read(),
+    onEffortUnsupported: (model) => effortStore.remember(model),
+    sessions: sessionsSvc,
+    activeRun: (id) => adapter.activeRun(id),
+  })
+
   return {
-    getConfig, log, notifyPicker, bin, version, status, store, pool, quota, warmup, semaphore,
-    catalog, auth, poolAuth, runs, adapter, acpPool, ecosystem, imageService, translation, translationWorkers, setOverride,
+    getConfig, log, notifyPicker, bin, version, resolveVersion, status, store, pool, quota, warmup, semaphore,
+    catalog, auth, poolAuth, runs, adapter, acpPool, backgroundWakeup, ecosystem, imageService, translation, translationWorkers, btw, setOverride,
     readEffortUnsupported: effortStore.read,
     rememberEffortUnsupported: effortStore.remember,
     sessionsSvc, sessionAuto,
@@ -441,6 +588,7 @@ export function createHostServices(ctx: Context, entryConfig: Record<string, unk
     get lastParser() { return lastParser },
     mediaDir, bridgeState, webServerPort, activeCwds,
     hostDir: '',
+    setMirrorToolCheck: (fn: (sessionId?: string) => boolean): void => { mirrorToolCheck = fn },
     onConfigWritten: (_key: string, _value: unknown): void => undefined,
   }
 }

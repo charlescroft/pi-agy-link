@@ -78,7 +78,9 @@ test('native-contract locale lifecycle registers, publishes switches, falls back
   // conversation.session.header.actions + settings.section + plugins.bundle.config
   // + plugins.row.config + agy_tool + run_code toolviews
   // + conversation.chat.node(agy-translation) + conversation.chat.assistant-actions
-  assert.equal(registeredSlots.length, 8)
+  // + conversation.chat.node(agy-acp-report) + conversation.chat.node(agy-acp-notice)
+  // + conversation.input.dock(agy-btw) + conversation.chat.commandview(btw)
+  assert.equal(registeredSlots.length, 12)
   assert.equal(registeredSlots[0]!.options.locale, 'agy-link')
   assert.equal(registeredSlots[1]!.options.id, 'agy-link')
   assert.equal(registeredSlots[2]!.options.key, 'dsh-agy-link')
@@ -88,6 +90,16 @@ test('native-contract locale lifecycle registers, publishes switches, falls back
   assert.equal(registeredSlots[6]!.options.key, 'agy-translation')
   assert.equal(registeredSlots[7]!.options.name, 'conversation.chat.assistant-actions')
   assert.equal(registeredSlots[7]!.options.id, 'agy-tsl-message')
+  // ACP channel cards: post-turn narration and channel notices are separate
+  // chat-node keys, so the conversation can render each with its own card.
+  assert.equal(registeredSlots[8]!.options.name, 'conversation.chat.node')
+  assert.equal(registeredSlots[8]!.options.key, 'agy-acp-report')
+  assert.equal(registeredSlots[9]!.options.name, 'conversation.chat.node')
+  assert.equal(registeredSlots[9]!.options.key, 'agy-acp-notice')
+  assert.equal(registeredSlots[10]!.options.name, 'conversation.input.dock')
+  assert.equal(registeredSlots[10]!.options.id, 'agy-btw')
+  assert.equal(registeredSlots[11]!.options.name, 'conversation.chat.commandview')
+  assert.equal(registeredSlots[11]!.options.key, 'btw')
   const t = locale.bind('agy-link')
   locale.setLocale('pt-BR'); assert.equal(t('account.add'), 'Adicionar conta Google')
   locale.setLocale('es'); assert.equal(t('account.add'), 'Añadir cuenta de Google')
@@ -196,8 +208,9 @@ test('modal host manager reactively promotes secondary header on unmount and sup
   const rendered = sessionStatusComponent()
   assert.ok(rendered)
   assert.equal(rendered.type, 'div')
-  // Second child (the portal) is null because isModalOpen is false
-  assert.equal(rendered.children[1], null)
+  // The LAST child is the modal portal, and it is null because isModalOpen is
+  // false. (A subagent control now sits between the badge and the portal.)
+  assert.equal(rendered.children[rendered.children.length - 1], null)
 })
 
 test('REGRESSION: session status badge claims primary host on mount to eliminate first-open flicker', () => {

@@ -24,8 +24,8 @@ export interface ToolCallBlockInput {
   /** Current open-block cursor; the tool block occupies this index. */
   blockIdx: number
   toolCallStates: Map<string, ToolCallState>
-  /** Last per-call usage sample, read at cut time (pure). */
-  finalUsage: () => RawUsage | undefined
+  /** Unconsumed per-call usage sample for this cut, or null/undefined to omit usage (#161). */
+  finalUsage: () => RawUsage | null | undefined
 }
 
 export interface ToolCallBlockResult {
@@ -42,9 +42,24 @@ export function buildToolCallBlock(input: ToolCallBlockInput): ToolCallBlockResu
   // otherwise fall back to whatever survived the stream so the card still
   // renders what it has.
   const fullArgs = input.resolvedFullArgs
-  const effectiveArgs = fullArgs !== undefined
-    ? { ...fullArgs, ...(typeof input.args === 'object' ? input.args as Record<string, unknown> : {}) }
+  const streamArgsObj = typeof input.args === 'object' && input.args !== null ? input.args as Record<string, unknown> : undefined
+  const mergedArgs = fullArgs !== undefined
+    ? { ...fullArgs, ...(streamArgsObj ?? {}) }
     : input.args
+  if (
+    fullArgs !== undefined &&
+    mergedArgs !== null &&
+    typeof mergedArgs === 'object' &&
+    Array.isArray(fullArgs.steps) &&
+    fullArgs.steps.length > 0 &&
+    (!Array.isArray((mergedArgs as Record<string, unknown>).steps) || ((mergedArgs as Record<string, unknown>).steps as unknown[]).length === 0)
+  ) {
+    ;(mergedArgs as Record<string, unknown>).steps = fullArgs.steps
+    if (typeof fullArgs.markdown === 'string' && typeof (mergedArgs as Record<string, unknown>).markdown !== 'string') {
+      ;(mergedArgs as Record<string, unknown>).markdown = fullArgs.markdown
+    }
+  }
+  const effectiveArgs = mergedArgs
   const unwrapped = unwrapMcpTool(input.toolName, effectiveArgs)
   const brief = toolStepBrief(unwrapped.tool, unwrapped.input, unwrapped.server)
   const argumentsJson = useCode
@@ -58,9 +73,13 @@ export function buildToolCallBlock(input: ToolCallBlockInput): ToolCallBlockResu
       })
   const rawCallId = mirrorCallId(input.runId, input.absIndex)
   const assignedCallId = rememberToolCallId(input.toolCallStates, rawCallId, toolName)
-  // Forward the last per-call context sample instead of a hard 0/0: DSH's
-  // token meter treats the last reported sample as current context occupancy,
-  // so a zero here reset the meter on every tool hop of an agentic turn.
+  // Forward the last per-call sample when there is one. With no sample the
+  // usage chunk is OMITTED rather than sent as 0/0: DSH treats a missing
+  // usage chunk as "no new measurement" (it keeps the previous context
+  // pressure and does not count the step towards decode time), while an
+  // explicit 0/0 resets the meter and drags token speed down (issue #158).
+  // Concurrent tool cuts 2..N of the same turn therefore forward no sample at
+  // all, so DSH neither double-bills totals nor flashes context pressure (#161).
   const trackedCut = input.finalUsage()
   const chunks: StreamChunk[] = [
     { type: 'block-start', index: idx, blockType: 'tool-call' },
@@ -74,12 +93,9 @@ export function buildToolCallBlock(input: ToolCallBlockInput): ToolCallBlockResu
         arguments: argumentsJson,
       },
     },
-    {
-      type: 'usage',
-      usage: trackedCut !== undefined && Object.keys(trackedCut).length > 0
-        ? usageFromRaw(trackedCut)
-        : { inputTokens: 0, outputTokens: 0 },
-    },
+    ...(trackedCut !== undefined && trackedCut !== null && Object.keys(trackedCut).length > 0
+      ? [{ type: 'usage' as const, usage: usageFromRaw(trackedCut) }]
+      : []),
     { type: 'finish', reason: { kind: 'tool-calls' } },
   ]
   return { chunks, nextBlockIdx: idx + 1 }

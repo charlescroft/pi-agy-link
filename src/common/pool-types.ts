@@ -2,28 +2,72 @@
 
 export type ModelFamily = 'google' | 'argon' | 'anthropic' | 'openai' | 'unknown'
 
+/** Subscription plan tier inferred from authoritative quota groups / models. */
+export type AccountPlanTier = 'ultra' | 'pro' | 'free' | 'enterprise' | 'unknown'
+
 /** Check if a model identifier belongs to the Gemini 4 Argon family. */
 export function isArgonModel(modelId?: string): boolean {
   if (!modelId) return false
-  return modelId.trim().toLowerCase().includes('argon')
+  const lower = modelId.trim().toLowerCase()
+  return lower.includes('argon') || lower === 'gemini-pro-orchestrator-g1-pro'
 }
 
 /**
  * Map a model slug to its backend quota counter family.
  *
- * Gemini 4 Argon (Pro/Ultra-only) bills against its OWN weekly quota pool —
- * never the plain Gemini one. Its ids look like `gemini-4-argon-low/-medium`
- * and MUST be detected before the generic `gemini-` prefix below, otherwise
- * argon usage would silently drain/report the Gemini counter.
+ * Gemini 4 Argon (Pro/Ultra-only) bills against Argon's pool (or the shared
+ * Gemini pool when folded by agy 1.5.15+). Its ids look like `gemini-4-argon-*`
+ * or `gemini-pro-orchestrator-argon` / `-g1-pro` and MUST be detected before
+ * the generic `gemini-` prefix below.
  */
 export function modelFamilyOf(modelId?: string): ModelFamily {
   if (!modelId) return 'unknown'
   const id = modelId.toLowerCase()
-  if (id.includes('argon')) return 'argon'
+  if (isArgonModel(id)) return 'argon'
   if (id.startsWith('claude-') || id.includes('claude')) return 'anthropic'
   if (id.startsWith('gemini-') || id.startsWith('gemma-') || id.includes('gemini')) return 'google'
   if (id.startsWith('gpt-') || id.startsWith('openai/') || id.includes('gpt-oss')) return 'openai'
   return 'unknown'
+}
+
+/**
+ * True when an account has no dedicated `quotas.argon` row AND the backend's
+ * shared `Gemini Models` (`quotas.google`) group description explicitly names
+ * Argon as a member (observed on all paid plans since agy 1.5.12/1.5.15).
+ * Kept strict on `google.description` so accounts/tests without that explicit
+ * group membership keep `argon` unknown rather than borrowing `google`.
+ */
+export function argonSharesGoogleGroup(acc?: ManagedAccount | null): boolean {
+  return Boolean(acc && acc.quotas?.argon === undefined && isArgonModel(acc.quotas?.google?.description))
+}
+
+/**
+ * Peer quota family when Argon shares the Gemini Models bucket (`google` <-> `argon`).
+ */
+export function sharedArgonPeerFamily(
+  acc?: ManagedAccount | null,
+  family?: ModelFamily,
+): ModelFamily | undefined {
+  if (!argonSharesGoogleGroup(acc)) return undefined
+  if (family === 'argon') return 'google'
+  if (family === 'google') return 'argon'
+  return undefined
+}
+
+/**
+ * Effective cooldown state for `family`, mirroring the peer bucket's cooldown
+ * when Argon shares the Gemini Models group (`argonSharesGoogleGroup`).
+ */
+export function effectiveFamilyCooldown(
+  acc: ManagedAccount | null | undefined,
+  family: ModelFamily,
+): FamilyCooldownState | undefined {
+  const direct = acc?.cooldowns?.[family]
+  const peerFam = sharedArgonPeerFamily(acc, family)
+  const peer = peerFam ? acc?.cooldowns?.[peerFam] : undefined
+  if (!direct) return peer
+  if (!peer) return direct
+  return peer.cooldownUntil > direct.cooldownUntil ? peer : direct
 }
 
 export interface ModelQuotaInfo {
@@ -89,8 +133,21 @@ export interface ManagedAccount {
   authError?: string
   /** When authRequired was last set (drives the background re-verification cadence). */
   authMarkedAt?: number
+  /**
+   * Consecutive background re-verifications that failed to disprove the flag.
+   * Drives an exponential back-off (2m → 4m → 8m → 16m → 30m) so a genuinely
+   * dead login is not re-probed every two minutes, while a transient false
+   * positive heals on the first attempt.
+   */
+  authReverifyAttempts?: number
   /** Cooldown state tracked per model family. */
   cooldowns: Partial<Record<ModelFamily, FamilyCooldownState>>
+  /**
+   * Cooldown state tracked per MODEL (base slug), for quota buckets that belong
+   * to a single model rather than the family — e.g. `gemini-3.1-flash-image`.
+   * A model-scoped 429 must never leave the family's OTHER models unavailable.
+   */
+  modelCooldowns?: Record<string, FamilyCooldownState>
   /** Cached real-time quota statistics per model family. */
   quotas: Partial<Record<ModelFamily, FamilyQuotaInfo>>
   /**
@@ -111,6 +168,19 @@ export interface ManagedAccount {
   dedicatedGroups?: ModelFamily[]
   /** Subscription tier reported by loadCodeAssist (`ULTRA`, `PRO`, `FREE`). */
   subscriptionTier?: string
+  /** Subscription tier (`ultra` | `pro` | `free` | `enterprise`), inferred from quota/model evidence. */
+  planTier?: AccountPlanTier
+  /**
+   * An explicit tier the user pinned for this account (`/agy plan <id|alias> <tier>`).
+   *
+   * WHY: the quota API cannot tell Pro from Ultra any more — agy 1.5.15 lists
+   * Argon inside the shared Gemini group for every paid plan, exposes no tier
+   * field, and the Antigravity licence service is not reachable from here
+   * (2026-11-24). Inference therefore reports the conservative `pro`; this field
+   * is the only truthful way to show a genuinely different plan, and it outranks
+   * every inferred value in `resolveAccountPlanTier`.
+   */
+  planTierOverride?: AccountPlanTier
   /**
    * Why the last quota refresh produced no authoritative snapshot, and when it
    * may be probed again.
@@ -220,8 +290,10 @@ export function accountHasArgon(
   // 2. Pool recorded dedicated Argon quota group (PR #54)
   if (pool && typeof pool.hasDedicatedGroup === 'function' && pool.hasDedicatedGroup(acc.id, 'argon')) return true
 
-  // 3. Per-model quotas reported an argon model
+  // 3. Per-model quotas or shared Gemini group description explicitly naming Argon
+  //    (agy 1.5.12/1.5.15 paid plans enumerate Gemini 4 Argon / Orchestrator (Argon) here).
   if (acc.quotas?.google?.models?.some((m) => isArgonModel(m.modelId))) return true
+  if (isArgonModel(acc.quotas?.google?.description)) return true
 
   // 4. Authoritative negative only when the Google group reported a PER-MODEL breakdown
   if (Array.isArray(acc.quotas?.google?.models)) {
@@ -272,16 +344,20 @@ function quotaSupportsModel(
     return true
   }
   // CLI-synthesized orchestrator slugs (`gemini-pro-orchestrator-neon`,
-  // `gemini-pro-orchestrator-g1-pro`) never appear in Google's REST quota
-  // breakdown (`fetchAvailableModels`), which only returns their backing
-  // models (`gemini-4-neon-*`, Argon). Infer support from that backing
-  // evidence so Pro/Ultra accounts are never falsely rejected before per-account
+  // `gemini-pro-orchestrator`, `gemini-pro-orchestrator-argon` / `-g1-pro`)
+  // never appear in Google's REST quota breakdown (`fetchAvailableModels`),
+  // which only returns their backing models (`gemini-4-neon-*`,
+  // `gemini-4-carbon-*`, Argon). Infer support from that backing evidence so
+  // Pro/Ultra accounts are never falsely rejected before per-account
   // `agy models` discovery finishes or when a cached catalog predates a rollout.
   const lower = clean.toLowerCase()
   if (lower === 'gemini-pro-orchestrator-neon') {
     return Array.isArray(familyQuotaModels) && familyQuotaModels.some((m) => modelMatches('gemini-4-neon', m.modelId))
   }
-  if (lower === 'gemini-pro-orchestrator-g1-pro') {
+  if (lower === 'gemini-pro-orchestrator' || lower === 'gemini-pro-orchestrator-carbon') {
+    return Array.isArray(familyQuotaModels) && familyQuotaModels.some((m) => modelMatches('gemini-4-carbon', m.modelId))
+  }
+  if (lower === 'gemini-pro-orchestrator-g1-pro' || lower === 'gemini-pro-orchestrator-argon') {
     return accountHasArgon(acc, pool, catalog)
   }
   return false
@@ -364,7 +440,7 @@ export function shouldPollAccount(account: ManagedAccount): boolean {
     // Only skip polling when EVERY known quota family has an active 429 cooldown:
     // cooling Gemini must not stop healthy Argon/Claude/GPT families from refreshing.
     const allCooling = quotaFamilies.every((fam) => {
-      const cd = account.cooldowns?.[fam]
+      const cd = effectiveFamilyCooldown(account, fam)
       return Boolean(cd && cd.cooldownUntil > now)
     })
     return !allCooling
@@ -394,6 +470,22 @@ export const AUTH_CONFIRM_STRIKES = 2
 export const AUTH_REVERIFY_DELAY_MS = 10 * 60_000
 
 /**
+ * First re-verification delay for a fresh flag. The hourly pool poll used to be
+ * the ONLY re-check, so a transient mis-classification painted a red 需重新登录
+ * badge for up to ~70 minutes on a healthy account (reported 2026-11-23).
+ */
+export const AUTH_FAST_REVERIFY_MS = 2 * 60_000
+
+/** Upper bound of the re-verification back-off (a dead login is still retried). */
+export const AUTH_REVERIFY_MAX_MS = 30 * 60_000
+
+/** Exponential re-verification back-off: 2m, 4m, 8m, 16m, then 30m. */
+export function authReverifyDelayMs(attempts: number): number {
+  const n = Number.isFinite(attempts) ? Math.max(0, Math.floor(attempts)) : 0
+  return Math.min(AUTH_FAST_REVERIFY_MS * 2 ** Math.min(n, 4), AUTH_REVERIFY_MAX_MS)
+}
+
+/**
  * A flagged account whose flag is old enough (or whose flag predates the
  * authMarkedAt bookkeeping) may be re-verified in the background. If the
  * stored token still works the flag clears itself; if not, the flag is
@@ -404,7 +496,11 @@ export function isTerminalAuthError(message?: string): boolean {
   return typeof message === 'string' && /\bTOS_VIOLATION\b|violation of Terms of Service/i.test(message)
 }
 
-export function needsAuthReverify(account: ManagedAccount, now = Date.now()): boolean {
+export function needsAuthReverify(
+  account: ManagedAccount,
+  now = Date.now(),
+  delayMs = AUTH_REVERIFY_DELAY_MS,
+): boolean {
   if (!account.enabled) return false
   if (!account.authRequired) return false
   // A TOS-banned account still has a working refresh token, so the 10-minute
@@ -412,14 +508,14 @@ export function needsAuthReverify(account: ManagedAccount, now = Date.now()): bo
   // wait for an explicit re-login / appeal, not a background poll (issue #114).
   if (isTerminalAuthError(account.authError)) return false
   if (typeof account.authMarkedAt !== 'number') return true
-  return now - account.authMarkedAt > AUTH_REVERIFY_DELAY_MS
+  return now - account.authMarkedAt > delayMs
 }
 
 /** Compute real-time health indicator for an account. */
 export function getAccountHealth(account: ManagedAccount, family: ModelFamily = 'google'): AccountHealthInfo {
   if (!account.enabled) return { status: 'disabled', message: 'Account disabled' }
   if (account.authRequired) return { status: 'auth_required', message: account.authError || 'Authentication required' }
-  const cd = account.cooldowns?.[family]
+  const cd = effectiveFamilyCooldown(account, family)
   if (cd && cd.cooldownUntil > Date.now()) {
     return {
       status: 'cooldown',
@@ -439,10 +535,13 @@ export interface AccountPoolData {
   /** Currently active account id per model family for sticky sequential drain */
   activeAccountIds?: Partial<Record<ModelFamily, string>>
   /**
-   * Account of the most recent agy spawn — the single source of truth for the
-   * console's "in use" badge. Per-family pointers above are an internal
-   * scheduling detail: families can legitimately sit stale on accounts that
-   * are not running anything (that badge showed two accounts at once).
+   * Account of the most recent agy spawn that belonged to the `google` family.
+   *
+   * NOT the account a session is using: selection is per family, so the
+   * console reads `activeAccountIds[family]` (a real per-family pin) and the
+   * conversation header reads `/session-view` (family of the selected model).
+   * Kept for the `google` readouts that predate family scoping and for
+   * last-resort fallbacks.
    */
   lastActiveAccountId?: string
   /** Timestamp of the most recent explicit user account switch/pin (overrides older session stickiness) */

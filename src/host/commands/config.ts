@@ -11,36 +11,39 @@ export function handleConfig(deps: CommandDeps, ctx: CommandContext): CommandRes
   const { sub, arg, raw } = ctx
 
   if (sub === 'mode') {
-    if (arg === '') {
+    const val = arg.toLowerCase()
+    if (val === '') {
       return ok(`Current permission mode: **${deps.cfg().permissionMode}** (usage: /agy mode <skip|auto|plan|accept-edits>)`)
     }
-    if (!['skip', 'auto', 'plan', 'accept-edits'].includes(arg)) {
+    if (!['skip', 'auto', 'plan', 'accept-edits'].includes(val)) {
       return err('usage: /agy mode <skip|auto|plan|accept-edits>')
     }
-    deps.setOverride('permissionMode', arg)
-    return ok('Permission mode set to **' + arg + '** — effective next turn.')
+    deps.setOverride('permissionMode', val)
+    return ok('Permission mode set to **' + val + '** — effective next turn.')
   }
 
   if (sub === 'sandbox') {
-    if (arg === '') {
+    const val = arg.toLowerCase()
+    if (val === '') {
       return ok(`Current terminal sandbox: **${deps.cfg().sandbox ? 'on' : 'off'}** (usage: /agy sandbox <on|off>)`)
     }
-    if (arg !== 'on' && arg !== 'off') {
+    if (val !== 'on' && val !== 'off') {
       return err('usage: /agy sandbox <on|off>')
     }
-    const on = arg === 'on'
+    const on = val === 'on'
     deps.setOverride('sandbox', on)
-    return ok(`Terminal sandbox set to **${arg}** — effective next turn.`)
+    return ok(`Terminal sandbox set to **${val}** — effective next turn.`)
   }
 
   if (sub === 'agent') {
     const rawAgent = (raw ?? '').trim().replace(/^(?:\/agy\s+)?agent\s*/i, '').trim()
     const target = rawAgent !== '' ? rawAgent : arg
+    const lowered = target.toLowerCase()
     if (target === '') {
       const cur = deps.cfg().agent.trim()
       return ok('Current custom agent: **' + (cur !== '' ? cur : '(default)') + '** (usage: /agy agent <name|off>)')
     }
-    if (target === 'off' || target === 'clear' || target === 'default') {
+    if (lowered === 'off' || lowered === 'clear' || lowered === 'default') {
       deps.setOverride('agent', '')
       return ok('Custom agent cleared (back to default agy agent) — effective next turn.')
     }
@@ -51,11 +54,12 @@ export function handleConfig(deps: CommandDeps, ctx: CommandContext): CommandRes
   if (sub === 'settings') {
     const rawVal = (raw ?? '').trim().replace(/^(?:\/agy\s+)?settings\s*/i, '').trim()
     const target = rawVal !== '' ? rawVal : arg
-    if (target === '' || target === 'show') {
+    const lowered = target.toLowerCase()
+    if (target === '' || lowered === 'show') {
       const cur = deps.cfg().agySettings.trim()
       return ok('Current `--settings` override: ' + (cur !== '' ? '`' + cur + '`' : '*(none)*'))
     }
-    if (target === 'off' || target === 'clear') {
+    if (lowered === 'off' || lowered === 'clear') {
       deps.setOverride('agySettings', '')
       return ok('Cleared `--settings` override.')
     }
@@ -75,7 +79,8 @@ export function handleConfig(deps: CommandDeps, ctx: CommandContext): CommandRes
 
   if (sub === 'transport') {
     const cur = deps.cfg().transport
-    if (arg === '' || arg === 'status') {
+    const lowered = arg.toLowerCase()
+    if (lowered === '' || lowered === 'status') {
       const st = deps.acpStatus?.()
       const extra = st ? ` (ACP active processes: ${st.activeProcesses}, sessions: ${st.sessions})` : ''
       return ok(`Current transport: **${cur}**${extra} (usage: /agy transport <cli|acp>)`)
@@ -86,6 +91,23 @@ export function handleConfig(deps: CommandDeps, ctx: CommandContext): CommandRes
     }
     deps.setOverride('transport', mode)
     return ok(`Transport set to **${mode}** — effective next turn.`)
+  }
+
+  if (sub === 'wakeup') {
+    const cur = deps.cfg().backgroundWakeup
+    if (arg === '' || arg === 'status') {
+      const st = deps.backgroundStatus?.()
+      const extra = st
+        ? ` (watches: ${st.activeWatches}, timers: ${st.pendingTimers}, tasks: ${st.pendingTasks})`
+        : ''
+      return ok(`Cross-turn background wakeup: **${cur ? 'on' : 'off'}**${extra} (usage: /agy wakeup <on|off|status>)`)
+    }
+    const val = arg.toLowerCase()
+    if (val !== 'on' && val !== 'off') {
+      return err('usage: /agy wakeup <on|off|status>')
+    }
+    deps.setOverride('backgroundWakeup', val === 'on')
+    return ok(`Cross-turn background wakeup set to **${val}**.`)
   }
 
   if (sub === 'effort') {
@@ -100,6 +122,22 @@ export function handleConfig(deps: CommandDeps, ctx: CommandContext): CommandRes
     deps.setOverride('defaultEffort', normalized === 'default' ? '' : normalized)
     deps.notifyPicker?.()
     return ok('Default effort set to **' + (normalized === 'default' ? 'model default' : normalized) + '**.')
+  }
+
+  if (sub === 'quota-poll' || sub === 'quota-interval') {
+    const curMin = Math.round(deps.cfg().quotaPollIntervalMs / 60_000)
+    if (arg === '') {
+      return ok(
+        `后台配额全量扫描间隔：**${curMin} 分钟**（用法：/agy config quota-poll <分钟>）\n` +
+          '注意：正在使用的账号在一轮结束后会**单独立即刷新**（节流 5 分钟），所以这个间隔只决定"全量扫描"的频率，不等于你看到的数据新鲜度上限。',
+      )
+    }
+    const minutes = Number(arg)
+    if (!Number.isFinite(minutes) || !Number.isInteger(minutes) || minutes < 1 || minutes > 1440) {
+      return err('usage: /agy config quota-poll <1-1440>')
+    }
+    deps.setOverride('quotaPollIntervalMs', minutes * 60_000)
+    return ok(`后台配额全量扫描间隔设为 **${minutes} 分钟** — 下一个定时周期生效。`)
   }
 
   if (sub === 'dispatch' || sub === 'dispatch-retries') {
@@ -119,11 +157,12 @@ export function handleConfig(deps: CommandDeps, ctx: CommandContext): CommandRes
       return ok(lines.join('\n'))
     }
     if (sub === 'dispatch') {
-      if (arg === 'off' || arg === '0') {
+      const val = arg.toLowerCase()
+      if (val === 'off' || val === '0') {
         deps.setOverride('dispatchTimeoutMinutes', 0)
         return ok('派发硬超时已关闭：排队将无限等待（仍然 Stop 可停、轮询自愈、心跳可见）。')
       }
-      const minutes = Number(arg)
+      const minutes = Number(val)
       if (!Number.isFinite(minutes) || minutes <= 0 || !Number.isInteger(minutes)) {
         return err('usage: /agy dispatch <分钟数|off>')
       }
@@ -142,10 +181,15 @@ export function handleConfig(deps: CommandDeps, ctx: CommandContext): CommandRes
   }
 
   if (sub === 'parallel') {
-    if (arg !== 'on' && arg !== 'off') {
+    const val = arg.toLowerCase()
+    if (val === '') {
+      const on = deps.cfg().parallelSameAccount
+      return ok(`同账号并行当前状态：**${on ? 'on（开启）' : 'off（关闭）'}**（用法：/agy parallel <on|off>）`)
+    }
+    if (val !== 'on' && val !== 'off') {
       return err('usage: /agy parallel <on|off>')
     }
-    const on = arg === 'on'
+    const on = val === 'on'
     deps.setOverride('parallelSameAccount', on)
     return ok(
       on
@@ -155,11 +199,16 @@ export function handleConfig(deps: CommandDeps, ctx: CommandContext): CommandRes
   }
 
   if (sub === 'max-concurrent') {
-    if (arg === 'off' || arg === '0') {
+    const val = arg.toLowerCase()
+    if (val === '') {
+      const cur = deps.cfg().maxConcurrent
+      return ok(`当前并发上限：**${cur > 0 ? `${cur} 个请求流` : 'off（不限制，原生并发）'}**（用法：/agy max-concurrent <1-64|off>）`)
+    }
+    if (val === 'off' || val === '0') {
       deps.setOverride('maxConcurrent', 0)
       return ok('并发上限已移除：**不限制**（原生 agy 并发，Google 速率与账号冷却为天然调节）— 下一个回合生效。')
     }
-    const n = Number(arg)
+    const n = Number(val)
     if (!Number.isFinite(n) || !Number.isInteger(n) || n < 1 || n > 64) {
       return err('usage: /agy max-concurrent <1-64|off>')
     }
@@ -169,9 +218,10 @@ export function handleConfig(deps: CommandDeps, ctx: CommandContext): CommandRes
 
   if (sub === 'workspace') {
     const rawPath = (raw ?? '').trim().replace(/^(?:\/agy\s+)?workspace\s*/i, '').trim()
-    const target = rawPath !== '' ? rawPath : arg
+    const target = (rawPath !== '' ? rawPath : arg).replace(/^(['"])(.*)\1$/, '$2').trim()
+    const lowered = target.toLowerCase()
     if (target === '') return ok('Current workspace: ' + (deps.cfg().workspaceRoot !== '' ? deps.cfg().workspaceRoot : '(session cwd / process cwd)'))
-    if (target === 'default' || target === 'clear') {
+    if (lowered === 'default' || lowered === 'clear') {
       deps.setOverride('workspaceRoot', '')
       return ok('Workspace reset to session cwd / process cwd.')
     }

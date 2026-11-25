@@ -26,6 +26,7 @@ function cjkLiterals(rel: string): string[] {
 
 const LOCALIZED = [
   'src/client/toolview/question-card.ts',
+  'src/client/toolview/checklist-card.ts',
   'src/client/toolview/extended-cards.ts',
   'src/client/toolview/image-card.ts',
   'src/client/mermaid-render.ts',
@@ -64,6 +65,7 @@ test('issue #153: every locale defines the new module keys', () => {
     'embed.collapse', 'embed.expand', 'embed.source',
     'file.openedInSidebar', 'file.openFailed', 'file.notFound',
     'lightbox.zoomIn', 'lightbox.close', 'lightbox.loading', 'lightbox.copyPath',
+    'lightbox.copyImage', 'lightbox.copyImageChip', 'lightbox.imageCopied', 'lightbox.copyImageFailed',
     'mermaid.viewSource', 'mermaid.parseFailed',
     'compaction.contextCompacted',
     'question.insert', 'question.recorded',

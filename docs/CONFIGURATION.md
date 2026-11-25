@@ -17,7 +17,7 @@ Resolution order (highest first): `DSH_AGY_*` environment variable → runtime o
 | `sandbox` | `DSH_AGY_SANDBOX` | `false` | Run `agy` with OS terminal sandboxing (`--sandbox`) |
 | `agent` | `DSH_AGY_AGENT` | `''` (agy default) | Default custom Markdown agent name (`--agent`) |
 | `agySettings` | `DSH_AGY_SETTINGS` | `''` | Inline JSON object or file path passed to `agy --settings` |
-| `transport` | `DSH_AGY_TRANSPORT` | `cli` | `cli` (short-lived `-p`) or `acp` (persistent `agy acp` stdio session pool with automatic pre-stream CLI fallback) |
+| `transport` | `DSH_AGY_TRANSPORT` | `acp` | `acp` (default) keeps one persistent `agy acp` process per account and session, so background commands, subagents and timers keep running after a turn ends and report back on their own, and per-call usage/cache metrics stay accurate. `cli` runs one-shot `agy -p` per turn (background work dies with the process); switch with `/agy config transport cli`, `/agy transport cli` or the settings page. A pre-stream ACP failure and a no-output ACP turn fall back to `cli` automatically |
 | `syncAccountCustomizations` | `DSH_AGY_SYNC_CUSTOMIZATIONS` | `true` | Mirror primary `plugins`, `skills`, `rules`, `agents`, and MCP config into isolated pool accounts (credentials/keychains never touched) |
 | `workspaceRoot` | `DSH_AGY_WORKSPACE_ROOT` | `''` (session cwd) | Workspace root passed to agy |
 
@@ -41,6 +41,11 @@ Resolution order (highest first): `DSH_AGY_*` environment variable → runtime o
 | `timeoutMs` | `DSH_AGY_TIMEOUT_MS` | `600000` | Activity watchdog timeout per turn |
 | `maxTurnMinutes` | `DSH_AGY_MAX_TURN_MINUTES` | `0` | Hard wall-clock cap per turn (0 = unlimited); bounds a self-driving turn that never goes idle |
 | `longToolIdleMinutes` | `DSH_AGY_LONG_TOOL_IDLE_MINUTES` | `240` | Idle budget while a tool step is open; `0` keeps `timeoutMs` so wedged tools fail fast |
+| `idleGraceMinutes` | `DSH_AGY_IDLE_GRACE_MINUTES` | `10` | Grace before the `root agent idle; waiting for N background task(s)` reaper kills the agy tree; `0` disables the reaper (the activity watchdog and `maxTurnMinutes` still bound the turn) |
+| `reapOrphanMcp` | `DSH_AGY_REAP_ORPHAN_MCP` | `true` | Reap MCP servers orphaned by short-lived agy probes. agy forks every server in the MCP registry for `models` / `/usage` / `--version` and does not kill them on exit, so a pool of accounts accumulates them run after run. Only processes whose parent is already dead and that have run for more than five minutes are killed; an unparseable start time never triggers a kill. The sweep runs in the deferred maintenance pass, never on the plugin-load path |
+| `backgroundWakeup` | `DSH_AGY_BACKGROUND_WAKEUP` | `false` | Opt-in. When on, idle DSH sessions wake across turns when a one-shot `schedule` timer expires, a detached task/subagent finishes, or a persistent ACP session emits a background completion update. Enable with the settings switch, `/agy config wakeup on`, or `DSH_AGY_BACKGROUND_WAKEUP=1` |
+| `backgroundWakeupTtlMinutes` | `DSH_AGY_BACKGROUND_WAKEUP_TTL_MINUTES` | `30` | Max window (minutes, 1–240) to keep post-turn background watches and one-shot `schedule` timers alive |
+| `backgroundWakeupMaxPerSession` | `DSH_AGY_BACKGROUND_WAKEUP_MAX_PER_SESSION` | `12` | Max automatic background wakeups per session between human turns (1–100) |
 | `dispatchTimeoutMinutes` | `—` | `15` | Cap on waiting for the Windows credential slot before backing off and retrying; `0` waits indefinitely |
 | `dispatchRetries` | `—` | `1` | Extra dispatch attempts after a credential-slot timeout |
 | `parallelSameAccount` | `—` | `true` | Concurrent sessions on the credential already in the slot start without exclusivity; `false` restores full slot exclusivity |
@@ -138,6 +143,15 @@ All three entry points use the plugin's real `AgyAdapter` (`ImageService` with
 classification and the retry-on-effort-refusal all come from the same code path a
 normal turn uses. `--json` returns the validated artifact (`path`, `mime`,
 `width`, `height`, `bytes`, `aspectRatio`, `accountId`) or a stable failure `code`.
+
+## Side questions (`/btw`)
+
+| Key | Environment | Default | Description |
+| --- | --- | --- | --- |
+| `btwModel` | `DSH_AGY_BTW_MODEL` | (empty) | Antigravity model for `/btw` read-only side questions; empty → `defaultModel` → Gemini 4 Hydrogen → Gemini Flash |
+| `btwEffort` | `DSH_AGY_BTW_EFFORT` | `medium` | Reasoning effort for `/btw` (`medium` balanced, `low` faster, `high` deeper) |
+
+Both are editable in **Settings → Antigravity** (in the `/btw Side Questions` card).
 
 ## Client UI visibility (issue #105)
 

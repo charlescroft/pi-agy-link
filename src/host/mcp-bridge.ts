@@ -17,14 +17,22 @@
 //     host resolves it back to an agent.
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
-import { chmodSync, existsSync, mkdirSync, readFileSync, unlinkSync } from 'node:fs'
-import { writeFileAtomicSync } from '../common/atomic-write.ts'
+import { existsSync, mkdirSync, readFileSync } from 'node:fs'
 import { basename, dirname, join } from 'node:path'
 import { randomBytes, timingSafeEqual } from 'node:crypto'
 import { readJsonBody } from './read-json-body.ts'
+import { extractMcpContentBlocks, prepareMcpTools } from './mcp-schema.ts'
+import {
+  applySchemaDoctor,
+  BRIDGE_SERVER_KEY,
+  invalidateToolStateCaches,
+  makeRegistryRestore,
+  sanitizeShimPath,
+  writePrivateMcpFile,
+} from './mcp-registry.ts'
 import { homedir } from 'node:os'
 
-const MCP_SERVER_KEY = 'dsh-tools'
+const MCP_SERVER_KEY = BRIDGE_SERVER_KEY
 
 /**
  * Tools that must NEVER be exposed to an external MCP client. These are
@@ -203,16 +211,11 @@ export function startMcpBridge(opts: {
         const used = new Set<string>()
         // List the CALLER's surface: without a scope the whole preset-registered
         // tool set is filtered out (issue #150).
-        const tools = svc.schemas(await resolveSessionAgent(req))
+        const rawTools = svc.schemas(await resolveSessionAgent(req))
           .filter((t) => allow.length === 0 || allowSet.has(t.name))
           // internal transports / loopback-only helpers are not bridgeable
           .filter((t) => !INTERNAL_TOOL_NAMES.has(t.name))
           .map((t) => {
-            // Map the DSH name to an MCP-safe name. Distinct DSH names can
-            // normalize to the same MCP name (e.g. 'a.b' and 'a_b'); rather than
-            // silently dropping one, disambiguate with a stable suffix so every
-            // real tool stays reachable. bridge.mjs calls back by the exact
-            // dshName, so the MCP-side suffix never affects execution.
             const base = toMcpName(t.name)
             let name = base
             for (let i = 2; used.has(name); i++) name = base + '__' + i
@@ -224,6 +227,7 @@ export function startMcpBridge(opts: {
               inputSchema: { type: 'object', ...t.parameters },
             }
           })
+        const tools = prepareMcpTools(rawTools)
         sendJson(res, 200, { tools })
         return;
       }
@@ -317,7 +321,13 @@ export function startMcpBridge(opts: {
             ...(isPtc ? { parent: Symbol(callId) } : {}),
           })
           audit('ok caller=' + (agent === undefined ? 'none' : 'agent'))
-          sendJson(res, 200, { ok: true, text: resultText(settledToolResult(result, callId)) })
+          const settled = settledToolResult(result, callId)
+          const content = extractMcpContentBlocks(settled)
+          sendJson(res, 200, {
+            ok: true,
+            text: resultText(settled),
+            ...(content ? { content } : {}),
+          })
         } catch (e) {
           audit('failed: ' + String(e).slice(0, 200))
           sendJson(res, 200, { ok: false, error: String(e) })
@@ -396,15 +406,6 @@ function isPidAlive(pid: number): boolean {
   }
 }
 
-function writePrivateMcpFile(file: string, content: string): void {
-  writeFileAtomicSync(file, content, 0o600)
-  try {
-    chmodSync(file, 0o600)
-  } catch {
-    // Windows: mode bits unsupported
-  }
-}
-
 /**
  * The `mcpServers` entry that points Antigravity at our stdio bridge.
  *
@@ -435,7 +436,12 @@ export function mcpServerEntry(
 export interface BridgeRegistryState {
   bridge: McpBridge | null
   restores: Array<() => void>
+  /** Optional host logger (schema-doctor wrap decisions are worth a line). */
+  log?: (message: string) => void
 }
+
+/** Absolute path of the schema-doctor shim that ships next to the bridge. */
+export { sanitizeShimPath }
 
 const registeredFilesByBridge = new WeakMap<McpBridge, Set<string>>()
 
@@ -453,7 +459,7 @@ export function registerBridgeMcpConfig(state: BridgeRegistryState, file: string
   }
   if (files.has(file)) return
   files.add(file)
-  state.restores.push(writeMcpConfig(file, bridge))
+  state.restores.push(writeMcpConfig(file, bridge, state.log))
 }
 
 /** Restore every registered MCP config file and close the active bridge. */
@@ -468,7 +474,7 @@ export async function teardownBridgeState(state: BridgeRegistryState): Promise<v
   }
 }
 
-export function writeMcpConfig(file: string, bridge: McpBridge): () => void {
+export function writeMcpConfig(file: string, bridge: McpBridge, log?: (message: string) => void): () => void {
   const key = mcpServerKey(bridge.port)
   let previous: string | null = null
   try {
@@ -495,86 +501,40 @@ export function writeMcpConfig(file: string, bridge: McpBridge): () => void {
     if (existingKey === key || !existingKey.startsWith(MCP_SERVER_KEY + '-')) continue
     const envObj = (val as { env?: Record<string, unknown> } | null)?.env
     const rawPid = envObj?.DSH_MCP_PID
-    if (typeof rawPid === 'string' && /^\d+$/.test(rawPid) && !isPidAlive(Number(rawPid))) {
+    // Entries written before DSH_MCP_PID existed can never be proven alive, so
+    // they were never pruned and piled up (8-9 per account seen in the wild).
+    // agy waits for EVERY registered server before sending the turn, so dead
+    // bridges stall each warmup probe until `--print-timeout` with 0 tokens
+    // used, and the quota window is never activated. Treat them as stale.
+    const legacyWithoutPid = rawPid === undefined
+    const deadPid = typeof rawPid === 'string' && /^\d+$/.test(rawPid) && !isPidAlive(Number(rawPid))
+    if (legacyWithoutPid || deadPid) {
       delete servers[existingKey]
     }
   }
   servers[key] = mcpServerEntry(bridge, process.execPath, process.versions.electron !== undefined)
+  // Foreign stdio servers (godot, blender, chrome-devtools, …) are declared to
+  // Google verbatim by `agy`: ONE array without `items` fails every turn with
+  // `400 INVALID_ARGUMENT … items: missing field`, so they are routed through
+  // the schema doctor that ships next to the bridge (see mcp-registry.ts).
+  const wrappedNames = applySchemaDoctor(servers, {
+    shimScript: sanitizeShimPath(bridge.bridgeScript),
+    nodeBin: process.execPath,
+    isElectron: process.versions.electron !== undefined,
+    ...(log === undefined ? {} : { log }),
+  })
   root.mcpServers = servers
-  let written = false
   let writtenBytes = ''
   try {
     mkdirSync(dirname(file), { recursive: true })
     writtenBytes = JSON.stringify(root, null, 2) + '\n'
     writePrivateMcpFile(file, writtenBytes)
-    written = true
+    const cleared = invalidateToolStateCaches(file, wrappedNames)
+    if (cleared.length > 0) {
+      log?.('[mcp] dropped stale agy tool state for: ' + cleared.join(','))
+    }
   } catch {
     return () => {}
   }
-  return () => {
-    try {
-      // Restore only what WE wrote: after a crash + manual edit (or another
-      // process rewriting the file), blindly restoring `previous` clobbered
-      // foreign changes. When the current content no longer contains our
-      // entry, leave the file alone.
-      if (!written) return
-      let current: string | null = null
-      try {
-        if (existsSync(file)) current = readFileSync(file, 'utf8')
-      } catch {
-        current = null
-      }
-      if (current === null) return // file vanished: nothing of ours remains
-      // Another host (or the user) rewrote the shared registry since we
-      // published. Restoring our old bytes would delete their entry, so only
-      // drop the key we own and leave everything else untouched.
-      if (current !== writtenBytes) {
-        let live: Record<string, unknown> = {}
-        try {
-          const v = JSON.parse(current)
-          if (v && typeof v === 'object') live = v as Record<string, unknown>
-        } catch {
-          return // unparseable: don't touch the file
-        }
-        const liveServers = (live.mcpServers && typeof live.mcpServers === 'object' ? live.mcpServers : {}) as Record<string, unknown>
-        if (!(key in liveServers)) return
-        delete liveServers[key]
-        const emptyRegistry = Object.keys(liveServers).length === 0
-        const nothingElse = Object.keys(live).every((k) => k === 'mcpServers')
-        if (emptyRegistry && nothingElse) {
-          // Nothing but empty bookkeeping is left: don't keep a file behind.
-          try {
-            unlinkSync(file)
-          } catch {
-            /* best effort */
-          }
-          return
-        }
-        writePrivateMcpFile(file, JSON.stringify({ ...live, mcpServers: liveServers }, null, 2) + '\n')
-        return
-      }
-      let parsed: Record<string, unknown> = {}
-      try {
-        const v = JSON.parse(current)
-        if (v && typeof v === 'object') parsed = v as Record<string, unknown>
-      } catch {
-        return // unparseable: assume our entry is gone, don't touch the file
-      }
-      const curServers = (parsed.mcpServers && typeof parsed.mcpServers === 'object' ? parsed.mcpServers : {}) as Record<string, unknown>
-      if (!(key in curServers)) return
-      if (previous === null) {
-        delete curServers[key]
-        if (Object.keys(curServers).length === 0) {
-          // We created the file and no other servers remain: remove it.
-          unlinkSync(file)
-        } else {
-          writePrivateMcpFile(file, JSON.stringify({ ...parsed, mcpServers: curServers }, null, 2) + '\n')
-        }
-      } else {
-        writePrivateMcpFile(file, previous)
-      }
-    } catch {
-      /* best effort */
-    }
-  }
+  return makeRegistryRestore({ file, key, previous, writtenBytes })
 }

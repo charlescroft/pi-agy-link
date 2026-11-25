@@ -14,18 +14,15 @@ import {
 } from '../../common/types.ts'
 import { findBrainDir } from '../../runtime/agy/db/paths.ts'
 import { TaskActivityTracker } from './task-activity.ts'
+import { ParentQuotaMonitor, type SubagentQuotaExhaustedInfo } from './parent-quota.ts'
+import { attachSubagentTracker, detachSubagentTracker, SUBAGENT_LIVE_WINDOW_MS, type SubagentSnapshot, type SubagentSnapshotItem } from './live.ts'
 
-export interface SubagentQuotaExhaustedInfo {
-  source: 'subagent-transcript' | 'parent-system-message' | 'tool-step'
-  errorText: string
-  model?: string
-  resetMs?: number
-  role?: string
-  conversationId?: string
-}
+export type { SubagentQuotaExhaustedInfo }
 
 export interface SubagentTrackerOptions {
   conversationId?: string
+  /** DSH session id, so the header badge can scope this tracker's subagents. */
+  sessionKey?: string
   accountHome?: string
   /**
    * True when attaching to a resumed multi-turn conversation: pre-existing
@@ -139,6 +136,7 @@ interface TrackedSubagent {
   cursor: TranscriptCursor
   /** Lines consumed so far — the fallback step index when a row carries none. */
   lines: number
+  startedAt: number; lastAt: number; lastAction: string
 }
 
 function isActiveSubagentState(state: string | undefined): boolean {
@@ -249,16 +247,20 @@ export class SubagentTracker {
   private readonly trackedSubagents = new Map<string, TrackedSubagent>()
   private readonly seenStepKeys = new Set<string>()
   private readonly taskActivity: TaskActivityTracker
+  private readonly parentQuota = new ParentQuotaMonitor()
   private timer: NodeJS.Timeout | null = null
   private active = false
   private polling = false
   private readonly pollIntervalMs: number
   private parentCursor: TranscriptCursor = createTranscriptCursor()
+  private sessionKey: string
+  setSessionKey(key: string): void { this.sessionKey = key }
   private parentLines = 0
 
   constructor(private readonly opts: SubagentTrackerOptions) {
     this.conversationId = opts.conversationId ?? ''
     this.accountHome = opts.accountHome
+    this.sessionKey = opts.sessionKey ?? ''
     this.pollIntervalMs = opts.pollIntervalMs ?? 500
     this.taskActivity = new TaskActivityTracker(opts.log)
   }
@@ -272,6 +274,7 @@ export class SubagentTracker {
     this.parentCursor = createTranscriptCursor()
     this.parentLines = 0
     this.taskActivity.reset()
+    this.parentQuota.reset()
     if (this.active) {
       if (this.opts.resumed === true) {
         this.baselined = true
@@ -286,6 +289,7 @@ export class SubagentTracker {
   start(): void {
     if (this.active) return
     this.active = true
+    attachSubagentTracker(this.sessionKey, this)
     if (this.opts.resumed === true && !this.baselined && this.conversationId !== '') {
       this.baselined = true
       this.baselineExisting()
@@ -304,6 +308,7 @@ export class SubagentTracker {
       const parentLog = join(this.brainDir, '.system_generated', 'logs', 'transcript.jsonl')
       this.parentCursor = createTranscriptCursor(fileSizeOrZero(parentLog))
       this.taskActivity.baseline(this.brainDir)
+      this.parentQuota.baseline(this.brainDir)
       this.scanSubagentsForConv(this.conversationId, true)
       for (const cid of Array.from(this.trackedSubagents.keys())) {
         this.scanSubagentsForConv(cid, true)
@@ -320,6 +325,9 @@ export class SubagentTracker {
       }
     } finally {
       this.active = false
+      // agy keeps a finished descriptor at ALIVE, so only the round ending proves it stopped.
+      for (const s of this.trackedSubagents.values()) if (!s.terminal) { s.terminal = true; s.lastAt = Date.now(); s.lastAction = '已结束（回合结束）' }
+      detachSubagentTracker(this.sessionKey, this)
       if (this.timer) {
         clearInterval(this.timer)
         this.timer = null
@@ -344,6 +352,11 @@ export class SubagentTracker {
       if (!this.brainDir) return
 
       this.pollParentTranscript()
+      this.parentQuota.poll(this.brainDir, (hit) => {
+        const key = `parent-retry-loop-${this.conversationId}`
+        this.emitSubagentEvent(key, '[主对话] 连续触发配额限流，正在中断重试...\n', hit)
+        this.opts.onQuotaExhausted?.(hit)
+      })
       this.taskActivity.poll(this.brainDir, (ev) => {
         this.emitSubagentEvent(ev.stepKey, ev.text, ev.raw)
       })
@@ -448,6 +461,8 @@ export class SubagentTracker {
             this.pollSubagentTranscript(existing)
             existing.state = rawState
             existing.terminal = true
+            existing.lastAt = Date.now()
+            existing.lastAction = `已停止 (${rawState})`
             const stateKey = `subagent-state-${subId}-${rawState}`
             if (baselineOnly) {
               this.seenStepKeys.add(stateKey)
@@ -466,6 +481,8 @@ export class SubagentTracker {
         const active = isActiveSubagentState(rawState)
         const logPath = join(subBrainDir, '.system_generated', 'logs', 'transcript.jsonl')
         const initialOffset = baselineOnly ? fileSizeOrZero(logPath) : 0
+        // Baseline rows are history: freshness comes from the descriptor mtime.
+        const descMtime = baselineOnly ? statSync(fullPath).mtimeMs : Date.now()
         const tracked: TrackedSubagent = {
           conversationId: subId,
           role,
@@ -475,6 +492,8 @@ export class SubagentTracker {
           terminal: !active,
           cursor: createTranscriptCursor(initialOffset),
           lines: 0,
+          startedAt: descMtime, lastAt: descMtime,
+          lastAction: active ? `已启动协同专员 (${typeName})` : `未保持运行 (${rawState ?? 'unknown'})`,
         }
         this.trackedSubagents.set(subId, tracked)
 
@@ -527,6 +546,8 @@ export class SubagentTracker {
               const toolName = typeof tc?.name === 'string' ? tc.name : ''
               if (toolName === '') continue
               const msg = formatSubagentAction(sub.role, toolName, tc.args)
+              sub.lastAction = msg
+              sub.lastAt = Date.now()
               this.emitSubagentEvent(`${baseKey}-tc-${tcIdx}`, `${msg}\n`, o)
             }
           } else if (o.type === 'PLANNER_RESPONSE' && typeof o.content === 'string' && o.content.trim() !== '') {
@@ -565,5 +586,14 @@ export class SubagentTracker {
         // skip malformed line
       }
     }
+  }
+
+  snapshot(): SubagentSnapshot {
+    const items: SubagentSnapshotItem[] = [...this.trackedSubagents.values()].map((s) => ({
+      conversationId: s.conversationId, role: s.role, typeName: s.typeName,
+      ...(s.state === undefined ? {} : { state: s.state }),
+      running: !s.terminal && Date.now() - s.lastAt <= SUBAGENT_LIVE_WINDOW_MS, lastAction: s.lastAction, startedAt: s.startedAt, lastAt: s.lastAt,
+    }))
+    return { total: items.length, running: items.filter((i) => i.running).length, items }
   }
 }

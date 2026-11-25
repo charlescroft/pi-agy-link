@@ -6,6 +6,7 @@
 // two default-argument entry points were renamed to `*At` so the host facade
 // can keep the original `defaultPoolDir()` defaults without this module
 // depending on the host.
+import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tryWriteFileAtomic } from '../../common/atomic-write.ts'
@@ -13,6 +14,7 @@ import type { ManagedAccount } from '../../common/pool-types.ts'
 import { readAccountCredential } from './backup.ts'
 
 const PRIMARY_STORE_FILE = '.primary-credential.json'
+const LAST_INSTALLED_FILE = '.last-installed-fingerprint.json'
 
 // ---- token document helpers ----------------------------------------------
 
@@ -20,6 +22,12 @@ export interface CredentialDoc {
   accessToken?: string
   refreshToken?: string
   expiryMs?: number
+  /**
+   * Account identity carried by agy's own slot document (`id_token_email`).
+   * The Windows credential slot is machine-wide, so this is the only reliable
+   * way to tell WHOSE token currently sits in it without a network round-trip.
+   */
+  email?: string
 }
 
 /** Parse either agy's nested `{token:{…}}` shape or a flat `{access_token}` doc. */
@@ -52,10 +60,22 @@ export function parseCredentialDoc(raw: string | null | undefined): CredentialDo
     const parsedMs = Date.parse(rawExpiry)
     if (!Number.isNaN(parsedMs)) expiryMs = parsedMs
   }
+  // agy writes the identity it loaded the token for next to (not inside) the
+  // token object, so the outer document is consulted as well.
+  const emailOf = (): string | undefined => {
+    for (const k of ['id_token_email', 'idTokenEmail', 'email']) {
+      for (const src of [inner, outer]) {
+        const v = src[k]
+        if (typeof v === 'string' && v.trim() !== '') return v.trim()
+      }
+    }
+    return undefined
+  }
   return {
     accessToken: str('access_token', 'accessToken'),
     refreshToken: str('refresh_token', 'refreshToken'),
     expiryMs,
+    email: emailOf(),
   }
 }
 
@@ -179,6 +199,41 @@ export function writePrimaryCredentialAt(cred: PrimaryCredential, baseDir: strin
     // ignore
   }
   return writeFileAtomic(primaryStorePath(baseDir), JSON.stringify(cred, null, 2))
+}
+
+/** Irreversible SHA-256 hash of a credential grant fingerprint (safe to persist, issue #145). */
+export function hashCredentialFingerprint(raw: string | null | undefined): string | null {
+  const fp = credentialFingerprint(raw)
+  if (!fp) return null
+  return createHash('sha256').update(fp).digest('hex')
+}
+
+export function lastInstalledFingerprintPath(baseDir: string): string {
+  return join(baseDir, LAST_INSTALLED_FILE)
+}
+
+/** Read the irreversible fingerprint hash last written to the Windows slot by this plugin (#145). */
+export function readLastInstalledFingerprintAt(baseDir: string): string | null {
+  const file = lastInstalledFingerprintPath(baseDir)
+  if (!existsSync(file)) return null
+  try {
+    const parsed = JSON.parse(readFileSync(file, 'utf8')) as { hash?: unknown }
+    return typeof parsed.hash === 'string' && parsed.hash.length === 64 ? parsed.hash : null
+  } catch {
+    return null
+  }
+}
+
+/** Persist the irreversible fingerprint hash of a credential blob we just wrote to the slot (#145). */
+export function writeLastInstalledFingerprintAt(raw: string | null | undefined, baseDir: string): boolean {
+  const hash = hashCredentialFingerprint(raw)
+  if (!hash) return false
+  try {
+    mkdirSync(baseDir, { recursive: true })
+  } catch {
+    // ignore
+  }
+  return writeFileAtomic(lastInstalledFingerprintPath(baseDir), JSON.stringify({ hash, updatedAt: Date.now() }, null, 2))
 }
 
 // ---- corruption detection --------------------------------------------------

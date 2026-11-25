@@ -15,12 +15,21 @@
 // as before; thinking-only turns stay token-annotated because agy print
 // mode never streams the thoughts themselves.
 import type { LlmFailure, StreamChunk } from '@deepseek-ai/dsh-llm'
-import { isNonConsumableResultError, type AgyEvent, type RawUsage } from '../../common/types.ts'
+import { isAgyQuotaBannerLine, isNonConsumableResultError, type AgyEvent, type RawUsage } from '../../common/types.ts'
 import { type CompactionNotice, renderCompactionMarker } from '../../common/compaction.ts'
 import { type GoalContext, buildGoalCompleteToolCallBlock, buildPlanExitToolCallBlock } from '../../host/dsh-goal.ts'
 import { unwrapMcpTool } from '../../host/mirror-tool.ts'
 import { composeThinkingText } from './thoughts.ts'
-import { normalizeFileLinks, rewriteAgentEmbeds, rewriteImageMarkdown, splitPendingEmbedFragment, suffixDelta } from './text.ts'
+import {
+  normalizeFileLinks,
+  rewriteAgentEmbeds,
+  rewriteImageMarkdown,
+  splitPendingEmbedFragment,
+  splitPendingWarn,
+  stripAgyInternalNoise,
+  stripQuotaBannerLines,
+  suffixDelta,
+} from './text.ts'
 import { buildToolCallBlock } from './tool-block.ts'
 import { usageFromRaw } from './usage.ts'
 import type { ToolCallState } from './tool-calls.ts'
@@ -56,6 +65,13 @@ export interface EventMapperOptions {
   runId: string
   /** Cut spans on completed tool steps (main turns). False for auxiliary calls. */
   cutOnTool: boolean
+  /**
+   * Dynamic liveness check evaluated right before cutting a tool span.
+   * When provided and returning false (e.g. plugin disposing or `agy_tool`
+   * unregistered/restricted mid-span), the mapper suppresses tool-call cuts
+   * so DSH never fails with `Error: unknown tool "agy_tool"`.
+   */
+  canCutOnTool?: () => boolean
   /** Whether an earlier span of this run already streamed assistant text. */
   initialSawText?: boolean
   /**
@@ -69,9 +85,10 @@ export interface EventMapperOptions {
    * conversation-cumulative and must never reach DSH's token meter.
    */
   usage?: {
-    noteStepUsage(raw: RawUsage): void
+    noteStepUsage(raw: RawUsage, stepKey?: string): void
     finalUsage(resultRaw: RawUsage): RawUsage
     consumeInternalCompaction?(): CompactionNotice | undefined
+    consumeSpanUsage?(resultRaw?: RawUsage): RawUsage | null
   }
   /**
    * Resolve FULL tool args for a recorded step from the agy conversation DB
@@ -128,6 +145,7 @@ export class EventMapper {
   private finished = false
   private totalTextOutput = ''
   private pendingEmbedFrag = ''
+  private pendingWarnFrag = ''
   private readonly toolCallStates = new Map<string, ToolCallState>()
   private emittedCompactionNotice = false
 
@@ -140,14 +158,32 @@ export class EventMapper {
     return this.finished
   }
 
+  private canCutOnTool(): boolean {
+    if (!this.opts.cutOnTool) return false
+    return this.opts.canCutOnTool ? this.opts.canCutOnTool() : true
+  }
+
   private formatAssistantText(text: string): string {
+    const clean = stripAgyInternalNoise(text)
     const embedBase = this.opts.mediaBaseUrl ? this.opts.mediaBaseUrl.replace(/\/media\/?$/, '/embed') : undefined
-    const withEmbeds = rewriteAgentEmbeds(text, embedBase)
+    const withEmbeds = rewriteAgentEmbeds(clean, embedBase)
     const withImages = this.opts.mediaBaseUrl ? rewriteImageMarkdown(withEmbeds, this.opts.mediaBaseUrl) : withEmbeds
     return normalizeFileLinks(withImages)
   }
 
+  private *flushPendingWarn(dropQuotaBanner = true): Generator<StreamChunk> {
+    if (this.pendingWarnFrag === '') return
+    const raw = this.pendingWarnFrag
+    this.pendingWarnFrag = ''
+    if (dropQuotaBanner && isAgyQuotaBannerLine(raw)) return
+    this.sawTextStep = true
+    yield* this.ensureBlock('text')
+    const d = this.appendDelta(this.formatAssistantText(raw))
+    if (d) yield d
+  }
+
   private *flushPendingEmbed(): Generator<StreamChunk> {
+    yield* this.flushPendingWarn(true)
     if (this.pendingEmbedFrag === '') return
     const raw = this.pendingEmbedFrag
     this.pendingEmbedFrag = ''
@@ -266,7 +302,7 @@ export class EventMapper {
     yield* this.flushBannerOnlyThoughts()
     if (ev.kind === 'step') {
       if (ev.usage) {
-        this.opts.usage?.noteStepUsage(ev.usage)
+        this.opts.usage?.noteStepUsage(ev.usage, ev.stepKey)
         const internalCompact = this.opts.usage?.consumeInternalCompaction?.()
         if (internalCompact) {
           yield* this.ensureBlock('text')
@@ -312,27 +348,37 @@ export class EventMapper {
           this.bannerOnlyShown.add(ev.stepKey)
           yield* this.emitThinking(ev.stepKey, absIndex, thoughtTokens, true)
         }
-        this.sawTextStep = true
-        yield* this.ensureBlock('text')
         let d: StreamChunk | null = null
         if (ev.fragment === true) {
-          // Sequential fragment (text_delta): hold incomplete <agent-embed> across chunk boundaries.
-          const combined = this.pendingEmbedFrag + ev.text
-          const { ready, pending } = splitPendingEmbedFragment(combined)
-          this.pendingEmbedFrag = pending
-          if (ready !== '') {
-            const processedText = this.formatAssistantText(ready)
-            const acc = (this.emittedByKey.get(ev.stepKey) ?? '') + processedText
-            this.emittedByKey.set(ev.stepKey, acc)
-            d = this.appendDelta(processedText)
+          // Sequential fragment (text_delta): hold incomplete `⚠` quota banners
+          // and `<agent-embed>` tags across chunk boundaries.
+          const warnSplit = splitPendingWarn(this.pendingWarnFrag + ev.text)
+          this.pendingWarnFrag = warnSplit.pending
+          const stripped = stripQuotaBannerLines(warnSplit.ready)
+          if (stripped !== '' || this.pendingEmbedFrag !== '') {
+            const embedSplit = splitPendingEmbedFragment(this.pendingEmbedFrag + stripped)
+            this.pendingEmbedFrag = embedSplit.pending
+            if (embedSplit.ready !== '') {
+              this.sawTextStep = true
+              yield* this.ensureBlock('text')
+              const processedText = this.formatAssistantText(embedSplit.ready)
+              const acc = (this.emittedByKey.get(ev.stepKey) ?? '') + processedText
+              this.emittedByKey.set(ev.stepKey, acc)
+              d = this.appendDelta(processedText)
+            }
           }
         } else {
-          // Cumulative snapshot: emit only the grown suffix.
-          const processedText = this.formatAssistantText(ev.text)
-          const prev = this.emittedByKey.get(ev.stepKey) ?? ''
-          const delta = suffixDelta(prev, processedText)
-          this.emittedByKey.set(ev.stepKey, processedText)
-          d = this.appendDelta(delta)
+          // Cumulative snapshot: emit only the grown suffix (without agy quota banners).
+          const cleaned = stripQuotaBannerLines(ev.text)
+          if (cleaned !== '') {
+            this.sawTextStep = true
+            yield* this.ensureBlock('text')
+            const processedText = this.formatAssistantText(cleaned)
+            const prev = this.emittedByKey.get(ev.stepKey) ?? ''
+            const delta = suffixDelta(prev, processedText)
+            this.emittedByKey.set(ev.stepKey, processedText)
+            d = this.appendDelta(delta)
+          }
         }
         if (d) yield d
         if (deferred) {
@@ -398,7 +444,7 @@ export class EventMapper {
           // step into the reasoning block; the completed step still cuts the
           // span with the real tool card below.
           if (
-            this.opts.cutOnTool &&
+            this.canCutOnTool() &&
             !this.finished &&
             ev.state === 'ACTIVE' &&
             !this.pendingAnnounced.has(ev.stepKey)
@@ -419,7 +465,7 @@ export class EventMapper {
         }
         if (this.announcedTools.has(ev.stepKey)) return
         this.announcedTools.add(ev.stepKey)
-        if (!this.opts.cutOnTool) return // auxiliary calls show no tool detail
+        if (!this.canCutOnTool()) return // auxiliary calls or unavailable agy_tool mirror: do not emit doomed tool-call
         yield* this.flushBannerOnlyThoughts()
         yield* this.flushPendingEmbed()
         // Cut the span: close any open block, then one tool-call block.
@@ -434,7 +480,11 @@ export class EventMapper {
           useCodeWrapper: this.opts.useCodeWrapper === true,
           blockIdx: this.blockIdx,
           toolCallStates: this.toolCallStates,
-          finalUsage: () => this.opts.usage?.finalUsage({}),
+          finalUsage: () => (
+            this.opts.usage?.consumeSpanUsage
+              ? this.opts.usage.consumeSpanUsage()
+              : this.opts.usage?.finalUsage({})
+          ),
         })
         for (const ch of block.chunks) yield ch
         this.blockIdx = block.nextBlockIdx
@@ -445,13 +495,14 @@ export class EventMapper {
       return;
     }
     // result
+    if (isNonConsumableResultError(ev.ok, ev.error, ev.response)) return
+    yield* this.flushBannerOnlyThoughts()
+    yield* this.flushPendingEmbed()
     if (!ev.ok) {
       // agy reports status=ERROR even when a usable response exists (e.g. a
       // tool timed out mid-run or network closed after generation). Keep the answer,
-      // surface the error as a reasoning annotation, and finish normally. However,
-      // hard quota / policy refusals (e.g. RESOURCE_EXHAUSTED with partial text)
-      // must stay passive here so the adapter cools down & rotates accounts.
-      if (ev.response === '' || isNonConsumableResultError(ev.ok, ev.error, ev.response)) return
+      // surface the error as a reasoning annotation, and finish normally.
+      if (ev.response === '') return
       const respText = this.formatAssistantText(ev.response)
       if (!this.sawTextStep) {
         yield* this.ensureBlock('text')
@@ -468,11 +519,14 @@ export class EventMapper {
       const d = this.appendDelta(this.formatAssistantText(ev.response))
       if (d) yield d
     }
-    yield* this.flushBannerOnlyThoughts()
-    yield* this.flushPendingEmbed()
     const close = this.closeOpen()
     if (close) yield close
-    yield { type: 'usage', usage: usageFromRaw(this.opts.usage?.finalUsage(ev.usage) ?? ev.usage) }
+    const resultUsage = this.opts.usage?.consumeSpanUsage
+      ? this.opts.usage.consumeSpanUsage(ev.usage)
+      : (this.opts.usage?.finalUsage(ev.usage) ?? ev.usage)
+    if (resultUsage !== null && resultUsage !== undefined && Object.keys(resultUsage).length > 0) {
+      yield { type: 'usage', usage: usageFromRaw(resultUsage) }
+    }
 
     // If running in a DSH goal continuation round and DSH provided the update_goal tool:
     // Emit a synthetic update_goal call to mark the goal complete and prevent infinite loop continuation rounds.
@@ -533,12 +587,13 @@ export class EventMapper {
     yield* this.flushPendingEmbed()
     const close = this.closeOpen()
     if (close) yield close
-    const tracked = this.opts.usage?.finalUsage({})
-    yield {
-      type: 'usage',
-      usage: tracked !== undefined && Object.keys(tracked).length > 0
-        ? usageFromRaw(tracked)
-        : { inputTokens: 0, outputTokens: 0 },
+    // Prefer the unconsumed span sample (#161 multi-cut accounting); fall back
+    // to the result envelope's own usage (#158). No sample means no measurement,
+    // not zero tokens: emitting 0/0 would reset the context meter on a failed turn.
+    const tracked = this.opts.usage?.consumeSpanUsage
+      ? this.opts.usage.consumeSpanUsage()
+      : this.opts.usage?.finalUsage({})
+    if (tracked !== null && tracked !== undefined && Object.keys(tracked).length > 0) {      yield { type: 'usage', usage: usageFromRaw(tracked) }
     }
     const failure: LlmFailure = {
       message,

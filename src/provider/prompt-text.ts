@@ -9,7 +9,9 @@
 import { mkdir, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import type { Message } from '@deepseek-ai/dsh-llm'
+import { AGY_LINK_NOTICE_KIND } from '../common/agy-link-source.ts'
 import { PROVIDER_ID } from '../common/types.ts'
+import { isMirrorToolNotFoundText, MIRROR_TOOL_RELOAD_NOTICE } from '../common/mirror-error.ts'
 import { stateDir } from '../common/config.ts'
 import { stripNulBytes } from '../host/runner.ts'
 import { sweepDir, mediaKindFor, type ImageRefLike, type MediaRefLike } from '../host/media.ts'
@@ -52,6 +54,19 @@ export function isToolResultMessage(m: Message): boolean {
     content.length > 0 &&
     content.every((b) => (b as UnknownBlock | undefined)?.type === 'tool-result')
   )
+}
+
+/**
+ * Source kind used by the memory plugin (dsh-mnemon) for the snapshots it
+ * injects as `role: 'user'`. Such a snapshot is not harness telemetry — it must
+ * ride along with the turn — but it must never become the turn's task text.
+ */
+const MEMORY_SNAPSHOT_SOURCE_KIND = 'dsh-mnemon'
+
+/** The message's source.kind, when it declares one. */
+function sourceKindOf(m: Message): string | undefined {
+  const kind = (m as unknown as ForeignSource).source?.kind
+  return typeof kind === 'string' ? kind : undefined
 }
 
 /** Flatten visible text, including nested tool-result payloads. */
@@ -100,6 +115,19 @@ export function isForeignAssistant(m: Message, currentConvId?: string): boolean 
  * or reminder block, causing agy to completely ignore the user's latest input
  * (e.g. session-c65a826e where 42 time samples were appended).
  */
+/** The record dsh-agy-link appends for an ACP report the agent wrote itself. */
+export const ACP_REPORT_SOURCE_KIND = 'plugin:agy-link/acp-report'
+
+/**
+ * True for the 方案 A card: agy's own post-turn narration, written into the
+ * transcript as a plugin record. It is not harness noise — it is the agent's
+ * words about work that finished after the turn — so the digest keeps it.
+ */
+export function isAcpReportMessage(m: Message): boolean {
+  const kind = (m as unknown as ForeignSource).source?.kind
+  return kind === ACP_REPORT_SOURCE_KIND
+}
+
 export function isSyntheticHarnessMessage(m: Message): boolean {
   if (isToolResultMessage(m)) return false
   const src = (m as unknown as ForeignSource).source
@@ -119,6 +147,13 @@ export function isSyntheticHarnessMessage(m: Message): boolean {
     ) {
       return true
     }
+    // An ACP report is the agent's own narration of background work that
+    // finished after the turn; dropping it would hide the outcome from a later
+    // context rebuild (session reset / CLI fallback).
+    if (kind === ACP_REPORT_SOURCE_KIND) return false
+    // dsh-agy-link's own background wake carries instruction text the model must
+    // act on, so it is never stripped as context noise.
+    if (kind === AGY_LINK_NOTICE_KIND) return false
     // Each DSH context producer names its own kind (`plugin:memory`,
     // `plugin:recall`, …) — dsh-llm has no shared catch-all `plugin` kind.
     if (kind.startsWith('plugin:')) return true
@@ -161,7 +196,15 @@ export function latestUserTaskText(messages: readonly Message[]): string {
     const m = messages[i]
     if (m === undefined) continue
     if (isSyntheticHarnessMessage(m)) continue
+    // Memory recall snapshots injected by dsh-mnemon carry role:'user' so they
+    // flow on the first turn, but they must never hijack the live task text (#158).
+    if ((m as unknown as ForeignSource).source?.kind === 'dsh-mnemon') continue
     if (isToolResultMessage(m) || m.role === 'assistant' || m.role === 'system') continue
+    // A memory-plugin snapshot arrives as role:user and is not marked
+    // synthetic, so it would otherwise displace the real task text. Skip it
+    // HERE only: isSyntheticHarnessMessage must keep it (the snapshot has to
+    // ride along with the first turn, issue #158).
+    if (sourceKindOf(m) === MEMORY_SNAPSHOT_SOURCE_KIND) continue
     if (m.role === 'user') {
       return textOf(m).trim()
     }
@@ -267,6 +310,9 @@ function collectMediaRefs(m: Message, out: MediaRefLike[]): void {
 
 function digestLabel(m: Message): string {
   if (isToolResultMessage(m)) return 'Tool result: '
+  // Label it as background narration so a later turn does not mistake it for a
+  // reply to whatever the user asked in the meantime.
+  if (isAcpReportMessage(m)) return 'Assistant (background report): '
   return m.role === 'user' ? 'User: ' : 'Assistant: '
 }
 
@@ -341,6 +387,19 @@ export function collectUnsentImageRefs(
  * stay under that with margin, and the live request must sit at the HEAD. */
 export const AGY_SINGLE_MESSAGE_MAX_BYTES = 192_000
 export const AGY_PROMPT_SAFE_BYTES = 180_000
+
+const QUOTED_AGY_SLASH_RE =
+  /(?<![A-Za-z0-9_./:\\-])\/(goal|plan|compact|schedule|browser|grill-me|teamwork|learn|boost)(?![A-Za-z0-9_/-])/gi
+
+/**
+ * Neutralize standalone agy system slash commands (e.g. `/goal`, `/plan`) inside
+ * quoted history or compaction transcripts so `agy -p` does not expand them as
+ * live commands (which arms `/goal` stop hooks or alters mode), while preserving
+ * file paths (`/plan/doc.md`, `src/goal.ts`), URLs, and hyphenated tokens (`/goal-123`).
+ */
+export function defuseQuotedSlashCommands(text: string): string {
+  return text.includes('/') ? text.replace(QUOTED_AGY_SLASH_RE, '/ $1') : text
+}
 
 export function utf8Bytes(s: string): number {
   return Buffer.byteLength(s, 'utf8')
@@ -467,10 +526,13 @@ export function buildDigest(
     const text = stripNulBytes(textOf(m))
     if (text === '') continue
     if (taskLine !== '' && !isToolResultMessage(m) && m.role === 'user' && text === taskText) continue
+    const safeText = isToolResultMessage(m) && isMirrorToolNotFoundText(text)
+      ? MIRROR_TOOL_RELOAD_NOTICE
+      : defuseQuotedSlashCommands(text)
     otherLines.push(
       isToolResultMessage(m)
-        ? capLine(digestLabel(m) + elideMiddle(text, toolLineCap))
-        : capLine(digestLabel(m) + text),
+        ? capLine(digestLabel(m) + elideMiddle(safeText, toolLineCap))
+        : capLine(digestLabel(m) + safeText),
     )
   }
 

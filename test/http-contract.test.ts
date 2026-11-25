@@ -35,6 +35,7 @@ try {
 /** The frozen route surface: kind + path, exactly as the client half polls it. */
 const EXPECTED_ROUTES: ReadonlyArray<readonly [kind: string, path: string]> = [
   ['exact', '/plugins/agy-link/status'],
+  ['exact', '/plugins/agy-link/session-view'],
   ['exact', '/plugins/agy-link/auth'],
   ['exact', '/plugins/agy-link/auth-code'],
   ['exact', '/plugins/agy-link/auth-cancel'],
@@ -69,6 +70,16 @@ const EXPECTED_ROUTES: ReadonlyArray<readonly [kind: string, path: string]> = [
   ['exact', '/plugins/agy-link/ecosystem'],
   ['exact', '/plugins/agy-link/ecosystem/sync'],
   ['exact', '/plugins/agy-link/ecosystem/plugin'],
+  ['exact', '/plugins/agy-link/btw/state'],
+  ['exact', '/plugins/agy-link/btw/stream'],
+  ['exact', '/plugins/agy-link/btw/ask'],
+  ['exact', '/plugins/agy-link/btw/cancel'],
+  ['exact', '/plugins/agy-link/btw/dismiss'],
+  ['exact', '/plugins/agy-link/btw/clear'],
+  ['exact', '/plugins/agy-link/lease'],
+  ['exact', '/plugins/agy-link/lease/acquire'],
+  ['exact', '/plugins/agy-link/lease/renew'],
+  ['exact', '/plugins/agy-link/lease/release'],
   ['prefix', '/plugins/agy-link/assets'],
 ]
 
@@ -99,6 +110,10 @@ const POST_ONLY_ROUTES = [
   '/plugins/agy-link/open',
   '/plugins/agy-link/ecosystem/sync',
   '/plugins/agy-link/ecosystem/plugin',
+  '/plugins/agy-link/btw/ask',
+  '/plugins/agy-link/btw/cancel',
+  '/plugins/agy-link/btw/dismiss',
+  '/plugins/agy-link/btw/clear',
 ] as const
 
 type FakeWebServer = {
@@ -134,6 +149,7 @@ const BASE_CONFIG: Record<string, unknown> = {
   agent: '',
   agySettings: '',
   transport: 'cli',
+  mcpBridge: false,
   imageTool: true,
   syncAccountCustomizations: true,
   workspaceRoot: '/tmp/agy-contract',
@@ -154,6 +170,8 @@ const BASE_CONFIG: Record<string, unknown> = {
   imageModel: '',
   imageEffort: '',
   imageOutputDir: '',
+  btwModel: '',
+  btwEffort: 'low',
   proxyUrl: '',
   mcpConfigScope: 'global',
   mcpConfigPath: '',
@@ -441,6 +459,7 @@ test('/status answers 200 with the client-visible shape', async () => {
     'permissionMode', 'workspaceRoot', 'defaultModel', 'defaultEffort', 'askTool', 'auth', 'poolAuth',
     'autoWarmup', 'warmupModels', 'autoTranslate', 'translateModel', 'translateEffort',
     'translateTargetLanguage', 'imageModel', 'imageEffort', 'imageOutputDir',
+    'btwModel', 'btwEffort',
     'showHeaderBadge', 'showTranslateAction', 'poolWideCatalog',
   ]) {
     assert.ok(key in body, 'status must keep field ' + key)
@@ -448,6 +467,60 @@ test('/status answers 200 with the client-visible shape', async () => {
   assert.equal(body.showHeaderBadge, true)
   assert.equal(body.showTranslateAction, true)
   assert.equal(body.poolWideCatalog, false)
+})
+
+test('/session-view answers for the family of the model this session selected', async () => {
+  const ele = {
+    id: 'acc_ele',
+    alias: 'ele',
+    email: 'ele@example.com',
+    dir: '/tmp/ele',
+    enabled: true,
+    createdAt: 1,
+    cooldowns: {},
+    quotas: { argon: { weeklyFraction: 0.58, weeklyResetTime: new Date(Date.now() + 86_400_000).toISOString(), updatedAt: Date.now() } },
+  }
+  const poolData = {
+    version: 1,
+    mode: 'sequential',
+    defaultCooldownMs: 900_000,
+    maxCooldownMs: 3_600_000,
+    activeAccountIds: { argon: 'acc_ele' },
+    resolvedActiveAccountIds: { argon: 'acc_ele' },
+    accounts: [ele],
+  }
+  const pool = {
+    getPoolData: () => poolData,
+    getAccounts: () => [ele],
+    getAccount: (id: string) => (id === 'acc_ele' ? ele : undefined),
+  }
+  // The session's own selection outranks the configured default model.
+  const sessionsSvc = () => ({
+    get: () => ({ log: [{ type: 'model/selection', data: { provider: 'antigravity', model: 'gemini-4-argon-high' } }] }),
+  })
+  const setup = () => {
+    const webServer = fakeWebServer()
+    registerRoutes(webServer, fakeServices({ pool, sessionsSvc } as never))
+    return { call: (path: string, req: unknown) => invoke(routeFor(webServer.routes, path), req) }
+  }
+
+  const captured = await setup().call('/plugins/agy-link/session-view', fakeReq('GET', '/?session=session-1'))
+  assert.equal(captured.status(), 200)
+  const body = captured.json() as Record<string, unknown>
+  assert.equal(body.family, 'argon')
+  assert.equal(body.accountId, 'acc_ele')
+  assert.equal(body.alias, 'ele')
+  assert.equal(body.percent, 58)
+  assert.equal(body.window, 'weekly')
+  assert.equal(body.model, 'gemini-4-argon-high')
+
+  // No session id: the configured default decides, and no account is invented
+  // for a family that has no pointer.
+  const fallback = await setup().call('/plugins/agy-link/session-view', fakeReq('GET'))
+  const fallbackBody = fallback.json() as Record<string, unknown>
+  assert.equal(fallbackBody.model, 'gemini-3-flash')
+  assert.equal(fallbackBody.family, 'google')
+  assert.equal(fallbackBody.accountId, null)
 })
 
 test('/status forwards an explicit UI visibility opt-out (issue #105)', async () => {
@@ -539,8 +612,9 @@ test('every POST-only route rejects GET/PUT/DELETE with 405 before touching serv
       assert.deepEqual(captured.json(), { error: 'POST only' }, path + ' ' + method)
     }
   }
-  // 24 POST-only + 11 GET/method-agnostic routes = 35 routes total.
-  assert.equal(POST_ONLY_ROUTES.length + 11, EXPECTED_ROUTES.length)
+  // POST-only + 14 GET/method-agnostic routes (incl. /btw/state & /btw/stream) + 4 lease routes (their own
+  // `{ok,code,error}` envelope; gated in test/lease-routes.test.ts).
+  assert.equal(POST_ONLY_ROUTES.length + 14 + 4, EXPECTED_ROUTES.length)
 })
 
 test('GET-style routes do not gate on method (current contract, asserted verbatim)', async (t) => {
@@ -550,6 +624,7 @@ test('GET-style routes do not gate on method (current contract, asserted verbati
   const s = setup({ hostDir: root }, {})
   const cases: Array<[string, string, number]> = [
     ['/plugins/agy-link/status', '/', 200],
+    ['/plugins/agy-link/session-view', '/?session=s', 200],
     ['/plugins/agy-link/pool', '/', 200],
     ['/plugins/agy-link/translate/pending', '/', 200],
     ['/plugins/agy-link/translate/turn', '/?session=s&turn=1', 200],
@@ -609,6 +684,10 @@ test('/config is POST-only and validates keys before writing', async () => {
   assert.equal(missingKey.status(), 400)
   assert.deepEqual(missingKey.json(), { error: 'key not settable' })
 
+  const badDisplay = await invoke(route, fakeReq('POST', '/', { key: 'translateDisplay', value: 'inline' }))
+  assert.equal(badDisplay.status(), 400)
+  assert.deepEqual(badDisplay.json(), { error: 'translateDisplay must be card or replace' })
+
   const badArray = await invoke(route, fakeReq('POST', '/', { key: 'hiddenModels', value: 'nope' }))
   assert.equal(badArray.status(), 400)
   assert.deepEqual(badArray.json(), { error: 'hiddenModels must be an array of model ids' })
@@ -642,12 +721,14 @@ test('/config is POST-only and validates keys before writing', async () => {
 
   // issue #105: both visibility switches are settable through the same guarded
   // endpoint; neither is a picker event.
-  for (const [key, value] of [['showHeaderBadge', false], ['showTranslateAction', false]] as const) {
+  for (const [key, value] of [['showHeaderBadge', false], ['showTranslateAction', false], ['translateDisplay', 'replace'], ['btwModel', 'gemini-4-hydrogen'], ['btwEffort', 'medium']] as const) {
     const res = await invoke(route, fakeReq('POST', '/', { key, value }))
     assert.equal(res.status(), 200, key + ' must be an allowed config key')
     assert.deepEqual(res.json(), { ok: true, key, value })
     assert.deepEqual(writes.at(-1), [key, value])
   }
+  const badBtwEffort = await invoke(route, fakeReq('POST', '/', { key: 'btwEffort', value: 'turbo' }))
+  assert.equal(badBtwEffort.status(), 400)
   // issue #108/#109: toggling the pool-wide catalog CHANGES the visible model
   // set, so it must announce a picker update (otherwise the cached picker
   // keeps showing the old account's models until a restart).
@@ -1942,4 +2023,23 @@ test('/config validates auto mode, sandbox, transport, agent, agySettings, image
     ['imageTool', false],
     ['syncAccountCustomizations', false],
   ])
+})
+
+test('issue #196: mcpBridge is settable through the config route (boolean only) and reported by status', async () => {
+  const writes: Array<[string, unknown]> = []
+  const s = setup({ setOverride: (k: string, v: unknown) => { writes.push([k, v]) } })
+  const route = s.route('/plugins/agy-link/config')
+
+  // It used to answer 400 "key not settable", which is why the switch was unreachable.
+  const ok = await invoke(route, fakeReq('POST', '/', { key: 'mcpBridge', value: true }))
+  assert.equal(ok.status(), 200)
+  assert.deepEqual(writes, [['mcpBridge', true]])
+
+  const bad = await invoke(route, fakeReq('POST', '/', { key: 'mcpBridge', value: 'yes' }))
+  assert.equal(bad.status(), 400)
+  assert.deepEqual(bad.json(), { error: 'mcpBridge must be a boolean' })
+
+  const status = await s.call('/plugins/agy-link/status', fakeReq('GET', '/plugins/agy-link/status'))
+  assert.equal(status.status(), 200)
+  assert.ok('mcpBridge' in (status.json() as Record<string, unknown>), 'status must expose mcpBridge so the panel can render its switch')
 })

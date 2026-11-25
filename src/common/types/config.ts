@@ -10,6 +10,9 @@ export type PermissionMode = 'skip' | 'auto' | 'plan' | 'accept-edits'
 
 export type AgyTransportMode = 'cli' | 'acp'
 
+export type WarmupWindowMode = 'weekly' | '5h' | 'both'
+export type TranslateDisplayMode = 'card' | 'replace'
+
 
 export interface PluginConfig {
   enabled: boolean
@@ -34,6 +37,14 @@ export interface PluginConfig {
   mediaMaxFileBytes: number
   defaultModel: string
   defaultEffort: string
+  /** Orchestrator Planner (upstream) model id (empty = agy default). */
+  orchestratorPlannerModel: string
+  /** Orchestrator Planner thinking effort id (empty = model/agy default). */
+  orchestratorPlannerEffort: string
+  /** Orchestrator Executor (downstream) model id (empty = agy default). */
+  orchestratorExecutorModel: string
+  /** Orchestrator Executor thinking effort id (empty = model/agy default). */
+  orchestratorExecutorEffort: string
   /** Watchdog for one full agy -p run. */
   timeoutMs: number
   /**
@@ -71,6 +82,14 @@ export interface PluginConfig {
    * exclusive only for account switches (Windows credential slot).
    */
   parallelSameAccount: boolean
+  /**
+   * Reap MCP servers orphaned by short-lived agy probes (agy forks every MCP
+   * server from the user registry for `models`/`/usage`/`--version` and does not
+   * kill them on exit). Only processes whose parent is already dead are killed.
+   */
+  reapOrphanMcp: boolean
+  /** Preserve a newer external standalone AGY sign-in in the Windows credential slot instead of overwriting it (#145). */
+  respectExternalSignIn: boolean
   maxConcurrent: number
   contextWindowDefault: number
   maxTokensDefault: number
@@ -96,6 +115,16 @@ export interface PluginConfig {
    * reviewer answer in prose instead of the required JSON object.
    */
   forwardSystemPrompt: boolean
+  /**
+   * Run pure-text auxiliary calls (session-title / compaction / translation)
+   * in a stable empty directory instead of the session workspace. agy loads
+   * the project's GEMINI.md/AGENTS.md and workspace context into every
+   * one-shot aux process (~15-20k uncached tokens each, 0% cache); a neutral
+   * cwd keeps that prefix small and cacheable across calls. Default: true.
+   */
+  auxNeutralWorkspace: boolean
+  /** Apply semantic-preserving rewrites to forwarded harness system prompts to avoid upstream prompt-fingerprint false 429 / shallow degradation (default: true). */
+  cloakSystemPrompt: boolean
   digestMaxChars: number
   /**
    * Character budget for the history digest used to seed a brand-new agy
@@ -201,6 +230,22 @@ export interface PluginConfig {
   autoWarmup: boolean
   /** Models monitored/used for auto-warmup. Defaults to the Gemini Flash + Claude lineup picks. */
   warmupModels: readonly string[]
+  /** Quota windows eligible for auto-warmup: 'weekly' (default), '5h', or 'both'. */
+  warmupWindows: WarmupWindowMode
+  /** Optional daily scheduled warmup wall-clock time (`HH:MM`, empty = event-driven/default). */
+  warmupDailyTime: string
+  /** Optional IANA timezone for `warmupDailyTime` (e.g. `Asia/Shanghai`, empty = local timezone). */
+  warmupTimezone: string
+  /** Optional fixed warmup interval in hours (0 = disabled, 1..168). */
+  warmupIntervalHours: number
+  /**
+   * Hard cap on CLI probes per warmup run (`0` = unlimited).
+   *
+   * A pool of N accounts × up to 4 model families can queue dozens of probes
+   * from one egress IP. Manual/scheduled runs stop here and report the rest as
+   * skipped instead of bursting through every account.
+   */
+  warmupMaxProbesPerRun: number
   /**
    * Auto "plain language" translation after every completed agent turn
    * (default OFF). The finished turn's final answer is sent to the translate
@@ -208,6 +253,13 @@ export interface PluginConfig {
    * session record, rendered as a labelled Gemini card under that reply.
    */
   autoTranslate: boolean
+  /**
+   * How a translated reply is shown (default `card`). `card` keeps the reply and
+   * adds the Gemini card under it; `replace` shows the translation in the
+   * reply's place, with a toggle back to the original. Display only: the
+   * session (and so the model's own context) always keeps the original text.
+   */
+  translateDisplay: TranslateDisplayMode
   /** Model used for translation (default: the preferred Gemini Flash; falls back through the live catalog). */
   translateModel: string
   /**
@@ -266,6 +318,26 @@ export interface PluginConfig {
   imageOutputDir: string
   /** Extra attempts after a retryable image failure (default 1). */
   imageRetries: number
+  // ---- `/btw` side questions ----
+  /** Model used for `/btw` side questions (`''` = auto: `defaultModel` → Gemini 4 Hydrogen → Gemini Flash). */
+  btwModel: string
+  /** Reasoning effort for `/btw` side questions (default `'medium'` for balanced quality and speed). */
+  btwEffort: string
+  /**
+   * Wake idle DSH sessions across turns when an agy `schedule` timer,
+   * detached background task/subagent, or persistent ACP update finishes
+   * after the turn ends.
+   *
+   * Opt-in (default false): a session that speaks on its own after the turn is
+   * a behaviour change no existing install asked for. Turn it on in Settings →
+   * Runtime controls, with `/agy config wakeup on`, or with
+   * `DSH_AGY_BACKGROUND_WAKEUP=1`.
+   */
+  backgroundWakeup: boolean
+  /** Max lifetime (minutes) to retain post-turn background watches/timers (default 30). */
+  backgroundWakeupTtlMinutes: number
+  /** Max automatic background wakeups per session between real human turns (default 12). */
+  backgroundWakeupMaxPerSession: number
 }
 
 // The offline/signed-out lineup lives in `common/model-lineup.ts` — the single
@@ -283,7 +355,14 @@ export function defaultConfig(): PluginConfig {
     sandbox: false,
     agent: '',
     agySettings: '',
-    transport: 'cli',
+    // ACP is the default transport: the persistent `agy acp` channel keeps one
+    // process per account/session so background commands, subagents, timers and
+    // the cross-turn wake path survive the end of a turn, and it reports real
+    // per-call usage (#158). A pre-stream failure still falls back to the
+    // one-shot `-p` CLI automatically, so nothing is lost when ACP cannot start.
+    // Opt back into the CLI with `DSH_AGY_TRANSPORT=cli`,
+    // `/agy config transport cli` or the settings page.
+    transport: 'acp',
     imageTool: true,
     syncAccountCustomizations: true,
     mediaMaxFileBytes: 20 * 1024 * 1024,
@@ -291,6 +370,10 @@ export function defaultConfig(): PluginConfig {
     // Explicit 'high' (not ''): effort-capable models default to the highest
     // agy offers, and the per-model choice now lives in DSH's model menu.
     defaultEffort: 'high',
+    orchestratorPlannerModel: '',
+    orchestratorPlannerEffort: '',
+    orchestratorExecutorModel: '',
+    orchestratorExecutorEffort: '',
     timeoutMs: 600_000,
     longToolIdleMinutes: 240,
     maxTurnMinutes: 0,
@@ -313,6 +396,8 @@ export function defaultConfig(): PluginConfig {
      * false restores full-run slot exclusivity (one agy process at a time).
      */
     parallelSameAccount: true,
+    reapOrphanMcp: true,
+    respectExternalSignIn: false,
     /**
      * Cross-session cap on concurrent agy request streams. 0 = UNLIMITED
      * (default): native agy concurrency — agy is a stateless CLI and runs
@@ -327,6 +412,8 @@ export function defaultConfig(): PluginConfig {
     modelApiMaxRetries: 3,
     slimPromptRules: true,
     forwardSystemPrompt: false,
+    auxNeutralWorkspace: true,
+    cloakSystemPrompt: true,
     digestMaxChars: 8_000,
     contextTransferMaxChars: 660_000,
     contextTransferMaxBytes: 150_000,
@@ -364,9 +451,16 @@ export function defaultConfig(): PluginConfig {
     // explicitly with `autoWarmup: true` / DSH_AGY_AUTO_WARMUP=1.
     autoWarmup: false,
     warmupModels: [PREFERRED_GEMINI_FLASH, PREFERRED_CLAUDE],
+    warmupWindows: 'weekly',
+    warmupDailyTime: '',
+    warmupTimezone: '',
+    warmupIntervalHours: 0,
+    // Bounded by default so one click cannot probe an entire large pool.
+    warmupMaxProbesPerRun: 12,
     // Translation is strictly opt-in: it spends quota on every completed
     // turn, so the default must never silently start billing a user.
     autoTranslate: false,
+    translateDisplay: 'card',
     translateModel: PREFERRED_GEMINI_FLASH,
     // Default to 'low': real agy measurements give ~12s cold / ~4-9s warm at low
     // vs ~33s at medium and ~45s at high, and plain-language rewriting needs
@@ -389,5 +483,10 @@ export function defaultConfig(): PluginConfig {
     imageMaxBytes: 20 * 1024 * 1024,
     imageOutputDir: '',
     imageRetries: 1,
+    btwModel: '',
+    btwEffort: 'medium',
+    backgroundWakeup: false,
+    backgroundWakeupTtlMinutes: 30,
+    backgroundWakeupMaxPerSession: 12,
   }
 }

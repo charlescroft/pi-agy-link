@@ -8,14 +8,20 @@
 import { existsSync, mkdirSync, readdirSync, renameSync, rmSync } from 'node:fs'
 import { isAbsolute, join, relative } from 'node:path'
 import {
-  AUTH_CONFIRM_STRIKES,
+  argonSharesGoogleGroup,
+  effectiveFamilyCooldown,
   isTerminalAuthError,
+  sharedArgonPeerFamily,
+  type AccountPlanTier,
   type AccountPoolData,
   type ManagedAccount,
   type ModelFamily,
 } from '../../common/pool-types.ts'
-import { parseResetDurationMs } from '../../common/types.ts'
+import { normalizeModelFamily } from '../../common/quota-bench.ts'
+import { applyModelFailure, clearModelCooldown, cooldownUntilFor, dropLegacyModelScopedFamilyCooldowns } from './model-cooldown.ts'
+import { isModelScopedQuotaFailure, parseResetDurationMs } from '../../common/types.ts'
 import { isAccountEligible, orderByExpiry, type DedicatedGroupSource } from './selection.ts'
+import { AccountAuthFlags } from './auth-state.ts'
 
 /** State and capabilities AccountPoolManager lends to PoolAdmin. */
 export interface PoolAdminDeps {
@@ -37,10 +43,21 @@ export interface PoolAdminDeps {
 }
 
 export class PoolAdmin {
-  constructor(private readonly deps: PoolAdminDeps) {}
+  /** 需重新登录 flag lifecycle (mark / confirm / clear / heal / back-off). */
+  private readonly authFlags: AccountAuthFlags
+
+  constructor(private readonly deps: PoolAdminDeps) {
+    this.authFlags = new AccountAuthFlags(this.deps)
+  }
 
   private account(id: string): ManagedAccount | undefined {
     return this.deps.getData().accounts.find((a) => a.id === id)
+  }
+
+  private canSyncSharedPeer(data: AccountPoolData, acc: ManagedAccount | undefined, fam: ModelFamily): ModelFamily | undefined {
+    const peer = sharedArgonPeerFamily(acc, fam)
+    if (!peer) return undefined
+    return peer === 'argon' && data.activeAccountIds?.argon && this.account(data.activeAccountIds.argon)?.quotas?.argon ? undefined : peer
   }
 
   /**
@@ -205,6 +222,35 @@ export class PoolAdmin {
     return true
   }
 
+  setAccountPlanTier(id: string, tier: AccountPlanTier | undefined): boolean {
+    const acc = this.account(id)
+    if (!acc) return false
+    if (acc.planTier === tier) return true
+    if (tier === undefined || tier === 'unknown') delete acc.planTier
+    else acc.planTier = tier
+    this.deps.persist()
+    return true
+  }
+
+  /**
+   * Pin (or clear) the subscription tier the user states for this account.
+   *
+   * The inference can only prove `free` / `pro` / `enterprise`; Ultra has no
+   * provable signal in the quota data, so this override is the single honest
+   * path to show it — and it must not be clobbered by the hourly refresh, hence
+   * a field of its own instead of `planTier`.
+   */
+  setPlanTierOverride(id: string, tier: AccountPlanTier | undefined): boolean {
+    const acc = this.account(id)
+    if (!acc) return false
+    const next = tier === 'unknown' ? undefined : tier
+    if (acc.planTierOverride === next) return true
+    if (next === undefined) delete acc.planTierOverride
+    else acc.planTierOverride = next
+    this.deps.persist()
+    return true
+  }
+
   setAccountEnabled(id: string, enabled: boolean): boolean {
     const data = this.deps.getData()
     const acc = this.account(id)
@@ -225,20 +271,35 @@ export class PoolAdmin {
   }
 
   /**
-   * Record the account a run actually spawned with. The console derives its
-   * single "in use" badge from this; exactly one account runs agy at a time.
+   * Record the account a run ACTUALLY used, scoped to its model family.
+   *
+   * Family-scoped on purpose: the console's per-family "当前使用" badge must
+   * describe reality, and an Argon turn on account X must not rewrite the
+   * Gemini pointer (or the global `lastActiveAccountId`). Before this, an
+   * unpinned family showed a *predicted* account as "in use" while the live
+   * session ran somewhere else (reported 2026-11-23: Argon row claimed the
+   * primary while the header showed the account really serving the turn).
+   * Deliberately does NOT stamp `manualPinAtByFamily` — runtime use is not a
+   * user pin, so an explicit pin still wins the tie-break in stickyAccount().
    */
-  markAccountActive(id: string): void {
+  markAccountActive(id: string, family: ModelFamily = 'google'): void {
     const data = this.deps.getData()
-    if (data.lastActiveAccountId === id) return
-    data.lastActiveAccountId = id
+    if (!data.activeAccountIds) data.activeAccountIds = {}
+    const peer = this.canSyncSharedPeer(data, this.account(id), family)
+    const updatesGoogle = family === 'google' || peer === 'google'
+    const familySame = data.activeAccountIds[family] === id
+    const peerSame = !peer || data.activeAccountIds[peer] === id
+    const lastSame = !updatesGoogle || data.lastActiveAccountId === id
+    if (familySame && peerSame && lastSame) return
+    data.activeAccountIds[family] = id
+    if (peer) data.activeAccountIds[peer] = id
+    if (updatesGoogle || !data.lastActiveAccountId) data.lastActiveAccountId = id
     this.deps.persist()
   }
 
   /**
    * Manually pin the active slot for one family (console per-family "设为当前").
-   * Strictly family-scoped: pinning one family never mutates or clears another
-   * family's active slot or session stickiness.
+   * Family-scoped except when Argon shares the Gemini Models bucket (links `google` <-> `argon`).
    */
   setActiveAccount(id: string, family: ModelFamily = 'google'): boolean {
     const data = this.deps.getData()
@@ -249,55 +310,23 @@ export class PoolAdmin {
     data.activeAccountIds[family] = id
     if (!data.manualPinAtByFamily) data.manualPinAtByFamily = {}
     data.manualPinAtByFamily[family] = now
-    if (family === 'google' || !data.lastActiveAccountId) {
-      data.lastActiveAccountId = id
+    const peer = this.canSyncSharedPeer(data, acc, family)
+    if (peer && isAccountEligible(acc, peer, now, this.deps.pool)) {
+      data.activeAccountIds[peer] = id
+      data.manualPinAtByFamily[peer] = now
     }
+    if (family === 'google' || peer === 'google' || !data.lastActiveAccountId) data.lastActiveAccountId = id
     this.deps.persist()
     return true
   }
 
   markAuthRequired(id: string, reason?: string): void {
-    const data = this.deps.getData()
-    const acc = this.account(id)
-    if (!acc) return
-    acc.authRequired = true
-    acc.authMarkedAt = Date.now()
-    acc.authError = reason || 'Authentication expired or revoked (invalid_grant)'
-    if (data.lastActiveAccountId === id) {
-      data.lastActiveAccountId = undefined
-    }
-    if (data.activeAccountIds) {
-      for (const [fam, accId] of Object.entries(data.activeAccountIds)) {
-        if (accId === id) delete data.activeAccountIds[fam as ModelFamily]
-      }
-    }
-    this.deps.authStrikes.delete(id)
-    this.deps.persist()
+    this.authFlags.mark(id, reason)
   }
 
-  /**
-   * Confirmation-gated quarantine for auth-classified failures that carry NO
-   * authoritative evidence (no invalid_grant / revoked / unauthorized_client).
-   *
-   * agy prints the same "not signed in" banner whether the login is really
-   * dead or its keyring validation merely missed a 10s window on a flaky
-   * network, so one banner used to sticky-quarantine healthy accounts — the
-   * user then saw a red 需重新登录 and could not even 设为当前使用. A single
-   * strike now only rotates the account away for the current retry; the flag
-   * hardens into a real quarantine only when the failure repeats with no
-   * success in between. Authoritative OAuth paths keep calling
-   * markAuthRequired directly and quarantine on first sight.
-   *
-   * Returns true when the account is now hard-quarantined.
-   */
+  /** Confirmation-gated quarantine for a non-authoritative auth banner (2 strikes). */
   noteAuthFailure(id: string, reason?: string): boolean {
-    const strikes = (this.deps.authStrikes.get(id) ?? 0) + 1
-    if (strikes < AUTH_CONFIRM_STRIKES) {
-      this.deps.authStrikes.set(id, strikes)
-      return false
-    }
-    this.markAuthRequired(id, reason)
-    return true
+    return this.authFlags.noteFailure(id, reason)
   }
 
   /**
@@ -306,36 +335,39 @@ export class PoolAdmin {
    * must not leak onto the new one. Resets everything email-bound while
    * keeping slot config (alias, dir, proxy, enabled).
    */
-  resetAccountIdentity(id: string, newEmail: string): void {
+  resetAccountIdentity(id: string, newEmail: string, resetAlias = false): void {
     const acc = this.account(id)
     if (!acc) return
     acc.email = newEmail
     acc.cooldowns = {}
     acc.quotas = {}
+    delete acc.dedicatedGroups
+    delete acc.planTier
+    delete acc.quotaUnavailable
     delete acc.authRequired
     delete acc.authError
     delete acc.authMarkedAt
+    delete acc.authReverifyAttempts
+    if (resetAlias && acc.systemHome) {
+      acc.alias = 'Primary account (system sign-in)'
+      acc.defaultAlias = true
+    }
     this.deps.persist()
   }
 
-  /**
-   * Drop the "needs re-login" flag.
-   *
-   * Automatic paths (a successful quota/token refresh, boot-time credential
-   * recovery) must NOT lift a TERMINAL TOS ban: those accounts still have a
-   * valid refresh token, so every refresh would succeed and clear the ban
-   * (issue #114). `force` is reserved for explicit user actions — a completed
-   * re-login or a fresh credential import.
-   */
+  /** Drop the flag (automatic paths never lift a terminal TOS ban; force = user action). */
   clearAuthRequired(id: string, force = false): void {
-    const acc = this.account(id)
-    if (!acc) return
-    if (!force && isTerminalAuthError(acc.authError)) return
-    delete acc.authRequired
-    delete acc.authError
-    delete acc.authMarkedAt
-    this.deps.authStrikes.delete(id)
-    this.deps.persist()
+    this.authFlags.clear(id, force)
+  }
+
+  /** Count one failed background re-verification (drives the 2m→30m back-off). */
+  noteAuthReverifyAttempt(id: string): void {
+    this.authFlags.noteReverifyAttempt(id)
+  }
+
+  /** Clear flags that a NEWER quota snapshot already disproved (zero network). */
+  healAuthFlagsFromQuota(): string[] {
+    return this.authFlags.healFromQuota()
   }
 
   /**
@@ -406,6 +438,70 @@ export class PoolAdmin {
   }
 
   /**
+   * Drop cooldowns that were recorded from a MODEL-scoped refusal
+   * (`... exhausted your capacity on this model ...`). Such a cooldown never
+   * should have removed the account from rotation for the whole family: the
+   * other models still have quota. Runs once at pool init so an account frozen
+   * by the old classifier rejoins rotation immediately.
+   */
+  dropModelScopedCooldowns(): number {
+    const dropped = dropLegacyModelScopedFamilyCooldowns(this.deps.getData().accounts)
+    if (dropped > 0) this.deps.persist()
+    return dropped
+  }
+
+  /** Clear cooldowns (family-level, and every model bucket of that account). */
+  clearCooldown(id?: string, family?: ModelFamily, includeQuotaBench = false): void {
+    const now = Date.now()
+    const targetFamily = family ? (normalizeModelFamily(family) ?? family) : undefined
+    const clearOne = (acc: ManagedAccount): void => {
+      acc.cooldowns ??= {}
+      const sharedArgon = argonSharesGoogleGroup(acc)
+      if (targetFamily) {
+        delete acc.cooldowns[targetFamily]
+        if (targetFamily === 'google' && !acc.quotas?.argon) delete acc.cooldowns.argon
+        if (targetFamily === 'argon' && includeQuotaBench && sharedArgon) delete acc.cooldowns.google
+      } else {
+        acc.cooldowns = {}
+      }
+      acc.modelCooldowns = {} // same user action: release paused model buckets too
+      if (!includeQuotaBench) return
+      const families: ModelFamily[] = targetFamily
+        ? ((targetFamily === 'google' && !acc.quotas?.argon) || (targetFamily === 'argon' && sharedArgon) ? ['google', 'argon'] : [targetFamily])
+        : [...new Set([...(Object.keys(acc.quotas ?? {}) as ModelFamily[]), ...(sharedArgon ? (['argon'] as ModelFamily[]) : [])])]
+      if (families.length === 0) return
+      acc.quotaGateClearedAt ??= {}
+      for (const fam of families) {
+        const updatedAt = acc.quotas?.[fam]?.updatedAt ?? (fam === 'argon' ? acc.quotas?.google?.updatedAt : undefined)
+        acc.quotaGateClearedAt[fam] = Math.max(now, updatedAt ?? 0)
+      }
+    }
+    if (id) {
+      const acc = this.account(id)
+      if (!acc) return
+      clearOne(acc)
+    } else {
+      for (const acc of this.deps.getData().accounts) clearOne(acc)
+    }
+    this.deps.persist()
+  }
+
+  /** Record a 429 that belongs to ONE model's own bucket (never the family). */
+  recordModelFailure(id: string, model: string, reason: string, serverResetTime?: string): void {
+    const acc = this.account(id)
+    const data = this.deps.getData()
+    if (!acc) return
+    applyModelFailure(acc, model, reason, serverResetTime, data)
+    this.deps.persist()
+  }
+
+  /** Clear one model's cooldown after a successful call on it. */
+  recordModelSuccess(id: string, model: string): void {
+    const acc = this.account(id)
+    if (acc && clearModelCooldown(acc, model)) this.deps.persist()
+  }
+
+  /**
    * Records a rate-limit / 429 error and sets cooldown for the requested model family.
    */
   recordFailure(id: string, family: ModelFamily, reason: string, serverResetTime?: string): void {
@@ -413,38 +509,19 @@ export class PoolAdmin {
     const acc = this.account(id)
     if (!acc) return
     acc.cooldowns ??= {}
-
-    const prev = acc.cooldowns[family]
+    const prev = effectiveFamilyCooldown(acc, family)
     const failures = (prev?.consecutiveFailures ?? 0) + 1
-
-    let cooldownUntil: number
-    const parsedDuration = parseResetDurationMs(serverResetTime || reason)
-
-    if (serverResetTime && !parsedDuration) {
-      const parsed = Date.parse(serverResetTime)
-      if (!Number.isNaN(parsed) && parsed > Date.now()) {
-        cooldownUntil = parsed + 10_000 // 10s safety buffer
-      } else {
-        cooldownUntil = Date.now() + Math.min(data.defaultCooldownMs * failures, data.maxCooldownMs)
-      }
-    } else if (parsedDuration && parsedDuration > 0) {
-      // Add a 10s safety buffer to avoid hitting Google at the exact millisecond of reset
-      cooldownUntil = Date.now() + parsedDuration + 10_000
-    } else {
-      cooldownUntil = Date.now() + Math.min(data.defaultCooldownMs * failures, data.maxCooldownMs)
+    const entry = { cooldownUntil: cooldownUntilFor(data, failures, reason, serverResetTime), reason, consecutiveFailures: failures }
+    acc.cooldowns[family] = entry
+    const peer = sharedArgonPeerFamily(acc, family)
+    if (peer) acc.cooldowns[peer] = { ...entry }
+    // Only advance if this account currently owns the family pointer (or fallback lastActiveAccountId).
+    const owns = (fam: ModelFamily): boolean => {
+      const p = data.activeAccountIds?.[fam]
+      return p === id || (p === undefined && (data.lastActiveAccountId === id || data.lastActiveAccountId === undefined))
     }
-
-    acc.cooldowns[family] = {
-      cooldownUntil,
-      reason,
-      consecutiveFailures: failures,
-    }
-    // Only advance if this account currently owns this specific family pointer
-    // (or if this family has no pin yet and it is the fallback lastActiveAccountId).
-    const famPinned = data.activeAccountIds?.[family]
-    if (famPinned === id || (famPinned === undefined && (data.lastActiveAccountId === id || data.lastActiveAccountId === undefined))) {
-      this.advanceAccount(id, family)
-    }
+    if (owns(family)) this.advanceAccount(id, family)
+    if (peer && owns(peer)) this.advanceAccount(id, peer)
     this.deps.persist()
   }
 
@@ -459,34 +536,31 @@ export class PoolAdmin {
       delete acc.authRequired
       delete acc.authError
       delete acc.authMarkedAt
+      delete acc.authReverifyAttempts
     }
-    if (acc.cooldowns?.[family]) {
-      delete acc.cooldowns[family]
-    }
+    if (acc.cooldowns?.[family]) delete acc.cooldowns[family]
+    const peer = sharedArgonPeerFamily(acc, family)
+    if (peer && acc.cooldowns?.[peer]) delete acc.cooldowns[peer]
     // A successful run is positive proof the login is alive: drop any pending
     // auth-confirmation streak so an old blip cannot harden later.
     this.deps.authStrikes.delete(id)
     this.deps.persist()
   }
 
-  /**
-   * Move the active pointer past `fromId` for one family WITHOUT cooling the
-   * account down, and return the account the next run should use. Used when a
-   * run produced no output at all (silent timeout): the retry must try another
-   * account, but a healthy account should not be punished with a cooldown
-   * because the network blipped.
-   */
+  /** Move the active pointer past `fromId` without setting cooldown (used on silent timeout). */
   advanceAccount(fromId: string, family: ModelFamily, model?: string): string | null {
     const data = this.deps.getData()
     const now = Date.now()
-    const candidates = data.accounts.filter(
-      (a) => a.id !== fromId && isAccountEligible(a, family, now, this.deps.pool, model),
-    )
+    const candidates = data.accounts.filter((a) => a.id !== fromId && isAccountEligible(a, family, now, this.deps.pool, model))
     if (candidates.length === 0) return null
-    const next = orderByExpiry(data.accounts, candidates, family, fromId, Date.now())[0]!
+    const next = orderByExpiry(data.accounts, candidates, family, fromId, now)[0]!
     if (!data.activeAccountIds) data.activeAccountIds = {}
     data.activeAccountIds[family] = next.id
-    if (family === 'google' || !data.lastActiveAccountId) {
+    const peer = this.canSyncSharedPeer(data, next, family)
+    if (peer && (data.activeAccountIds[peer] === fromId || data.activeAccountIds[peer] === undefined) && isAccountEligible(next, peer, now, this.deps.pool)) {
+      data.activeAccountIds[peer] = next.id
+    }
+    if (family === 'google' || (peer === 'google' && data.activeAccountIds.google === next.id) || !data.lastActiveAccountId) {
       data.lastActiveAccountId = next.id
     }
     this.deps.persist()

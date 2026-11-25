@@ -7,10 +7,15 @@ import {
   Err,
   ELIGIBILITY_ERROR_HINT,
   HEADLESS_PERMISSION_ERROR_HINT,
+  extractModelConfigDiagnostic,
+  extractTransportDiagnostic,
+  looksLikeAiCreditsLow,
   looksLikeContextWindowExceeded,
   looksLikeEligibilityFailure,
   looksLikeHardRateLimit,
   looksLikeHeadlessPermissionDenial,
+  looksLikeModelConfigFetchFailure,
+  looksLikePlanModelNotSpecified,
   looksLikeTosViolation,
   looksLikeValidationRequired,
 } from '../common/types.ts'
@@ -50,6 +55,7 @@ export interface FailureContext {
   transportFailure: boolean
   keyringJitter: boolean
   rawErrText: string
+  runLogText?: string
   isRateLimit: boolean
   silentTimeout: boolean
 }
@@ -73,13 +79,16 @@ function classifyPolicyOrQuota(c: FailureContext): AttemptFailure | null {
   }
   if (c.isRateLimit) {
     const bestMsg = detailText(c, 'Rate limit or quota reached')
-    const hard = looksLikeHardRateLimit(c.rawErrText)
+    const aiCreditsLow = looksLikeAiCreditsLow(c.rawErrText) || looksLikeAiCreditsLow(bestMsg)
+    const hard = looksLikeHardRateLimit(c.rawErrText) || aiCreditsLow
     return {
       kind: 'error',
       code: hard ? Err.RATE_LIMIT : Err.OVERLOADED,
-      message: hard
-        ? 'Google Antigravity quota / rate limit reached: ' + bestMsg
-        : 'Google Antigravity quota / rate limit reached (server capacity overloaded): ' + bestMsg,
+      message: aiCreditsLow
+        ? 'Google Antigravity AI credits balance is too low: ' + bestMsg
+        : hard
+          ? 'Google Antigravity quota / rate limit reached: ' + bestMsg
+          : 'Google Antigravity quota / rate limit reached (server capacity overloaded): ' + bestMsg,
     }
   }
   const resultErr = c.parser.stats.lastResultError ?? ''
@@ -123,17 +132,58 @@ function classifyPolicyOrQuota(c: FailureContext): AttemptFailure | null {
       message: HEADLESS_PERMISSION_ERROR_HINT + (detail !== '' ? ' (' + detail + ')' : ''),
     }
   }
+  const combinedErr = [c.rawErrText, resultErr, c.runLogText ?? ''].filter(Boolean).join('\n')
+  const planModelMissing = looksLikePlanModelNotSpecified(c.rawErrText) || looksLikePlanModelNotSpecified(resultErr)
+  const modelConfigFetchFailed = looksLikeModelConfigFetchFailure(combinedErr)
+  if (planModelMissing || modelConfigFetchFailed) {
+    if (c.transportFailure) {
+      const netDetail = extractTransportDiagnostic(c.runLogText)
+        ?? extractTransportDiagnostic(c.rawErrText)
+        ?? detailText(c, brief(c.rawErrText))
+      return {
+        kind: 'error',
+        code: Err.NETWORK,
+        message: 'Network/proxy error prevented agy from fetching model config — check proxy or network connectivity (网络/代理异常导致 agy 无法拉取模型配置，并非所选模型无效，请检查代理或网络): '
+          + (netDetail !== '' ? netDetail : brief(c.rawErrText)),
+      }
+    }
+    if (modelConfigFetchFailed) {
+      const cfgDetail = extractModelConfigDiagnostic(c.runLogText)
+        ?? extractModelConfigDiagnostic(c.rawErrText)
+        ?? detailText(c, brief(c.rawErrText))
+      return {
+        kind: 'error',
+        code: Err.AGY_ERROR,
+        message: 'agy failed to fetch available model config from server — not a network disconnect; try /agy refresh or switch account (无法拉取可用模型配置，非网络断连，请尝试 /agy refresh 或切换账号): '
+          + (cfgDetail !== '' ? cfgDetail : brief(c.rawErrText)),
+      }
+    }
+    return {
+      kind: 'error',
+      code: Err.UNKNOWN_MODEL,
+      message: 'agy could not apply the selected model (未指定或当前账号不支持所选模型，请重新选择模型或刷新模型列表): '
+        + detailText(c, brief(c.rawErrText)),
+    }
+  }
   return null
 }
 
 function classifyExitOrFallback(c: FailureContext): AttemptFailure {
+  const netDetail = c.transportFailure
+    ? (extractTransportDiagnostic(c.runLogText) ?? extractTransportDiagnostic(c.rawErrText))
+    : undefined
   if (c.outcome.code !== 0) {
-    const detail = detailText(c)
+    // `detailText` only looks at the parsed result / stderr. The ACP path's own
+    // exception (e.g. "ACP prompt returned an empty turn: ...") lives in
+    // rawErrText, and dropping it turned every such failure into the useless
+    // "agy exited with code 1". Fall back to it when nothing else is present.
+    const detail = detailText(c, brief(c.rawErrText))
     return c.transportFailure
       ? {
           kind: 'error',
           code: Err.NETWORK,
-          message: 'agy hit a network error while talking to Google — the automatic retry usually succeeds. ' + (detail !== '' ? detail : brief(c.rawErrText)),
+          message: 'agy hit a network error while talking to Google — the automatic retry usually succeeds (网络连接异常，通常会自动重试成功): '
+            + (netDetail ?? (detail !== '' ? detail : brief(c.rawErrText))),
         }
       : { kind: 'error', code: Err.PROCESS_EXIT, message: 'agy exited with code ' + c.outcome.code + (detail !== '' ? ': ' + detail : '') }
   }
@@ -141,7 +191,8 @@ function classifyExitOrFallback(c: FailureContext): AttemptFailure {
     return {
       kind: 'error',
       code: Err.NETWORK,
-      message: 'agy hit a network error while talking to Google — the automatic retry usually succeeds. ' + brief(c.rawErrText),
+      message: 'agy hit a network error while talking to Google — the automatic retry usually succeeds (网络连接异常，通常会自动重试成功): '
+        + (netDetail ?? brief(c.rawErrText)),
     }
   }
   if (c.parser.stats.lastResultError) {

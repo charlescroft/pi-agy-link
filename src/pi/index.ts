@@ -5,15 +5,20 @@ import { createAssistantMessageEventStream } from '@earendil-works/pi-ai'
 import { createHostServices } from '../host/services.ts'
 import { listPlugins, manageAgyPlugin } from '../host/agy-plugins.ts'
 import { runBootHygiene } from '../host/boot-hygiene.ts'
+import { scheduleBootMaintenance } from '../host/boot-maintenance.ts'
+import { cacheMetrics, formatCacheReport } from '../host/cache-metrics.ts'
 import { MIN_AGY_VERSION, compareVersions, parseVersion, probeProcess } from '../host/runner.ts'
 import { defineAgyMirrorTool } from '../provider/mirror/definition.ts'
 import { defineAgyImageTool } from '../host/image-tool.ts'
 import { mergeCatalogWithQuotaModels, quotaCatalogForAccount } from '../domain/models/quota-catalog.ts'
 import { sanitizeCatalogEntries } from '../host/models.ts'
 import { modelMatches } from '../common/pool-types.ts'
+import { resolveAccountPlanTier } from '../common/plan-tier.ts'
+import { clampWarmupIntervalHours } from '../common/config.ts'
+import { buildOrchestratorSettingsObject } from '../common/orchestrator.ts'
 import type { Context as CordisContext } from './dsh-shims/cordis.ts'
 import type { Message, StreamChunk, TokenUsage } from './dsh-shims/dsh-llm.ts'
-import type { ManagedAccount, ModelFamily } from '../common/pool-types.ts'
+import type { AccountPlanTier, ManagedAccount, ModelFamily } from '../common/pool-types.ts'
 import { parseCompactLimitValue, resolveEffectiveCompactLimit } from '../common/compact-threshold.ts'
 
 export const AGY_PROVIDER_ID = 'agy-link'
@@ -30,6 +35,7 @@ interface AgyWidgetAccount {
   alias: string
   email?: string
   tier: string
+  planTierOverride?: string
   priority: number
   disabled: boolean
   active: boolean
@@ -160,8 +166,11 @@ function buildWidgetState(services: ReturnType<typeof createHostServices>): AgyW
       }
     }
 
+    const inferredTier = resolveAccountPlanTier(acc)
     const tier =
+      (acc.planTierOverride && acc.planTierOverride !== 'unknown' ? acc.planTierOverride.toUpperCase() : undefined) ||
       acc.subscriptionTier ||
+      (inferredTier && inferredTier !== 'unknown' ? inferredTier.toUpperCase() : undefined) ||
       (acc.dedicatedGroups?.includes('argon') || arg !== undefined ? 'PRO/ULTRA' : 'STANDARD')
 
     return {
@@ -169,6 +178,7 @@ function buildWidgetState(services: ReturnType<typeof createHostServices>): AgyW
       alias: acc.alias || acc.email || acc.id,
       email: acc.email,
       tier,
+      planTierOverride: acc.planTierOverride && acc.planTierOverride !== 'unknown' ? acc.planTierOverride : undefined,
       priority: idx + 1,
       disabled: !acc.enabled,
       active: acc.id === activeId,
@@ -192,6 +202,7 @@ function buildWidgetState(services: ReturnType<typeof createHostServices>): AgyW
   const effectiveContextWindow = resolveEffectiveCompactLimit(cfg).effectiveLimit
   const availableModels = resolveAllCatalogModels(services).map((m) => m.id)
   const acpSt = services.acpPool.status()
+  const cacheSnap = cacheMetrics.snapshot()
 
   const authSt = services.poolAuth.status()
   const pendingAuthUrl = authSt.phase === 'waiting' ? authSt.url : undefined
@@ -209,6 +220,10 @@ function buildWidgetState(services: ReturnType<typeof createHostServices>): AgyW
       proxyUrl: cfg.proxyUrl || '',
       permissionMode: cfg.permissionMode || 'skip',
       defaultEffort: cfg.defaultEffort || '',
+      orchestratorPlannerModel: cfg.orchestratorPlannerModel || '',
+      orchestratorPlannerEffort: cfg.orchestratorPlannerEffort || '',
+      orchestratorExecutorModel: cfg.orchestratorExecutorModel || '',
+      orchestratorExecutorEffort: cfg.orchestratorExecutorEffort || '',
       parallelSameAccount: Boolean(cfg.parallelSameAccount),
       maxConcurrent: Number(cfg.maxConcurrent ?? 0),
       dispatchTimeoutMinutes: Number(cfg.dispatchTimeoutMinutes ?? 0),
@@ -219,6 +234,11 @@ function buildWidgetState(services: ReturnType<typeof createHostServices>): AgyW
       hiddenModels: Array.isArray(cfg.hiddenModels) ? [...cfg.hiddenModels] : [],
       selectedModels: Array.isArray(cfg.selectedModels) ? [...cfg.selectedModels] : [],
       autoWarmup: Boolean(cfg.autoWarmup),
+      warmupWindows: cfg.warmupWindows || 'weekly',
+      warmupDailyTime: cfg.warmupDailyTime || '',
+      warmupTimezone: cfg.warmupTimezone || '',
+      warmupIntervalHours: Number(cfg.warmupIntervalHours ?? 0),
+      warmupMaxProbesPerRun: Number(cfg.warmupMaxProbesPerRun ?? 12),
       imageModel: cfg.imageModel || '',
       imageEffort: cfg.imageEffort || 'low',
       imageTimeoutMs: Number(cfg.imageTimeoutMs ?? 240000),
@@ -229,9 +249,35 @@ function buildWidgetState(services: ReturnType<typeof createHostServices>): AgyW
       effectiveCompactLimit: effectiveContextWindow,
       modelApiMaxRetries: Number(cfg.modelApiMaxRetries ?? 3),
       slimPromptRules: cfg.slimPromptRules !== false,
-      transport: cfg.transport || 'cli',
+      transport: cfg.transport || 'acp',
       acpActiveProcesses: Number(acpSt.activeProcesses ?? 0),
       acpSessions: Number(acpSt.sessions ?? 0),
+      acpDrainingProcesses: Number(acpSt.drainingProcesses ?? 0),
+      acpStrayProcesses: Number(acpSt.strayProcesses ?? 0),
+      acpSlotOverwriteDetectedCount: Number(acpSt.slotOverwriteDetectedCount ?? 0),
+      cacheStats: {
+        today: {
+          date: cacheSnap.today.date,
+          turns: cacheSnap.today.turns,
+          coldTurns: cacheSnap.today.coldTurns,
+          promptTokens: cacheSnap.today.promptTokens,
+          cacheReadTokens: cacheSnap.today.cacheReadTokens,
+          hitPercent: cacheSnap.today.hitPercent,
+          reasons: cacheSnap.today.reasons,
+        },
+        last: cacheSnap.last
+          ? {
+              at: cacheSnap.last.at,
+              reason: cacheSnap.last.reason,
+              model: cacheSnap.last.model,
+              hitPercent: cacheSnap.last.stats?.hitPercent ?? null,
+              contextTokens: cacheSnap.last.stats?.contextTokens ?? 0,
+              inputTokens: cacheSnap.last.stats?.inputTokens ?? 0,
+              cacheReadTokens: cacheSnap.last.stats?.cacheReadTokens ?? 0,
+              outputTokens: cacheSnap.last.stats?.outputTokens ?? 0,
+            }
+          : null,
+      },
       sandbox: Boolean(cfg.sandbox),
       agent: cfg.agent || '',
       agySettings: cfg.agySettings || '',
@@ -448,6 +494,16 @@ export default function (pi: ExtensionAPI): void {
 
   const services = createHostServices(mockCtx as unknown as Parameters<typeof createHostServices>[0], {})
   runBootHygiene(services)
+  const stopBootMaintenance = scheduleBootMaintenance({
+    accounts: () => services.pool.getAccounts(),
+    sweepStaging: () => services.pool.sweepStaleStaging(),
+    sweepLogs: () => services.pool.sweepOldLogs(services.getConfig().logRetentionDays),
+    ...(services.getConfig().syncAccountCustomizations ? { syncEcosystem: () => services.ecosystem?.syncAll() } : {}),
+    log: services.log,
+    reapOrphans: services.getConfig().reapOrphanMcp,
+  })
+  let mirrorToolActive = false
+  services.setMirrorToolCheck(() => mirrorToolActive)
 
   const warnTimestamps = new Map<string, number>()
   const warnThrottled = (key: string, msg: string, err?: unknown): void => {
@@ -778,7 +834,9 @@ export default function (pi: ExtensionAPI): void {
   })
 
   pi.on('session_shutdown', async () => {
+    mirrorToolActive = false
     lastUiCtx = undefined
+    stopBootMaintenance()
     if (bgQuotaTimer) {
       clearInterval(bgQuotaTimer)
       bgQuotaTimer = null
@@ -787,6 +845,8 @@ export default function (pi: ExtensionAPI): void {
       clearInterval(authWatchTimer)
       authWatchTimer = null
     }
+    services.backgroundWakeup.dispose()
+    services.btw.dispose()
     services.acpPool.dispose()
   })
 
@@ -829,6 +889,7 @@ export default function (pi: ExtensionAPI): void {
   ensureImageToolRegistered()
 
   const mirrorTool = defineAgyMirrorTool({ runs: services.runs })
+  mirrorToolActive = true
   pi.registerTool({
     name: mirrorTool.name,
     label: 'Antigravity Tool Mirror',
@@ -1184,11 +1245,243 @@ export default function (pi: ExtensionAPI): void {
         emitOutput(ctx, `Auto fallback model ${on ? 'enabled' : 'disabled'}`)
         return
       }
-      if (sub === 'warmup' && rest[0]) {
-        const on = rest[0].toLowerCase() === 'on' || rest[0].toLowerCase() === 'true'
-        services.setOverride('autoWarmup', on)
+      if (sub === 'warmup') {
+        const wSub = (rest[0] || '').toLowerCase()
+        if (!wSub || wSub === 'status' || wSub === 'show') {
+          const c = services.getConfig()
+          emitOutput(
+            ctx,
+            [
+              `Warmup: ${c.autoWarmup ? 'on' : 'off'}`,
+              `- windows: ${c.warmupWindows}`,
+              `- daily: ${c.warmupDailyTime || '(off)'}${c.warmupTimezone ? ` (${c.warmupTimezone})` : ''}`,
+              `- interval: ${c.warmupIntervalHours > 0 ? `${c.warmupIntervalHours}h` : '(off)'}`,
+              `- max-probes: ${c.warmupMaxProbesPerRun > 0 ? c.warmupMaxProbesPerRun : 'unlimited'}`,
+            ].join('\n'),
+          )
+          return
+        }
+        if (wSub === 'on' || wSub === 'off' || wSub === 'true' || wSub === 'false') {
+          const on = wSub === 'on' || wSub === 'true'
+          services.setOverride('autoWarmup', on)
+          publishAgyUi(ctx, services)
+          emitOutput(ctx, `Auto warmup ${on ? 'enabled' : 'disabled'}`)
+          return
+        }
+        if (wSub === 'windows' && rest[1]) {
+          const win = rest[1].toLowerCase()
+          if (win !== 'weekly' && win !== '5h' && win !== 'both') {
+            emitOutput(ctx, 'Usage: /agy warmup windows <weekly|5h|both>', 'error')
+            return
+          }
+          services.setOverride('warmupWindows', win)
+          publishAgyUi(ctx, services)
+          emitOutput(ctx, `Warmup windows set to ${win}`)
+          return
+        }
+        if (wSub === 'daily') {
+          const rawVal = (rest[1] || '').trim()
+          const lowered = rawVal.toLowerCase()
+          if (!rawVal || lowered === 'off' || lowered === 'clear' || lowered === 'none') {
+            services.setOverride('warmupDailyTime', '')
+            publishAgyUi(ctx, services)
+            emitOutput(ctx, 'Warmup daily schedule cleared')
+            return
+          }
+          if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(rawVal)) {
+            emitOutput(ctx, 'Usage: /agy warmup daily <HH:MM|off> (24-hour format, e.g. 08:30)', 'error')
+            return
+          }
+          services.setOverride('warmupDailyTime', rawVal)
+          publishAgyUi(ctx, services)
+          emitOutput(ctx, `Warmup daily schedule set to ${rawVal}`)
+          return
+        }
+        if (wSub === 'timezone' || wSub === 'tz') {
+          const rawTz = rest.slice(1).join(' ').trim()
+          const lowered = rawTz.toLowerCase()
+          if (!rawTz || lowered === 'local' || lowered === 'clear' || lowered === 'default') {
+            services.setOverride('warmupTimezone', '')
+            publishAgyUi(ctx, services)
+            emitOutput(ctx, 'Warmup timezone reset to local system timezone')
+            return
+          }
+          try {
+            Intl.DateTimeFormat(undefined, { timeZone: rawTz })
+          } catch {
+            emitOutput(ctx, `Invalid IANA timezone: ${rawTz} (e.g. Asia/Shanghai, UTC)`, 'error')
+            return
+          }
+          services.setOverride('warmupTimezone', rawTz)
+          publishAgyUi(ctx, services)
+          emitOutput(ctx, `Warmup timezone set to ${rawTz}`)
+          return
+        }
+        if (wSub === 'interval' && rest[1]) {
+          const lowered = rest[1].toLowerCase()
+          if (lowered === 'off' || lowered === 'clear' || lowered === '0') {
+            services.setOverride('warmupIntervalHours', 0)
+            publishAgyUi(ctx, services)
+            emitOutput(ctx, 'Warmup fixed interval disabled')
+            return
+          }
+          const n = Number(rest[1])
+          if (!Number.isFinite(n) || n < 0 || n > 168) {
+            emitOutput(ctx, 'Usage: /agy warmup interval <hours (4-168)|0|off>', 'error')
+            return
+          }
+          const clamped = clampWarmupIntervalHours(n)
+          services.setOverride('warmupIntervalHours', clamped)
+          publishAgyUi(ctx, services)
+          emitOutput(ctx, `Warmup interval set to ${clamped}h`)
+          return
+        }
+        if ((wSub === 'max-probes' || wSub === 'budget') && rest[1]) {
+          const lowered = rest[1].toLowerCase()
+          const n = lowered === 'unlimited' || lowered === 'off' ? 0 : Number(rest[1])
+          if (!Number.isInteger(n) || n < 0 || n > 100) {
+            emitOutput(ctx, 'Usage: /agy warmup max-probes <0-100|unlimited>', 'error')
+            return
+          }
+          services.setOverride('warmupMaxProbesPerRun', n)
+          publishAgyUi(ctx, services)
+          emitOutput(ctx, n === 0 ? 'Warmup max probes per run: unlimited' : `Warmup max probes per run set to ${n}`)
+          return
+        }
+        if (wSub === 'run' || wSub === 'now') {
+          emitOutput(ctx, 'Running manual Antigravity warmup…')
+          const results = await services.warmup.warmupAllAccounts({
+            force: true,
+            ignoreFailureBackoff: true,
+            trigger: 'manual',
+          })
+          publishAgyUi(ctx, services)
+          const okCount = results.filter((r) => r.success).length
+          const skipCount = results.filter((r) => r.skipped).length
+          emitOutput(
+            ctx,
+            `Warmup finished: ${okCount}/${results.length} probe(s) succeeded${skipCount > 0 ? ` (${skipCount} skipped)` : ''}.`,
+          )
+          return
+        }
+        emitOutput(
+          ctx,
+          'Usage: /agy warmup <on|off|status|windows <weekly|5h|both>|daily <HH:MM|off>|timezone <IANA|local>|interval <hours|off>|max-probes <0-100>|run>',
+          'error',
+        )
+        return
+      }
+      if (sub === 'plan') {
+        if (rest.length < 2) {
+          emitOutput(ctx, 'Usage: /agy plan <id|alias|index> <pro|ultra|free|enterprise|auto>', 'error')
+          return
+        }
+        const token = (rest[rest.length - 1] || '').toLowerCase()
+        const selector = rest.slice(0, -1).join(' ').trim()
+        const target = findAccount(selector)
+        if (!target) {
+          emitOutput(ctx, `Account not found: ${selector}`, 'error')
+          return
+        }
+        if (token === 'auto' || token === 'reset' || token === 'clear') {
+          services.pool.setPlanTierOverride(target.id, undefined)
+          publishAgyUi(ctx, services)
+          emitOutput(ctx, `Plan tier pin cleared for ${target.email || target.alias} (using inferred tier)`)
+          return
+        }
+        const validTiers: readonly AccountPlanTier[] = ['pro', 'ultra', 'free', 'enterprise']
+        const tier = validTiers.find((t) => t === token)
+        if (!tier) {
+          emitOutput(ctx, `Unknown plan "${token}". Expected: pro, ultra, free, enterprise, auto`, 'error')
+          return
+        }
+        services.pool.setPlanTierOverride(target.id, tier)
         publishAgyUi(ctx, services)
-        emitOutput(ctx, `Auto 7-day warmup ${on ? 'enabled' : 'disabled'}`)
+        emitOutput(ctx, `Plan tier for ${target.email || target.alias} pinned to ${tier.toUpperCase()}`)
+        return
+      }
+      if (sub === 'orchestrator' || sub === 'orch') {
+        const oSub = (rest[0] || '').toLowerCase()
+        const validEfforts = new Set(['minimal', 'low', 'medium', 'high', 'max'])
+        if (!oSub || oSub === 'show' || oSub === 'status') {
+          const c = services.getConfig()
+          const resolved = buildOrchestratorSettingsObject(c)
+          emitOutput(
+            ctx,
+            [
+              'Orchestrator config:',
+              `- planner: ${c.orchestratorPlannerModel || '(auto)'}${c.orchestratorPlannerEffort ? ` [effort=${c.orchestratorPlannerEffort}]` : ''}`,
+              `- executor: ${c.orchestratorExecutorModel || '(auto)'}${c.orchestratorExecutorEffort ? ` [effort=${c.orchestratorExecutorEffort}]` : ''}`,
+              `- effective payload: ${resolved ? JSON.stringify(resolved) : '(none — agy default)'}`,
+            ].join('\n'),
+          )
+          return
+        }
+        if (oSub === 'clear' || oSub === 'reset') {
+          services.setOverride('orchestratorPlannerModel', '')
+          services.setOverride('orchestratorPlannerEffort', '')
+          services.setOverride('orchestratorExecutorModel', '')
+          services.setOverride('orchestratorExecutorEffort', '')
+          publishAgyUi(ctx, services)
+          emitOutput(ctx, 'Orchestrator planner/executor overrides cleared')
+          return
+        }
+        if (oSub === 'planner' || oSub === 'executor') {
+          const modelKey = oSub === 'planner' ? 'orchestratorPlannerModel' : 'orchestratorExecutorModel'
+          const effortKey = oSub === 'planner' ? 'orchestratorPlannerEffort' : 'orchestratorExecutorEffort'
+          const rawModel = (rest[1] || '').trim()
+          const lowered = rawModel.toLowerCase()
+          const nextModel = !rawModel || lowered === 'auto' || lowered === 'clear' || lowered === 'default' ? '' : rawModel
+          services.setOverride(modelKey, nextModel)
+          if (rest[2] !== undefined) {
+            const rawEff = rest[2].trim().toLowerCase()
+            if (rawEff === 'default' || rawEff === 'clear' || rawEff === 'auto') {
+              services.setOverride(effortKey, '')
+            } else if (validEfforts.has(rawEff)) {
+              services.setOverride(effortKey, rawEff)
+            } else {
+              emitOutput(ctx, `Invalid effort "${rest[2]}". Expected: default, minimal, low, medium, high, max`, 'error')
+              return
+            }
+          }
+          publishAgyUi(ctx, services)
+          emitOutput(ctx, nextModel ? `Orchestrator ${oSub} model set to ${nextModel}` : `Orchestrator ${oSub} model reset to auto`)
+          return
+        }
+        if (oSub === 'planner-effort' || oSub === 'executor-effort') {
+          const effortKey = oSub === 'planner-effort' ? 'orchestratorPlannerEffort' : 'orchestratorExecutorEffort'
+          const rawEff = (rest[1] || '').trim().toLowerCase()
+          if (!rawEff || rawEff === 'default' || rawEff === 'clear' || rawEff === 'auto') {
+            services.setOverride(effortKey, '')
+            publishAgyUi(ctx, services)
+            emitOutput(ctx, `Orchestrator ${oSub} reset to default`)
+            return
+          }
+          if (!validEfforts.has(rawEff)) {
+            emitOutput(ctx, `Usage: /agy orchestrator ${oSub} <default|minimal|low|medium|high|max>`, 'error')
+            return
+          }
+          services.setOverride(effortKey, rawEff)
+          publishAgyUi(ctx, services)
+          emitOutput(ctx, `Orchestrator ${oSub} set to ${rawEff}`)
+          return
+        }
+        emitOutput(
+          ctx,
+          'Usage: /agy orchestrator <status|planner <model|auto> [effort]|planner-effort <effort|default>|executor <model|auto> [effort]|executor-effort <effort|default>|clear>',
+          'error',
+        )
+        return
+      }
+      if (sub === 'cache-status' || sub === 'cache-stats' || sub === 'cache') {
+        if ((rest[0] || '').toLowerCase() === 'reset') {
+          cacheMetrics.reset()
+          publishAgyUi(ctx, services)
+          emitOutput(ctx, 'ACP cache metrics reset.')
+          return
+        }
+        publishAgyUi(ctx, services)
+        emitOutput(ctx, formatCacheReport(cacheMetrics.snapshot()).join('\n'))
         return
       }
       if (sub === 'hidden-models') {

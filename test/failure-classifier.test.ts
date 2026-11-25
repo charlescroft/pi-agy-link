@@ -52,6 +52,11 @@ test('context window, eligibility, exit code, network, envelope and invalid outp
   assert.equal(classifyFailure(c({ consumable: false, rawErrText: 'context window exceeded' }))?.code, Err.CONTEXT_WINDOW_EXCEEDED)
   assert.equal(classifyFailure(c({ consumable: false, rawErrText: 'User location is not supported' }))?.code, Err.ELIGIBILITY)
   assert.equal(classifyFailure(c({ consumable: false }, { code: 1, stderrTail: 'boom' }))?.code, Err.PROCESS_EXIT)
+  // The ACP path's own exception must survive into the message; the old code
+  // dropped it and showed only "agy exited with code 1".
+  const acpEmpty = classifyFailure(c({ consumable: false, rawErrText: 'ACP prompt returned an empty turn: agy produced no output' }, { code: 1 }))!
+  assert.equal(acpEmpty.code, Err.PROCESS_EXIT)
+  assert.match(acpEmpty.message, /empty turn/)
   assert.equal(classifyFailure(c({ consumable: false, transportFailure: true, rawErrText: 'EOF' }))?.code, Err.NETWORK)
   assert.equal(classifyFailure(c({ consumable: false }, { code: 0 }, { lastResultError: 'model said no' }))?.code, Err.AGY_ERROR)
   assert.equal(classifyFailure(c({ consumable: false }, { code: 0 }))?.code, Err.INVALID_OUTPUT)
@@ -75,4 +80,38 @@ test('headless permission denial (#121) includes actionable permissionMode guida
   const f = classifyFailure(c({ consumable: false, rawErrText: denial }, { code: 1, stderrTail: denial }))!
   assert.equal(f.code, Err.AGY_ERROR)
   assert.match(f.message, /permissionMode|\/agy/i)
+})
+
+test('plan model not specified distinguishes network/proxy outage vs model-config fetch failure vs unknown model', () => {
+  const errBanner = '⚠ failed to construct executor: plan model not specified; you must specify a valid model'
+
+  const netLog = 'E1124 19:33:39.904 server.go:762] failed to get model config: failed to get load code assist response: Post "https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist": read tcp 198.18.0.1:54270->198.18.0.81:443: read: connection reset by peer'
+  const net = classifyFailure(c({
+    consumable: false,
+    transportFailure: true,
+    rawErrText: errBanner,
+    runLogText: netLog,
+  }, { code: 1 }))!
+  assert.equal(net.code, Err.NETWORK)
+  assert.match(net.message, /网络\/代理异常/)
+  assert.match(net.message, /connection reset by peer/)
+
+  const cfgLog = 'E1124 19:33:39.904 server.go:762] failed to get model config: server returned empty availableModels'
+  const cfgErr = classifyFailure(c({
+    consumable: false,
+    transportFailure: false,
+    rawErrText: errBanner,
+    runLogText: cfgLog,
+  }, { code: 1 }))!
+  assert.equal(cfgErr.code, Err.AGY_ERROR)
+  assert.match(cfgErr.message, /无法拉取可用模型配置/)
+  assert.match(cfgErr.message, /server returned empty availableModels/)
+
+  const unknown = classifyFailure(c({
+    consumable: false,
+    transportFailure: false,
+    rawErrText: errBanner,
+  }, { code: 1 }))!
+  assert.equal(unknown.code, Err.UNKNOWN_MODEL)
+  assert.match(unknown.message, /未指定或当前账号不支持所选模型/)
 })

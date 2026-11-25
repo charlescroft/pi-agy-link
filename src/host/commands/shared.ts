@@ -1,7 +1,7 @@
 // Shared shapes and helpers for the /agy command family. Command groups live in
 // sibling modules and are wired together by registry.ts.
 import type { CommandInvocation, CommandResult } from '@deepseek-ai/dsh-commands'
-import type { PluginConfig } from '../../common/types.ts'
+import type { AgyEvent, PluginConfig } from '../../common/types.ts'
 import type { AuthHelper } from '../auth.ts'
 import type { ModelCatalog } from '../models.ts'
 import type { SessionStore } from '../sessions.ts'
@@ -10,6 +10,21 @@ import type { PoolAuthFlow } from '../pool-auth.ts'
 import type { QuotaService } from '../quota.ts'
 import type { OneShotResult } from '../oneshot.ts'
 import type { EcosystemService } from '../../features/ecosystem/index.ts'
+import type { BackgroundWakeStatus } from '../../common/background-types.ts'
+
+/**
+ * ACP pool view for the status surfaces. The three drain/slot fields are
+ * optional so host stubs written before they existed still satisfy the shape.
+ */
+export interface AcpStatusView {
+  activeProcesses: number
+  sessions: number
+  keys: readonly string[]
+  drainingProcesses?: number
+  drainingKeys?: readonly string[]
+  slotOverwriteDetectedCount?: number
+  lastSlotRecoveryAt?: number | null
+}
 
 export interface GoalViewLike {
   id: string
@@ -30,6 +45,13 @@ export interface GoalServiceLike {
   resume(agent: unknown, ref: { id: string; revision: number }): GoalViewLike
   complete(agent: unknown, ref: { id: string; revision: number }): GoalViewLike
   clear(agent: unknown, ref: { id: string; revision: number }): unknown
+}
+
+export interface ActiveRunLike {
+  readonly length: number
+  readonly isSettled: boolean
+  readonly conversationId: string | null
+  eventAt(index: number): AgyEvent | undefined
 }
 
 export interface CommandDeps {
@@ -57,13 +79,17 @@ export interface CommandDeps {
   goals?: () => GoalServiceLike | undefined
   agents?: () => { get(id: unknown): unknown } | undefined
   imageService?: () => import('../image.ts').ImageService
-  acpStatus?: () => { activeProcesses: number; sessions: number; keys: readonly string[] }
+  acpStatus?: () => AcpStatusView
+  backgroundStatus?: () => BackgroundWakeStatus
   ecosystem?: () => EcosystemService
+  activeRun?: (sessionId: string) => ActiveRunLike | undefined
   runOnce?: (req: {
     prompt: string
     model?: string
     effort?: string
     mode?: string
+    cwd?: string
+    disableSlashCommands?: boolean
     timeoutMs?: number
     signal?: AbortSignal
     readPaths?: readonly string[]
@@ -90,22 +116,24 @@ export type CommandHandler = (deps: CommandDeps, ctx: CommandContext) => Promise
 export const HELP = [
   '**/agy** — Antigravity (agy CLI) bridge',
   '- `/agy status` — binary, version, auth, mode, catalog, bindings',
+  '- `/agy cache-stats` (`/agy cache`) — per-day cache hit rate and cold-start reasons',
   '- `/agy pool` / `/agy accounts` — account pool, live quota %, cooldowns',
   '- `/agy goal [status|set <obj>|edit <obj>|pause|resume|complete|clear]` — inspect or control the current DSH goal',
   '- `/agy session [info|clear]` — view or drop the current session agy binding',
-  '- `/agy add-account [alias]` — start OAuth login for a new account slot',
-  '- `/agy use <id>` — switch the active account immediately',
-  '- `/agy enable-account <id>` — enable an account slot',
-  '- `/agy disable-account <id>` — disable an account slot (skips in rotation)',
+  '- `/agy add-account [alias]` — create an isolated account slot (then run `/agy auth <id>`)',
+  '- `/agy use <id|alias> [family]` / `/agy set-active` — switch active account (`gemini|argon|claude|gpt`)',
+  '- `/agy enable-account <id|alias>` — enable an account slot',
+  '- `/agy disable-account <id|alias>` — disable an account slot (skips in rotation)',
   '- `/agy refresh-quota` — query Google backend for fresh quota %',
-  '- `/agy clear-cooldown` — reset cooldown timers (and any active low-quota bench)',
-  '- `/agy remove-account <id>` — delete an account slot',
+  '- `/agy clear-cooldown [id|alias] [family]` — reset cooldown timers (and any active low-quota bench)',
+  '- `/agy remove-account <id|alias>` — delete an account slot',
+  '- `/agy plan <id|alias> <pro|ultra|free|enterprise|auto>` — pin the plan badge (quota data cannot tell Pro from Ultra)',
   '- `/agy auth [id|alias|email]` — login to the primary or reauthenticate an existing account',
   '- `/agy auth-status` — check the current or most recent login result',
   '- `/agy auth-code <code>` — finish login by pasting the code (fallback)',
-  '- `/agy import <refresh_token_or_json> [alias]` — import account via refresh token or token JSON',
+  '- `/agy import <refresh_token_or_json> [alias]` (`/agy import-token`) — import account via refresh token or JSON',
   '- `/agy models` — refresh and list discovered models',
-  '- `/agy image <prompt> [-a ratio] [-n name] [-i ref]` — generate or edit an image via agy (`generate_image`)',
+  '- `/agy image <prompt> [-a ratio] [-n name] [-i ref] [-o out] [--model id] [--effort lvl]` (`/agy img`) — generate/edit image',
   '- `/agy btw <question>` — ask an isolated side question in read-only mode without altering session state',
   '- `/agy fork [list|restore <id>|<prompt>]` — snapshot, branch, or restore an agy conversation fork',
   '- `/agy grill [topic]` / `/agy grill-me [topic]` — structured design interview to surface trade-offs & decisions',
@@ -113,17 +141,18 @@ export const HELP = [
   '- `/agy compact [focus]` — summarize session context and reset the agy conversation binding',
   '- `/agy plugins [list|enable <id>|disable <id>]` — inspect or toggle installed Antigravity plugins',
   '- `/agy mcp` / `/agy skills` / `/agy agents [list|use <name>|off]` — inspect MCP servers, skills/rules, and custom agents',
-  '- `/agy sync-ecosystem` — mirror primary plugins, skills, rules, agents, and MCP config to isolated pool accounts',
+  '- `/agy sync-ecosystem` / `/agy sync` — mirror primary plugins, skills, rules, agents, and MCP config to pool accounts',
   '- `/agy mode <skip|auto|plan|accept-edits>` — permission mode (next turn)',
   '- `/agy sandbox [on|off]` — toggle OS terminal sandbox (`--sandbox`)',
   '- `/agy agent [name|off]` — select default custom Markdown agent (`--agent`)',
   '- `/agy settings [show|<json-or-path>|clear]` — set per-session `agy --settings` override',
   '- `/agy transport [cli|acp|status]` — switch between CLI `-p` and persistent `agy acp`',
+  '- `/agy wakeup [on|off|status]` — toggle cross-turn background timer/task wakeup or inspect active watches',
   '- `/agy effort <low|medium|high|xhigh|max|default>` — default reasoning effort',
   '- `/agy dispatch [minutes|off]` — credential-slot wait cap per attempt (omit to inspect; `off` = unlimited)',
   '- `/agy dispatch-retries <n>` — extra dispatch attempts after the cap',
-  '- `/agy parallel <on|off>` — same-account parallel agy runs (Windows slot fast path)',
-  '- `/agy max-concurrent <n|off>` — cap on concurrent agy request streams (off = unlimited, native)',
+  '- `/agy parallel [on|off]` — inspect or toggle same-account parallel agy runs (Windows slot fast path)',
+  '- `/agy max-concurrent [n|off]` — inspect or cap concurrent agy request streams (off = unlimited, native)',
   '- `/agy workspace [path]` — set the agy working directory (absolute path; omit to show)',
   '- `/agy compact-limit [<tokens|512k|900k|default>]` — inspect or override agy auto-compact threshold',
   '- `/agy net [retries <0-10>|proxy <url|clear>]` — inspect or configure API retries and proxy',

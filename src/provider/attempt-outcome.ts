@@ -6,8 +6,10 @@
 // waits for the child, flushes the parser, classifies the failure and calls
 // finalizeAttempt.
 import { LlmError, type StreamChunk } from '@deepseek-ai/dsh-llm'
+import { withRunLogTail } from './failure-log-tail.ts'
 import {
   Err,
+  extractAgyQuotaBanner,
   isHardQuotaResultError,
   isTransportFailure,
   looksLikeAuthFailure,
@@ -32,6 +34,7 @@ import {
   SlotUnavailableError,
 } from '../host/credential-slot.ts'
 import { detectSystemProxy } from '../host/wincred.ts'
+import { supportsSshIsolation } from '../runtime/agy/env.ts'
 import { classifyFailure, type AttemptFailure } from './failure.ts'
 import { finalizeAttempt } from './finalize.ts'
 import { STATUS_NOTICE_BLOCK_INDEX, awaitWithNotices } from './notices.ts'
@@ -41,14 +44,14 @@ import {
   buildSpawnArgs,
   createAttemptRecorder,
   createAttemptSlot,
-  startAttemptProcess,
+  resolveEffectiveAgySettings,
   type AttemptDeps,
   type AttemptInput,
   type AttemptRecorder,
   type AttemptSlot,
   type SpawnPlan,
-  type SpawnedAttempt,
 } from './attempt.ts'
+import { startAttemptProcess, type SpawnedAttempt } from './attempt-spawn.ts'
 
 function describeDispatchTimeoutNotice(cfg: PluginConfig, attempt: number, maxAttempts: number, backoffMs: number): string {
   return '[agy] 等待 agy 凭据槽已超过 ' + cfg.dispatchTimeoutMinutes + ' 分钟，正在重新排队（' +
@@ -96,10 +99,16 @@ function acquireSlotLease(
   // fake IO and still exercise the handoff directly.
   if (process.env.NODE_TEST_CONTEXT !== undefined) return Promise.resolve(undefined)
   const { cfg, account, signal } = input
-  // Windows has ONE process-global credential slot that every agy process
-  // reads. Ownership is serialized for the whole run and only handed over when
-  // it can provably be handed back. This throws instead of signing in as the
-  // wrong account, which would silently spend that account's quota.
+  // On agy >= 1.5, isolated accounts pass SSH_CONNECTION so agy bypasses the
+  // shared Windows Credential Manager completely — lock-free multi-account concurrency!
+  if (
+    process.platform === 'win32'
+    && account?.dir
+    && !account.systemHome
+    && supportsSshIsolation(deps.agyVersion?.() ?? null)
+  ) {
+    return Promise.resolve(undefined)
+  }
   return acquireCredentialSlot(account ?? undefined, deps.pool, {
     baseDir: deps.pool?.dir,
     proxyUrl: account?.proxyUrl || cfg.proxyUrl || detectSystemProxy() || undefined,
@@ -107,6 +116,7 @@ function acquireSlotLease(
     signal,
     dispatchTimeoutMs: dispatchHardCapMs,
     parallel: cfg.parallelSameAccount,
+    respectExternalSignIn: cfg.respectExternalSignIn,
   })
 }
 
@@ -309,7 +319,9 @@ function classifyRun(input: {
   const rawErrText = [
     outcome.stderrTail,
     parser.stats.lastResultError,
-    !consumable && r && (!r.ok || zeroUsageTos) ? (r.error ?? r.response) : '',
+    !consumable && r && (!r.ok || zeroUsageTos || errorResponseHardQuota)
+      ? (r.error ?? (errorResponseHardQuota ? (extractAgyQuotaBanner(r.response) ?? r.response) : r.response))
+      : '',
     liveQuota ? quotaFailover.rawErrorText : '',
     logQuotaHint,
   ]
@@ -335,13 +347,14 @@ function classifyRun(input: {
     transportFailure: liveQuota ? false : transportFailure,
     keyringJitter: liveQuota ? false : keyringJitter,
     rawErrText,
+    runLogText,
     isRateLimit,
     silentTimeout,
   })
   if (failure && liveQuota && failure.code === Err.RATE_LIMIT && parser.stats.lastResultError === undefined && outcome.stderrTail === '') {
     failure.message = 'Google Antigravity quota / rate limit reached (subagent/tool): ' + quotaFailover.errorText
   }
-  return { failure, rawErrText, runLogText, silentTimeout }
+  return { failure: withRunLogTail(failure, runLogText), rawErrText, runLogText, silentTimeout }
 }
 
 function sawAuthFailure(parser: StreamJsonParser, outcome: { stderrTail: string }): boolean {
@@ -435,6 +448,7 @@ export async function handleAttemptOutcome(
       sessionAccountKey: input.sessionAccountKey,
       ...(input.binding === undefined ? {} : { binding: input.binding }),
       conversationId,
+      cwd: input.binding?.cwd || input.workspaceRoot,
       messages: input.messages,
       model: input.model,
       activeModel: input.activeModel,
@@ -452,8 +466,22 @@ export async function handleAttemptOutcome(
       sharesSingleEgress: () => deps.sharesSingleEgress(),
       ...(deps.onRun === undefined ? {} : { onRun: deps.onRun }),
     })
+    // The run settled on `input.account`: refresh just that account so the panel
+    // stops showing the pre-turn snapshot (throttled host-side).
+    if (input.account !== undefined) deps.onAccountUsed?.(input.account.id, input.family)
   } finally {
     rec.settle(failure)
+    if (!input.isAux && sessionKey !== '') {
+      deps.backgroundObserver?.onAttemptSettled?.({
+        sessionKey,
+        conversationId,
+        ...(rec.accountHome === undefined ? {} : { accountHome: rec.accountHome }),
+        transport: 'cli',
+        recording: rec,
+        failure,
+        superseded,
+      })
+    }
   }
 }
 
@@ -466,10 +494,15 @@ export async function* runAgyAttempt(
   deps: AttemptDeps,
   input: AttemptInput,
 ): AsyncGenerator<StreamChunk, RunRecording, void> {
+  // Same pre-flight for the CLI path: a stale isolated token makes agy load the
+  // machine-wide keyring (wrong account) instead of this account's own token.
+  if (input.account && input.account.dir && !input.account.systemHome && deps.ensureFreshToken) {
+    await deps.ensureFreshToken(input.account).catch(() => false)
+  }
   const recorder = createAttemptRecorder(deps, input.cfg, input.account, input.binding?.conversationId, true, {
     family: input.family,
     activeModel: input.activeModel,
-  })
+  }, input.isBackgroundAux === true)
   // Build the argv (and tail-trim an over-budget prompt) BEFORE waiting for
   // the slot, exactly as the former inline block did — the trim warning is
   // logged even when the dispatch later aborts.
@@ -477,7 +510,9 @@ export async function* runAgyAttempt(
   // Dispatch sees the NUL-sanitized prompt: its failure path clears the
   // in-flight marker with the same string the former inline block used.
   const slot = yield* dispatchCredentialSlot(deps, { ...input, prompt: spawn.prompt })
-  if ((input.transport ?? input.cfg.transport) === 'acp' && deps.runAcp && !input.jsonSchema && !input.agySettings && !input.isAux) {
+  recorder.setTrackerSession?.(input.sessionKey)
+  const effectiveAgySettings = resolveEffectiveAgySettings(input)
+  if ((input.transport ?? input.cfg.transport) === 'acp' && deps.runAcp && !input.jsonSchema && !effectiveAgySettings && !input.isAux) {
     const acpRec = await deps.runAcp(deps, { ...input, prompt: spawn.prompt }, slot).catch(() => null)
     if (acpRec !== null) {
       recorder.stop()

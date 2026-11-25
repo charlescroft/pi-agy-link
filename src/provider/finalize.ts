@@ -23,6 +23,7 @@ import {
   Err,
   isAuthoritativeAuthError,
   looksLikeHardRateLimit,
+  isModelScopedQuotaFailure,
   parseResetDurationMs,
   shouldMarkAuthRequired,
   type RawUsage,
@@ -65,6 +66,8 @@ export interface FinalizeInput {
   sessionAccountKey: string
   binding?: SessionBinding
   conversationId: string | null
+  /** Original working directory for this conversation (persisted to preserve prompt cache on resume). */
+  cwd?: string
   messages: readonly Message[]
   /** Model slug reported to onRun (resolved model id). */
   model: string
@@ -122,9 +125,15 @@ function applySuccess(input: FinalizeInput): void {
 }
 
 function writeSuccessBinding(input: FinalizeInput): void {
-  const finalId = input.binding !== undefined ? input.binding.conversationId : input.conversationId
+  // The run's OWN conversation id wins over the binding we entered with: an
+  // ACP turn whose persisted session had to be rebuilt (session/resume and
+  // session/load both produced nothing) starts a NEW agy conversation, and
+  // writing the old id back would point the next turn at a session that no
+  // longer exists — the exact "silently opens an empty page" failure.
+  const finalId = input.conversationId ?? input.binding?.conversationId
   if (!finalId) return
   const inputTokens = resolveInputTokens(input.rec, input.binding)
+  const resolvedCwd = input.binding?.cwd || input.cwd
   input.store.set(input.sessionAccountKey, {
     conversationId: finalId,
     lastMessageCount: input.messages.length,
@@ -132,6 +141,7 @@ function writeSuccessBinding(input: FinalizeInput): void {
     model: input.activeModel,
     sentImageIds: mergeSentImageIds(input.binding?.sentImageIds, input.newlySentImageIds),
     ...(typeof inputTokens === 'number' && inputTokens > 0 ? { lastInputTokens: inputTokens } : {}),
+    ...(resolvedCwd ? { cwd: resolvedCwd } : {}),
   })
 }
 
@@ -157,12 +167,23 @@ function rotateOnFailure(input: FinalizeInput, failure: AttemptFailure): void {
   const targetFamily = qf?.family ?? family
   const resetMs = parseResetDurationMs(input.rawErrText) ?? parseResetDurationMs(failure.message)
   const serverResetTime = qf?.resetTime ?? (resetMs && resetMs > 0 ? new Date(Date.now() + resetMs).toISOString() : undefined)
+  const modelScoped =
+    qf?.modelScoped === true ||
+    isModelScopedQuotaFailure(input.rawErrText) ||
+    isModelScopedQuotaFailure(failure.message)
   if (account && !outcome.aborted && (looksLikeHardRateLimit(input.rawErrText) || Boolean(qf))) {
-    if (!qf?.cooledInLive) {
-      pool?.recordFailure(account.id, targetFamily, failure.message, serverResetTime)
-    }
-    if (qf?.crossFamily) {
-      pool?.advanceAccount(account.id, family, input.activeModel)
+    if (modelScoped) {
+      // One model's own quota ran out (e.g. an image model). Rotate this turn
+      // so the retry does not land on the same exhausted model, but never put
+      // the whole family into cooldown — other models still have quota.
+      pool?.advanceAccount(account.id, targetFamily, input.activeModel)
+    } else {
+      if (!qf?.cooledInLive) {
+        pool?.recordFailure(account.id, targetFamily, failure.message, serverResetTime)
+      }
+      if (qf?.crossFamily) {
+        pool?.advanceAccount(account.id, family, input.activeModel)
+      }
     }
   }
   // Silent timeout: rotate to the next account for the automatic retry
@@ -260,9 +281,13 @@ function persistFailureBinding(input: FinalizeInput, failure: AttemptFailure): v
     // Persisting it here is what lets the next hop continue instead of
     // starting a fresh conversation with a digest-only prompt
     // (issue #35 root cause ②: "aborted 分支永远存不下来").
-    const finalId = input.binding !== undefined ? input.binding.conversationId : input.conversationId
+    // Same precedence as writeSuccessBinding: the conversation this run actually
+    // reached beats the one we entered with, otherwise a rebuilt ACP session
+    // writes its dead id back and the next turn resumes nothing.
+    const finalId = input.conversationId ?? input.binding?.conversationId
     if (!finalId) return
     const inputTokens = resolveInputTokens(input.rec, input.binding)
+    const resolvedCwd = input.binding?.cwd || input.cwd
     input.store.set(input.sessionAccountKey, {
       conversationId: finalId,
       lastMessageCount: input.messages.length,
@@ -276,6 +301,7 @@ function persistFailureBinding(input: FinalizeInput, failure: AttemptFailure): v
       sentImageIds: mergeSentImageIds(input.binding?.sentImageIds, []),
       ...((interruptedTurn || input.binding?.interrupted === true) ? { interrupted: true } : {}),
       ...(typeof inputTokens === 'number' && inputTokens > 0 ? { lastInputTokens: inputTokens } : {}),
+      ...(resolvedCwd ? { cwd: resolvedCwd } : {}),
     })
   }
 }

@@ -3,7 +3,7 @@
 // so the settings section and the Plugins-page dashboard render IDENTICAL
 // quota visuals from one implementation.
 
-import type { ManagedAccount } from '../../common/pool-types.ts';
+import { effectiveFamilyCooldown, type ManagedAccount } from '../../common/pool-types.ts';
 import { isFamilyCooling, isFamilyInCooldown } from '../../common/quota-bench.ts';
 import { computeQuotaPacing } from '../../common/quota-pacing.ts';
 import type { AgyLocaleKey } from '../locales.ts';
@@ -15,6 +15,8 @@ import { Spinner } from '../ui/Spinner.ts';
 
 export interface FamilyBarActions {
 	isActive?: boolean;
+	/** `isActive` came from the eligibility PREDICTION, not from a real use/pin. */
+	predicted?: boolean;
 	canSetActive?: boolean;
 	settingActive?: boolean;
 	clearingCooldown?: boolean;
@@ -143,8 +145,8 @@ const renderLine = (
 	// Chromium/Electron scroll flicker across multi-account lists.
 	const isShimmer = isRefreshing;
 	const { pacing, tooltipText, showTimeMarker, markerLeftPct } = describePacing(t, windowDurationMs, resetStr, rawFraction, rawReset);
-	return h('div', { className: 'agy-quota-line', style: { display: 'flex', alignItems: 'center', fontSize: '11.5px', margin: '2px 0' } },
-		h('span', { style: { width: '64px', color: 'var(--agy-text-window-label)', fontSize: '11px', fontWeight: 600, flexShrink: 0, whiteSpace: 'nowrap' } }, windowName),
+	return h('div', { className: 'agy-quota-line', style: { display: 'flex', alignItems: 'center', fontSize: '11.5px', margin: '2px 0', minWidth: 0 } },
+		h('span', { title: windowName, style: { width: '64px', color: 'var(--agy-text-window-label)', fontSize: '11px', fontWeight: 600, flexShrink: 0, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' } }, windowName),
 		h('div', {
 			className: isShimmer ? 'agy-shimmer-track' : '',
 			style: { ...S.progressBarBg, position: 'relative' },
@@ -199,12 +201,13 @@ const renderLine = (
 				minWidth: '150px',
 				flexShrink: 0,
 				marginLeft: '6px',
+				overflow: 'hidden',
 			},
 		},
 			resetStr
-				? h('span', { style: { color: 'var(--agy-text-secondary)', fontSize: '10.5px', fontWeight: 500, whiteSpace: 'nowrap' } }, `↻ ${resetStr}`)
+				? h('span', { title: resetStr, style: { color: 'var(--agy-text-secondary)', fontSize: '10.5px', fontWeight: 500, whiteSpace: 'nowrap', maxWidth: '100%', overflow: 'hidden', textOverflow: 'ellipsis' } }, `↻ ${resetStr}`)
 				: pacing?.status === 'unactivated'
-					? h('span', { style: { color: 'var(--agy-text-tertiary)', fontSize: '10px', fontWeight: 500, whiteSpace: 'nowrap' } }, t('quota.unactivated'))
+					? h('span', { title: t('quota.unactivated'), style: { color: 'var(--agy-text-tertiary)', fontSize: '10px', fontWeight: 500, whiteSpace: 'nowrap', maxWidth: '100%', overflow: 'hidden', textOverflow: 'ellipsis' } }, t('quota.unactivated'))
 					: null,
 		),
 	);
@@ -216,7 +219,7 @@ function formatCooldownTip(
 	acc: ManagedAccount,
 	now: number,
 ): string {
-	const cd = acc.cooldowns[familyKey];
+	const cd = effectiveFamilyCooldown(acc, familyKey);
 	if (cd && cd.cooldownUntil > now) {
 		const mins = Math.max(1, Math.ceil((cd.cooldownUntil - now) / 60_000));
 		const hours = Math.floor(mins / 60);
@@ -272,14 +275,19 @@ function renderFamilyHeaderActions(
 		);
 	}
 	if (familyActions?.isActive) {
-		return h('span', {
+		// A family with no real pin resolves to "who WOULD be picked". Calling that
+		// "当前使用" is what made the panel contradict the running session; the
+		// predicted case says so explicitly, and offers the pin so it can be made real.
+		const predicted = familyActions.predicted === true;
+		const label = predicted ? t('account.predictedInUse') : t('status.inUse');
+		const badge = h('span', {
 			key: 'fam-active',
-			title: t('status.inUse'),
+			title: label,
 			style: {
 				...S.badgeTag!,
-				background: 'rgba(16, 185, 129, 0.12)',
-				color: '#10b981',
-				borderColor: 'rgba(16, 185, 129, 0.45)',
+				background: familyActions.predicted ? 'rgba(148, 163, 184, 0.14)' : 'rgba(16, 185, 129, 0.12)',
+				color: familyActions.predicted ? 'var(--agy-text-secondary)' : '#10b981',
+				borderColor: familyActions.predicted ? 'var(--agy-border-box)' : 'rgba(16, 185, 129, 0.45)',
 				gap: '3px',
 				fontSize: '10px',
 				padding: '1px 5px',
@@ -287,23 +295,36 @@ function renderFamilyHeaderActions(
 				whiteSpace: 'nowrap',
 				flexShrink: 0,
 			},
-		}, uiIcon('zap', 10, '#10b981'), t('status.inUse'));
+		}, uiIcon('zap', 10, predicted ? 'var(--agy-text-secondary)' : '#10b981'), label);
+		if (!predicted) return badge;
+		return h('div', { key: 'fam-predicted', style: { display: 'inline-flex', alignItems: 'center', gap: '4px', flexShrink: 0 } },
+			badge,
+			familyActions.canSetActive && familyActions.onSetActive ? setActiveButton(t, familyActions) : null,
+		);
 	}
 	if (familyActions?.canSetActive && familyActions.onSetActive) {
-		return h(Button, {
-			key: 'fam-set-active',
-			variant: 'default',
-			size: 'sm',
-			className: 'agy-btn',
-			style: { gap: '3px', fontSize: '10.5px', padding: '1px 6px', height: '20px', flexShrink: 0 },
-			title: t('account.setActive'),
-			disabled: familyActions.settingActive,
-			onClick: familyActions.onSetActive,
-		}, ...(familyActions.settingActive
-			? [Spinner(), t('account.settingActive')]
-			: [uiIcon('zap', 10), ` ${t('account.setActive')}`]));
+		return setActiveButton(t, familyActions);
 	}
 	return null;
+}
+
+/** The per-family "设为当前" pin, shared by the plain and predicted paths. */
+function setActiveButton(
+	t: (key: AgyLocaleKey) => string,
+	familyActions: FamilyBarActions,
+): unknown {
+	return h(Button, {
+		key: 'fam-set-active',
+		variant: 'default',
+		size: 'sm',
+		className: 'agy-btn',
+		style: { gap: '3px', fontSize: '10.5px', padding: '1px 6px', height: '20px', flexShrink: 0 },
+		title: t('account.setActive'),
+		disabled: familyActions.settingActive,
+		onClick: familyActions.onSetActive,
+	}, ...(familyActions.settingActive
+		? [Spinner(), t('account.settingActive')]
+		: [uiIcon('zap', 10), ` ${t('account.setActive')}`]));
 }
 
 /**
@@ -329,19 +350,17 @@ export function renderFamilyQuotaBar(
 	const has5h = typeof info?.remainingFraction === 'number' && Number.isFinite(info.remainingFraction);
 	const pct5h = has5h ? Math.max(0, Math.min(100, Math.round(info!.remainingFraction! * 100))) : -1;
 	const w5h = formatQuotaWindow(t, info?.resetTime);
-	const expiredFull5h = w5h.expired && has5h && pct5h >= 100;
 
 	// Weekly limit
 	const hasWeekly = typeof info?.weeklyFraction === 'number' && Number.isFinite(info.weeklyFraction);
 	const pctWeekly = hasWeekly ? Math.max(0, Math.min(100, Math.round(info!.weeklyFraction! * 100))) : -1;
 	const wWeekly = formatQuotaWindow(t, info?.weeklyResetTime);
-	const expiredFullWeekly = wWeekly.expired && hasWeekly && pctWeekly >= 100;
 
 	const c5h = getQuotaColors(pct5h);
 	const cWeekly = getQuotaColors(pctWeekly);
 
-	const note5h = w5h.resetText ? w5h.resetText : expiredFull5h ? t('quota.windowReset') : '';
-	const noteWeekly = wWeekly.resetText ? wWeekly.resetText : expiredFullWeekly ? t('quota.windowReset') : '';
+	const note5h = w5h.resetText ? w5h.resetText : staleResetNote(t, w5h.expired, has5h, pct5h, info?.updatedAt);
+	const noteWeekly = wWeekly.resetText ? wWeekly.resetText : staleResetNote(t, wWeekly.expired, hasWeekly, pctWeekly, info?.updatedAt);
 	const isActive = Boolean(!cooling && familyActions?.isActive);
 	const borderColor = isActive
 		? 'var(--dsw-alias-state-business-primary, #3b82f6)'
@@ -363,22 +382,67 @@ export function renderFamilyQuotaBar(
 				display: 'flex',
 				alignItems: 'center',
 				justifyContent: 'space-between',
+				flexWrap: 'wrap',
 				gap: '6px',
+				minWidth: 0,
 				fontWeight: 700,
 				fontSize: '12px',
 				marginBottom: '3px',
 				color: 'var(--agy-text-primary)',
 			},
 		},
-			h('div', { style: { display: 'flex', alignItems: 'center', gap: '5px' } },
+			h('div', { style: { display: 'flex', alignItems: 'center', gap: '5px', minWidth: 0 } },
 				brandIcon(FAMILY_BRAND[familyKey], 13),
 				h('span', null, label),
 			),
 			renderFamilyHeaderActions(t, cooling, cooldownTip, familyActions),
 		),
-		(familyKey !== 'argon' || has5h) ? renderLine(t, t('quota.fiveHour'), pct5h, c5h, note5h, FIVE_H_MS, info?.remainingFraction, info?.resetTime, isRefreshing) : null,
+		// Hide the 5-hour row when a family is weekly-only (e.g. Free-tier Gemini or
+		// dedicated Argon weekly bucket) so the card reflects the real quota structure.
+		(has5h || (!hasWeekly && familyKey !== 'argon')) ? renderLine(t, t('quota.fiveHour'), pct5h, c5h, note5h, FIVE_H_MS, info?.remainingFraction, info?.resetTime, isRefreshing) : null,
 		renderLine(t, t('quota.weekly'), pctWeekly, cWeekly, noteWeekly, SEVEN_D_MS, info?.weeklyFraction, info?.weeklyResetTime, isRefreshing),
+		renderModelPauses(t, acc, now),
 	);
+}
+
+/**
+ * Model buckets that are paused while the family stays healthy — the image
+ * model is the common case (`gemini-3.1-flash-image`). Shown under the family
+ * bars so "76% but the image model is out" is legible instead of invisible.
+ */
+function renderModelPauses(t: (key: AgyLocaleKey) => string, acc: ManagedAccount, now: number): unknown {
+	const paused = Object.entries(acc.modelCooldowns ?? {})
+		.filter(([, cd]) => cd.cooldownUntil > now)
+		.sort(([a], [b]) => a.localeCompare(b));
+	if (paused.length === 0) return null;
+	const label = paused
+		.map(([model, cd]) => `${model} → ${new Date(cd.cooldownUntil).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`)
+		.join(' · ');
+	return h('div', { style: { marginTop: '2px', fontSize: '10px', fontWeight: 600, color: '#f59e0b', wordBreak: 'break-word' } },
+		`${t('quota.modelPaused')}: ${label}`);
+}
+
+/**
+ * Note for a quota row whose reset boundary is ALREADY IN THE PAST.
+ *
+ * A passed boundary means the window rolled over, so the stored fraction
+ * describes the PREVIOUS window, not the current one. At 100% that is exactly
+ * "reset · available". Below 100% the row used to render a bare percentage with
+ * no time marker at all, which reads as a live figure — reported 2026-11-23 on
+ * an account stuck at 91% whose 5-hour boundary had passed 33 hours earlier.
+ */
+function staleResetNote(
+	t: (key: AgyLocaleKey, vars?: Record<string, string | number>) => string,
+	expired: boolean,
+	hasValue: boolean,
+	percent: number,
+	updatedAt?: number,
+): string {
+	if (!expired || !hasValue) return '';
+	if (percent >= 100) return t('quota.windowReset');
+	return typeof updatedAt === 'number' && updatedAt > 0
+		? t('quota.windowResetStale', { time: formatSnapshotStamp(updatedAt) })
+		: '';
 }
 
 /** Short absolute stamp for "this data is from …" notes (past tense). */
@@ -408,7 +472,22 @@ export function renderQuotaUnavailableNote(
 	if (!state) return null;
 	const stamps = Object.values(acc.quotas).map((q) => q?.updatedAt ?? 0).filter((ts) => ts > 0);
 	const oldest = stamps.length > 0 ? Math.min(...stamps) : 0;
-	const reason = t(`quota.unavailable.${state.reason}` as AgyLocaleKey);
+	// `no_summary_access` only DESCRIBES a free-tier shape when the account has no
+	// 5-hour window at all. A paid account that already reported one is being
+	// refused transiently; calling it "free-tier" contradicted its own Pro badge
+	// and 5h bar in the SAME card (reported 2026-11-23).
+	//
+	// The 5h reading only counts as evidence while it is NEWER than the refusal:
+	// a 5h bar frozen from before the account was refused says nothing about the
+	// plan it has NOW (a lapsed Pro account keeps its old 100% row and would
+	// otherwise be described as a refused paid account — reported 2026-11-23).
+	const has5hEvidence = Object.values(acc.quotas).some(
+		(q) => typeof q?.remainingFraction === 'number' && (q?.updatedAt ?? 0) > state.since,
+	);
+	const reasonKey = state.reason === 'no_summary_access' && has5hEvidence
+		? 'quota.unavailable.no_summary_access_paid'
+		: `quota.unavailable.${state.reason}`;
+	const reason = t(reasonKey as AgyLocaleKey);
 	const isCritical = state.reason === 'validation_required' || state.reason === 'tos_violation';
 	const toneText = isCritical ? 'var(--agy-quota-low-text)' : 'var(--agy-quota-med-text)';
 	const toneBg = isCritical ? 'var(--agy-quota-low-bg)' : 'var(--agy-quota-med-bg)';

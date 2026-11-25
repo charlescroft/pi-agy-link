@@ -1,5 +1,35 @@
 # Changelog
 
+## 1.5.0 (2026-11-25)
+
+### English
+
+- **Sync upstream `dsh-agy-link` (`v0.6.59` → `v0.6.83`)**:
+  - **ACP Default Transport & Stability (`v0.6.60`–`v0.6.75`)**: Switched default transport from `cli` to persistent `acp` (with automatic pre-stream fallback to `-p` CLI); fixed real per-call ACP token usage reporting (issues #158, #167, #175); prevented eviction of ACP processes with an active foreground prompt (issue #182); added silent non-zero `agy` exit log-tail diagnostics and `disableTelemetry` propagation (`v0.6.79`).
+  - **Quota, Plan Tier & Failover (`v0.6.61`–`v0.6.83`)**: Refreshed offline model lineup to `agy 1.5.16` (issue #174); linked shared-group Google/Argon quotas and cooldowns (`v0.6.77`); added model-scoped cooldowns (e.g. `gemini-3.1-flash-image` 429s no longer cool down other Gemini models); auto-rotated accounts when `agy` emits a quota-exhausted banner with `end_turn` (issue #183); introduced pure plan-tier inference (`resolveAccountPlanTier`) without guessing Ultra from quota data; added exponential-backoff auth-flag self-healing and CLI safety gate credential alignment (issue #199).
+  - **Warmup, MCP & Startup Performance (`v0.6.60`–`v0.6.83`)**: Added 5h/weekly/both warmup windows, daily schedule, timezone, fixed interval, and per-run probe caps with unactivated-window retry; split deferred housekeeping (`scheduleBootMaintenance`) to keep plugin boot fast and reap orphaned MCP servers & stale presence locks; sanitized MCP array schemas and empty-string enum members rejected by Gemini (issues #188, #189); fixed reverse MCP bridge reachability (issue #196) and always-load bridge name unwrapping (`v0.6.83`); added prompt cloaking (`cloakSystemPrompt`) and neutral workspace for auxiliary calls (`auxNeutralWorkspace`).
+  - **Orchestrator & Cache Observability (`v0.6.70`–`v0.6.78`)**: Added Orchestrator planner/executor model & effort configuration (`common/orchestrator.ts`) and per-day ACP cache hit-rate & cold-start attribution (`host/cache-metrics.ts`).
+- **Expose New APIs to Pi & PiCrust (`src/pi/index.ts`)**:
+  - **Account Plan Tier Pinning**: Added `/agy plan <id|alias|index> <pro|ultra|free|enterprise|auto|reset>` and exposed `accounts[].planTierOverride` in `agy-link-state` (resolving `tier` via `planTierOverride > subscriptionTier > resolveAccountPlanTier`).
+  - **Fine-Grained Warmup Scheduling**: Expanded `/agy warmup` (backward-compatible with `/agy warmup on|off`) with `status`, `windows <weekly|5h|both>`, `daily <HH:MM|off>`, `timezone <IANA|local>`, `interval <hours|off>`, `max-probes <0-100|unlimited>`, and `run`; exposed `warmupWindows`, `warmupDailyTime`, `warmupTimezone`, `warmupIntervalHours`, and `warmupMaxProbesPerRun` in `AgyWidgetState.settings`.
+  - **Orchestrator Configuration**: Added `/agy orchestrator <status|planner|planner-effort|executor|executor-effort|clear>` and exposed `orchestratorPlannerModel`, `orchestratorPlannerEffort`, `orchestratorExecutorModel`, and `orchestratorExecutorEffort` in `AgyWidgetState.settings`.
+  - **Cache Status & ACP Diagnostics**: Added `/agy cache-status` (aliases `/agy cache-stats`, `/agy cache`, plus `reset`) and exposed `cacheStats` (`today` bucket + `last` sample), `acpDrainingProcesses`, `acpStrayProcesses`, and `acpSlotOverwriteDetectedCount` in `AgyWidgetState.settings`.
+  - **Lifecycle & Shim Integration**: Wired `scheduleBootMaintenance()`, `services.setMirrorToolCheck(...)`, `backgroundWakeup.dispose()` / `btw.dispose()` on `session_shutdown`, and added `boundContextSummary` to `src/pi/dsh-shims/dsh-llm.ts`.
+
+### 中文
+
+- **跟进上游 `dsh-agy-link`（`v0.6.59` → `v0.6.83`）**：
+  - **ACP 默认传输与稳定性（`v0.6.60`–`v0.6.75`）**：默认传输模式由 `cli` 切换为持久 `acp`（启动失败自动回退到 `-p` CLI）；修复 ACP 真实单次调用 token 用量上报（issues #158, #167, #175）；禁止驱逐存在活跃前台回合的 ACP 进程（issue #182）；静默非零退出补充日志尾部诊断，修复 `disableTelemetry` 透传（`v0.6.79`）。
+  - **配额、订阅等级与故障转移（`v0.6.61`–`v0.6.83`）**：更新离线模型阵容至 `agy 1.5.16`（issue #174）；联动共享组的 Google/Argon 配额与冷却（`v0.6.77`）；新增模型级独立冷却（如 `gemini-3.1-flash-image` 限流不再影响同家族其他 Gemini 模型）；`agy` 输出配额耗尽横幅并带 `end_turn` 时自动轮换账号（issue #183）；引入纯配额推导 `resolveAccountPlanTier`（不再从配额猜测 Ultra）；新增登录失效标记指数退避自愈及 CLI 安全门凭证对齐（issue #199）。
+  - **预热、MCP 与启动性能（`v0.6.60`–`v0.6.83`）**：支持 `weekly`/`5h`/`both` 窗口、每日定时、时区、固定间隔与单次探针上限，并重试未激活窗口；拆分延迟维护（`scheduleBootMaintenance`）加速启动并回收孤儿 MCP 进程与过期 presence 锁；清洗 Gemini 拒绝的 MCP 数组 schema 与空字符串枚举（issues #188, #189）；修复反向 MCP bridge 可达性（issue #196）与 always-load 桥接名称解包（`v0.6.83`）；新增系统提示词伪装（`cloakSystemPrompt`）与辅助调用中性工作目录（`auxNeutralWorkspace`）。
+  - **Orchestrator 与缓存可观测性（`v0.6.70`–`v0.6.78`）**：新增 Orchestrator planner/executor 模型与思考强度配置（`common/orchestrator.ts`）以及按本地日统计的 ACP 缓存命中率与冷启动归因（`host/cache-metrics.ts`）。
+- **向 Pi 与 PiCrust 新增暴露接口（`src/pi/index.ts`）**：
+  - **账号 Plan 手动固定**：新增 `/agy plan <id|alias|index> <pro|ultra|free|enterprise|auto|reset>`，并在 `agy-link-state` 中暴露 `accounts[].planTierOverride`（`tier` 按 `planTierOverride > subscriptionTier > resolveAccountPlanTier` 解析）。
+  - **Warmup 精细化调度**：扩展 `/agy warmup`（完全兼容 `/agy warmup on|off`），支持 `status`、`windows <weekly|5h|both>`、`daily <HH:MM|off>`、`timezone <IANA|local>`、`interval <hours|off>`、`max-probes <0-100|unlimited>`、`run`，并在 `AgyWidgetState.settings` 暴露对应配置字段。
+  - **Orchestrator 配置**：新增 `/agy orchestrator <status|planner|planner-effort|executor|executor-effort|clear>`，并在 `AgyWidgetState.settings` 暴露 `orchestratorPlannerModel`、`orchestratorPlannerEffort`、`orchestratorExecutorModel`、`orchestratorExecutorEffort`。
+  - **缓存统计与 ACP 诊断**：新增 `/agy cache-status`（别名 `/agy cache-stats`、`/agy cache`，支持 `reset`），并在 `AgyWidgetState.settings` 暴露 `cacheStats`（今日统计与最近一轮样本）、`acpDrainingProcesses`、`acpStrayProcesses`、`acpSlotOverwriteDetectedCount`。
+  - **生命周期与 Shim 适配**：接入 `scheduleBootMaintenance()`、`services.setMirrorToolCheck(...)`、`session_shutdown` 释放 `backgroundWakeup`/`btw`，并在 `src/pi/dsh-shims/dsh-llm.ts` 补齐 `boundContextSummary`。
+
 ## 1.4.1 (2026-11-22)
 
 ### English

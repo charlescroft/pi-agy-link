@@ -6,7 +6,7 @@ import { S } from '../styles.ts';
 import type { Translator } from '../hooks/useTranslation.ts';
 import type { StatusPayload } from '../status.ts';
 import { Button } from '../ui/Button.ts';
-import { Row } from '../ui/Row.ts';
+import { Row, rowCaption } from '../ui/Row.ts';
 import { segGroup } from '../ui/SegGroup.ts';
 
 export interface RuntimeControlsProps {
@@ -14,13 +14,10 @@ export interface RuntimeControlsProps {
 	status: StatusPayload;
 	loadingAction: string | null;
 	setCfg: (key: string, value: unknown) => Promise<void>;
-}
-
-function rowCaption(title: string, desc: string): unknown {
-	return h('div', { style: { display: 'flex', flexDirection: 'column', minWidth: 0, flex: '1 1 0' } },
-		h('span', { style: { color: 'var(--agy-text-primary)', fontWeight: 600, fontSize: '12.5px' } }, title),
-		h('span', { style: S.muted }, desc),
-	);
+	exclude?: {
+		imageTool?: boolean;
+		syncCustomizations?: boolean;
+	};
 }
 
 function boolRow(opts: {
@@ -78,12 +75,28 @@ function renderTransportRow(props: RuntimeControlsProps): unknown {
 	const { t, status, loadingAction, setCfg } = props;
 	const transport = status.transport === 'acp' ? 'acp' : 'cli';
 	const acpInfo = status.acpStatus;
+	// The badge must describe the REAL machine, not just the pool's own map:
+	// `activeProcesses` excludes draining children and any stray `agy acp` the
+	// pool lost track of, which is how "1 进程" was shown while two servers ran.
+	const procTotal = acpInfo
+		? (acpInfo.activeProcesses ?? 0) + (acpInfo.drainingProcesses ?? 0) + (acpInfo.strayProcesses ?? 0)
+		: 0;
+	const notes: string[] = [];
+	if (acpInfo && (acpInfo.drainingProcesses ?? 0) > 0) {
+		notes.push(t('config.acpStatsDraining', { draining: acpInfo.drainingProcesses }));
+	}
+	if (acpInfo && (acpInfo.strayProcesses ?? 0) > 0) {
+		notes.push(t('config.acpStatsStray', { stray: acpInfo.strayProcesses }));
+	}
+	const statsLabel = acpInfo === undefined || acpInfo === null
+		? ''
+		: t('config.acpStats', { procs: procTotal, sessions: acpInfo.sessions }) + (notes.length > 0 ? ' ' + notes.join(' ') : '');
 	return h(Row, {
 		style: { gap: '10px', flexWrap: 'wrap' },
 		left: rowCaption(t('config.transport'), t('config.transportDesc')),
 		right: h('div', { style: { display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' } },
 			transport === 'acp' && acpInfo
-				? h('span', { style: S.badgeTag }, t('config.acpStats', { procs: acpInfo.activeProcesses, sessions: acpInfo.sessions }))
+				? h('span', { style: S.badgeTag, title: t('config.acpStatsHint') }, statsLabel)
 				: null,
 			segGroup([
 				h(Button, {
@@ -111,11 +124,10 @@ function renderAgentRow(props: RuntimeControlsProps & {
 	const saved = (status.agent ?? '').trim();
 	const busy = loadingAction === 'config:agent';
 	return h(Row, {
-		style: { gap: '10px', flexWrap: 'wrap' },
 		left: rowCaption(t('config.agent'), t('config.agentDesc')),
-		right: h('div', { style: { display: 'flex', alignItems: 'center', gap: '6px' } },
+		right: h('div', { style: { display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap', maxWidth: '100%' } },
 			h('input', {
-				style: { ...S.input, width: '165px', padding: '3px 8px', fontSize: '11.5px' },
+				style: { ...S.input, width: '165px', maxWidth: '100%', padding: '3px 8px', fontSize: '11.5px' },
 				value: draft,
 				placeholder: t('config.agentPlaceholder'),
 				'aria-label': t('config.agent'),
@@ -141,8 +153,32 @@ function renderAgentRow(props: RuntimeControlsProps & {
 	});
 }
 
+export function renderImageToolRow(props: RuntimeControlsProps): unknown {
+	return boolRow({
+		t: props.t,
+		title: props.t('config.imageTool'),
+		desc: props.t('config.imageToolDesc'),
+		cfgKey: 'imageTool',
+		value: props.status.imageTool !== false,
+		loadingAction: props.loadingAction,
+		setCfg: props.setCfg,
+	});
+}
+
+export function renderSyncCustomizationsRow(props: RuntimeControlsProps): unknown {
+	return boolRow({
+		t: props.t,
+		title: props.t('config.syncCustomizations'),
+		desc: props.t('config.syncCustomizationsDesc'),
+		cfgKey: 'syncAccountCustomizations',
+		value: props.status.syncAccountCustomizations !== false,
+		loadingAction: props.loadingAction,
+		setCfg: props.setCfg,
+	});
+}
+
 export function RuntimeControlsSection(props: RuntimeControlsProps): unknown {
-	const { t, status, loadingAction, setCfg } = props;
+	const { t, status, loadingAction, setCfg, exclude } = props;
 	const [agentDraft, setAgentDraft] = useState(status.agent ?? '');
 	useEffect(() => {
 		setAgentDraft(status.agent ?? '');
@@ -160,21 +196,28 @@ export function RuntimeControlsSection(props: RuntimeControlsProps): unknown {
 			setCfg,
 		}),
 		renderTransportRow(props),
+		exclude?.imageTool ? null : renderImageToolRow(props),
+		exclude?.syncCustomizations ? null : renderSyncCustomizationsRow(props),
+		// Opt-in: an absent field means "off", so the switch must not claim to be
+		// on when the host never reported a value.
 		boolRow({
 			t,
-			title: t('config.imageTool'),
-			desc: t('config.imageToolDesc'),
-			cfgKey: 'imageTool',
-			value: status.imageTool !== false,
+			title: t('config.backgroundWakeup'),
+			desc: t('config.backgroundWakeupDesc'),
+			cfgKey: 'backgroundWakeup',
+			value: status.backgroundWakeup === true,
 			loadingAction,
 			setCfg,
 		}),
+		// Reverse MCP bridge: experimental and off by default, but it MUST be
+		// reachable from the panel — it used to have no UI, no settable HTTP key,
+		// and a hand-edited runtime-overrides.json that never took effect (#196).
 		boolRow({
 			t,
-			title: t('config.syncCustomizations'),
-			desc: t('config.syncCustomizationsDesc'),
-			cfgKey: 'syncAccountCustomizations',
-			value: status.syncAccountCustomizations !== false,
+			title: t('config.mcpBridge'),
+			desc: t('config.mcpBridgeDesc'),
+			cfgKey: 'mcpBridge',
+			value: status.mcpBridge === true,
 			loadingAction,
 			setCfg,
 		}),

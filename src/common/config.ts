@@ -2,7 +2,8 @@
 // entry config > defaults (spec ADR-13). The overrides file backs /agy
 // hot changes and survives restarts; the env is read per call so a changed
 // process environment is honored without reload.
-import { defaultConfig, type AgyTransportMode, type PermissionMode, type PluginConfig } from './types.ts'
+import { defaultConfig, type AgyTransportMode, type PermissionMode, type PluginConfig, type TranslateDisplayMode, type WarmupWindowMode } from './types.ts'
+import { MIN_WARMUP_INTERVAL_HOURS } from './timeouts.ts'
 import { readFileSync, existsSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
@@ -11,6 +12,17 @@ export interface OverridesFile { [key: string]: unknown }
 
 export function piHome(): string {
   return process.env.PI_CODING_AGENT_DIR ?? process.env.PI_AGENT_DIR ?? process.env.DSH_HOME ?? join(homedir(), '.pi', 'agent')
+}
+
+/**
+ * Clamp the scheduled-warmup interval. `0` disables it; anything else is at
+ * least MIN_WARMUP_INTERVAL_HOURS (a pool sweep now spans minutes, so a 1–2h
+ * interval would re-arm before the previous run drains).
+ */
+export function clampWarmupIntervalHours(hours: number): number {
+  const floored = Math.floor(hours)
+  if (!Number.isFinite(floored) || floored <= 0) return 0
+  return Math.min(168, Math.max(MIN_WARMUP_INTERVAL_HOURS, floored))
 }
 
 export function dshHome(): string {
@@ -95,6 +107,18 @@ function asTransport(v: unknown): AgyTransportMode | undefined {
   return s === 'cli' || s === 'acp' ? s : undefined
 }
 
+function asTranslateDisplay(v: unknown): TranslateDisplayMode | undefined {
+  if (typeof v !== 'string') return undefined
+  const s = v.trim().toLowerCase()
+  return s === 'card' || s === 'replace' ? s : undefined
+}
+
+function asWarmupWindows(v: unknown): WarmupWindowMode | undefined {
+  if (typeof v !== 'string') return undefined
+  const s = v.trim().toLowerCase()
+  return s === 'weekly' || s === '5h' || s === 'both' ? s : undefined
+}
+
 /** Layered config read; cheap enough to call per request (thunk pattern). */
 export function resolveConfig(
   entry: Record<string, unknown> | undefined,
@@ -125,6 +149,10 @@ export function resolveConfig(
     mediaMaxFileBytes: asNum(get('mediaMaxFileBytes')) ?? base.mediaMaxFileBytes,
     defaultModel: asString(get('defaultModel')) ?? base.defaultModel,
     defaultEffort: asString(get('defaultEffort')) ?? base.defaultEffort,
+    orchestratorPlannerModel: asString(get('orchestratorPlannerModel')) ?? base.orchestratorPlannerModel,
+    orchestratorPlannerEffort: asString(get('orchestratorPlannerEffort')) ?? base.orchestratorPlannerEffort,
+    orchestratorExecutorModel: asString(get('orchestratorExecutorModel')) ?? base.orchestratorExecutorModel,
+    orchestratorExecutorEffort: asString(get('orchestratorExecutorEffort')) ?? base.orchestratorExecutorEffort,
     timeoutMs: asNum(get('timeoutMs')) ?? base.timeoutMs,
     longToolIdleMinutes: asNum(get('longToolIdleMinutes')) ?? base.longToolIdleMinutes,
     maxTurnMinutes: asNum(get('maxTurnMinutes')) ?? base.maxTurnMinutes,
@@ -132,6 +160,8 @@ export function resolveConfig(
     dispatchTimeoutMinutes: asNum(get('dispatchTimeoutMinutes')) ?? base.dispatchTimeoutMinutes,
     dispatchRetries: asNum(get('dispatchRetries')) ?? base.dispatchRetries,
     parallelSameAccount: asBool(get('parallelSameAccount')) ?? base.parallelSameAccount,
+    respectExternalSignIn: asBool(get('respectExternalSignIn')) ?? base.respectExternalSignIn,
+    reapOrphanMcp: asBool(get('reapOrphanMcp')) ?? base.reapOrphanMcp,
     maxConcurrent: asNum(get('maxConcurrent')) ?? base.maxConcurrent,
     contextWindowDefault: asNum(get('contextWindowDefault')) ?? base.contextWindowDefault,
     maxTokensDefault: asNum(get('maxTokensDefault')) ?? base.maxTokensDefault,
@@ -139,6 +169,8 @@ export function resolveConfig(
     modelApiMaxRetries: asNum(get('modelApiMaxRetries')) ?? base.modelApiMaxRetries,
     slimPromptRules: asBool(get('slimPromptRules')) ?? base.slimPromptRules,
     forwardSystemPrompt: asBool(get('forwardSystemPrompt')) ?? base.forwardSystemPrompt,
+    auxNeutralWorkspace: asBool(get('auxNeutralWorkspace')) ?? base.auxNeutralWorkspace,
+    cloakSystemPrompt: asBool(get('cloakSystemPrompt')) ?? base.cloakSystemPrompt,
     digestMaxChars: asNum(get('digestMaxChars')) ?? base.digestMaxChars,
     contextTransferMaxChars: asNum(get('contextTransferMaxChars')) ?? base.contextTransferMaxChars,
     modelsCacheTtlMs: asNum(get('modelsCacheTtlMs')) ?? base.modelsCacheTtlMs,
@@ -172,7 +204,13 @@ export function resolveConfig(
     suppressAgyAutoUpdate: asBool(get('suppressAgyAutoUpdate')) ?? base.suppressAgyAutoUpdate,
     autoWarmup: asBool(get('autoWarmup')) ?? base.autoWarmup,
     warmupModels: asStringArray(get('warmupModels')) ?? base.warmupModels,
+    warmupWindows: asWarmupWindows(get('warmupWindows')) ?? base.warmupWindows,
+    warmupDailyTime: asString(get('warmupDailyTime')) ?? base.warmupDailyTime,
+    warmupTimezone: asString(get('warmupTimezone')) ?? base.warmupTimezone,
+    warmupIntervalHours: asNum(get('warmupIntervalHours')) ?? base.warmupIntervalHours,
+    warmupMaxProbesPerRun: asNum(get('warmupMaxProbesPerRun')) ?? base.warmupMaxProbesPerRun,
     autoTranslate: asBool(get('autoTranslate')) ?? base.autoTranslate,
+    translateDisplay: asTranslateDisplay(get('translateDisplay')) ?? base.translateDisplay,
     translateModel: asString(get('translateModel')) ?? base.translateModel,
     translateEffort: asString(get('translateEffort')) ?? base.translateEffort,
     translateTargetLanguage: asString(get('translateTargetLanguage')) ?? base.translateTargetLanguage,
@@ -192,6 +230,11 @@ export function resolveConfig(
     imageMaxBytes: asNum(get('imageMaxBytes')) ?? base.imageMaxBytes,
     imageOutputDir: asString(get('imageOutputDir')) ?? base.imageOutputDir,
     imageRetries: asNum(get('imageRetries')) ?? base.imageRetries,
+    btwModel: asString(get('btwModel')) ?? base.btwModel,
+    btwEffort: asString(get('btwEffort')) ?? base.btwEffort,
+    backgroundWakeup: asBool(get('backgroundWakeup')) ?? base.backgroundWakeup,
+    backgroundWakeupTtlMinutes: asNum(get('backgroundWakeupTtlMinutes')) ?? base.backgroundWakeupTtlMinutes,
+    backgroundWakeupMaxPerSession: asNum(get('backgroundWakeupMaxPerSession')) ?? base.backgroundWakeupMaxPerSession,
   }
   // Env wins last (spec ADR-13).
   if (env.DSH_AGY_ENABLED !== undefined) cfg.enabled = asBool(env.DSH_AGY_ENABLED) ?? cfg.enabled
@@ -228,6 +271,10 @@ export function resolveConfig(
   }
   if (env.DSH_AGY_DEFAULT_MODEL) cfg.defaultModel = env.DSH_AGY_DEFAULT_MODEL
   if (env.DSH_AGY_DEFAULT_EFFORT) cfg.defaultEffort = env.DSH_AGY_DEFAULT_EFFORT
+  if (env.DSH_AGY_ORCHESTRATOR_PLANNER_MODEL !== undefined) cfg.orchestratorPlannerModel = env.DSH_AGY_ORCHESTRATOR_PLANNER_MODEL
+  if (env.DSH_AGY_ORCHESTRATOR_PLANNER_EFFORT !== undefined) cfg.orchestratorPlannerEffort = env.DSH_AGY_ORCHESTRATOR_PLANNER_EFFORT
+  if (env.DSH_AGY_ORCHESTRATOR_EXECUTOR_MODEL !== undefined) cfg.orchestratorExecutorModel = env.DSH_AGY_ORCHESTRATOR_EXECUTOR_MODEL
+  if (env.DSH_AGY_ORCHESTRATOR_EXECUTOR_EFFORT !== undefined) cfg.orchestratorExecutorEffort = env.DSH_AGY_ORCHESTRATOR_EXECUTOR_EFFORT
   if (env.DSH_AGY_TIMEOUT_MS) {
     const t = asNum(env.DSH_AGY_TIMEOUT_MS)
     if (t && t > 0) cfg.timeoutMs = t
@@ -322,6 +369,22 @@ export function resolveConfig(
     const wm = asStringArray(env.DSH_AGY_WARMUP_MODELS.split(','))
     if (wm) cfg.warmupModels = wm
   }
+  if (env.DSH_AGY_WARMUP_WINDOWS) {
+    const ww = asWarmupWindows(env.DSH_AGY_WARMUP_WINDOWS)
+    if (ww) cfg.warmupWindows = ww
+  }
+  if (env.DSH_AGY_WARMUP_DAILY_TIME !== undefined) cfg.warmupDailyTime = env.DSH_AGY_WARMUP_DAILY_TIME
+  if (env.DSH_AGY_WARMUP_TIMEZONE !== undefined) cfg.warmupTimezone = env.DSH_AGY_WARMUP_TIMEZONE
+  if (env.DSH_AGY_WARMUP_INTERVAL_HOURS) {
+    const ih = asNum(env.DSH_AGY_WARMUP_INTERVAL_HOURS)
+    if (ih !== undefined && ih >= 0) cfg.warmupIntervalHours = Math.min(168, Math.floor(ih))
+  }
+  if (env.DSH_AGY_WARMUP_MAX_PROBES) {
+    const mp = asNum(env.DSH_AGY_WARMUP_MAX_PROBES)
+    if (mp !== undefined && mp >= 0) cfg.warmupMaxProbesPerRun = Math.floor(mp)
+  }
+  cfg.warmupIntervalHours = clampWarmupIntervalHours(cfg.warmupIntervalHours)
+  cfg.warmupMaxProbesPerRun = Math.min(200, Math.max(0, Math.floor(cfg.warmupMaxProbesPerRun)))
   if (env.DSH_AGY_AUTO_TRANSLATE !== undefined) {
     const at = asBool(env.DSH_AGY_AUTO_TRANSLATE)
     if (at !== undefined) cfg.autoTranslate = at
@@ -329,6 +392,8 @@ export function resolveConfig(
   if (env.DSH_AGY_TRANSLATE_MODEL) cfg.translateModel = env.DSH_AGY_TRANSLATE_MODEL
   if (env.DSH_AGY_TRANSLATE_EFFORT) cfg.translateEffort = env.DSH_AGY_TRANSLATE_EFFORT
   if (env.DSH_AGY_TRANSLATE_LANG) cfg.translateTargetLanguage = env.DSH_AGY_TRANSLATE_LANG
+  const td = asTranslateDisplay(env.DSH_AGY_TRANSLATE_DISPLAY)
+  if (td !== undefined) cfg.translateDisplay = td
   if (env.DSH_AGY_SHOW_HEADER_BADGE !== undefined) {
     const shb = asBool(env.DSH_AGY_SHOW_HEADER_BADGE)
     if (shb !== undefined) cfg.showHeaderBadge = shb
@@ -356,5 +421,29 @@ export function resolveConfig(
     const v = asNum(env.DSH_AGY_IMAGE_RETRIES)
     if (v !== undefined) cfg.imageRetries = v
   }
+  if (env.DSH_AGY_BTW_MODEL !== undefined) cfg.btwModel = env.DSH_AGY_BTW_MODEL
+  if (env.DSH_AGY_BTW_EFFORT !== undefined) cfg.btwEffort = env.DSH_AGY_BTW_EFFORT
+  if (env.DSH_AGY_CLOAK_SYSTEM_PROMPT !== undefined) {
+    const csp = asBool(env.DSH_AGY_CLOAK_SYSTEM_PROMPT)
+    if (csp !== undefined) cfg.cloakSystemPrompt = csp
+  }
+  if (env.DSH_AGY_AUX_NEUTRAL_WORKSPACE !== undefined) {
+    const anw = asBool(env.DSH_AGY_AUX_NEUTRAL_WORKSPACE)
+    if (anw !== undefined) cfg.auxNeutralWorkspace = anw
+  }
+  if (env.DSH_AGY_BACKGROUND_WAKEUP !== undefined) {
+    const bw = asBool(env.DSH_AGY_BACKGROUND_WAKEUP)
+    if (bw !== undefined) cfg.backgroundWakeup = bw
+  }
+  if (env.DSH_AGY_BACKGROUND_WAKEUP_TTL_MINUTES) {
+    const ttl = asNum(env.DSH_AGY_BACKGROUND_WAKEUP_TTL_MINUTES)
+    if (ttl !== undefined && ttl > 0) cfg.backgroundWakeupTtlMinutes = Math.min(240, Math.max(1, Math.floor(ttl)))
+  }
+  if (env.DSH_AGY_BACKGROUND_WAKEUP_MAX_PER_SESSION) {
+    const max = asNum(env.DSH_AGY_BACKGROUND_WAKEUP_MAX_PER_SESSION)
+    if (max !== undefined && max > 0) cfg.backgroundWakeupMaxPerSession = Math.min(100, Math.max(1, Math.floor(max)))
+  }
+  cfg.backgroundWakeupTtlMinutes = Math.min(240, Math.max(1, Math.floor(cfg.backgroundWakeupTtlMinutes)))
+  cfg.backgroundWakeupMaxPerSession = Math.min(100, Math.max(1, Math.floor(cfg.backgroundWakeupMaxPerSession)))
   return cfg
 }

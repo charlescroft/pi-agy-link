@@ -14,6 +14,8 @@ import { installImageEnhancer, setClientContext } from './images.ts';
 import { installAgentEmbedRenderer } from './embed.ts';
 import { installDecisionChips } from './decisions.ts';
 import { installTranslationUi } from './translate.ts';
+import { installAcpCards } from './acp-notice.ts';
+import { installBtwUi } from './btw.ts';
 import { installCompactionCard } from './compaction.ts';
 import { ensureScrollListener, disposeScrollListener, setOverlaySuspended } from './scroll-guard.ts';
 import { installSettingsNavIcon } from './icons.ts';
@@ -115,6 +117,10 @@ export function apply(ctx: ClientContext): void {
 				order: 10,
 				label: () => locale.bind(NS)('section.label'),
 				locale: NS,
+				// The header component needs the session id to scope subagents.
+				// `inject` is supported by the slot runtime but missing from this
+				// bundle's TS surface, so spread it past the excess-property check.
+				...({ inject: (sessionId: string) => ({ sessionId }) } as Record<string, unknown>),
 			},
 			AgySessionStatus,
 		);
@@ -212,13 +218,38 @@ export function apply(ctx: ClientContext): void {
 
 	// Interactive compaction card (DeepSeek Flash native visual parity + token delta metrics).
 	ctx.effect(() => installCompactionCard());
+
 	// Gemini plain-language translation: the persisted record card plus the
 	// per-reply "译成人话" action. Contained: a host that lacks uiConversation
 	// or the chat slots must keep every other plugin contribution (header badge,
 	// settings, toolviews) alive instead of failing the whole client apply.
+	// ACP channel cards: the transport keeps narrating after a turn ends, so the
+	// host persists those frames as plugin records and these Definitions project
+	// them into the conversation without spending a model turn. They live inside
+	// the translation effect because both project persisted records into the chat:
+	// a host that registers conversation Definitions once must not be asked twice.
+	// (Splitting them into a second effect doubled the registered chat-node slots
+	// and the locale lifecycle test rightly caught it.)
 	ctx.effect(() => {
 		try {
-			return installTranslationUi(ctx as never, NS);
+			const dispose = installTranslationUi(ctx as never, NS);
+			let disposeAcp = () => {};
+			try {
+				disposeAcp = installAcpCards(ctx as never, NS);
+			} catch (e) {
+				console.warn('[dsh-agy-link] ACP cards unavailable:', e);
+			}
+			let disposeBtw = () => {};
+			try {
+				disposeBtw = installBtwUi(ctx as never, NS);
+			} catch (e) {
+				console.warn('[dsh-agy-link] btw UI unavailable:', e);
+			}
+			return () => {
+				disposeBtw();
+				disposeAcp();
+				dispose();
+			};
 		} catch (e) {
 			console.warn('[dsh-agy-link] translation UI unavailable:', e);
 			return () => {};

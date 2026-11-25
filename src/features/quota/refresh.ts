@@ -5,6 +5,7 @@
 import { existsSync, readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import type {
+  AccountPlanTier,
   FamilyQuotaInfo,
   ManagedAccount,
   ModelFamily,
@@ -12,8 +13,9 @@ import type {
   QuotaUnavailableState,
 } from '../../common/pool-types.ts'
 import { quotaSummarySuppressed } from '../../common/pool-types.ts'
-import { QUOTA_FREE_TIER_RETRY_MS, QUOTA_LICENSE_RETRY_MS } from '../../common/timeouts.ts'
+import { QUOTA_FREE_TIER_RETRY_MS, QUOTA_LICENSE_RETRY_MS, QUOTA_SUMMARY_REFUSED_RETRY_MS } from '../../common/timeouts.ts'
 import { shouldReleaseOrphanedCooldown, summaryHasArgonGroup } from '../../domain/quota/buckets.ts'
+import { inferAccountPlanTier, type PlanTierGroupLike } from '../../domain/quota/tier.ts'
 import type { QuotaSummaryFailure } from './http.ts'
 import {
   buildFamilyQuotas,
@@ -48,6 +50,8 @@ export interface QuotaRefreshPool {
   noteQuotaUnavailable(id: string, state: QuotaUnavailableState): void
   /** Clears that marker once an authoritative snapshot arrives. */
   clearQuotaUnavailable(id: string): void
+  /** Persist inferred subscription tier (optional for lightweight test doubles). */
+  setAccountPlanTier?(id: string, tier: AccountPlanTier | undefined): boolean
 }
 
 /**
@@ -74,6 +78,8 @@ export interface QuotaRefreshDeps {
   credentialFingerprint(raw: string | null | undefined): string | null
   /** The refusal behind the last empty summary (undefined when not tracked). */
   summaryFailure?(): QuotaSummaryFailure | null
+  /** Raw CLI `/usage` groups from the most recent readCliUsageFamilies call. */
+  lastCliUsageGroups?(): readonly PlanTierGroupLike[] | undefined
 }
 
 /** Map the HTTP verdict onto the account-level marker. */
@@ -172,9 +178,17 @@ export async function refreshAccountQuotaPipeline(
       if (cliFamilies.argon) {
         deps.pool.noteDedicatedGroup(account.id, 'argon')
       } else {
+        const groupSeenBefore = typeof deps.pool.hasDedicatedGroup === 'function' && deps.pool.hasDedicatedGroup(account.id, 'argon')
         deps.pool.clearQuotaFamily(account.id, 'argon')
+        if (shouldReleaseOrphanedCooldown({
+          summaryAuthoritative: true,
+          groupPresent: false,
+          groupSeenBefore,
+          hasCooldown: account.cooldowns?.argon !== undefined,
+        })) {
+          deps.pool.clearCooldown(account.id, 'argon')
+        }
         deps.pool.forgetDedicatedGroup(account.id, 'argon')
-        deps.pool.clearCooldown(account.id, 'argon')
       }
       // The CLI just produced authoritative quotas for this account, so any
       // marker recorded while the REST summary endpoint was down no longer
@@ -183,6 +197,13 @@ export async function refreshAccountQuotaPipeline(
       // unreachable · data from <old time>" while the stored quotas kept
       // advancing (issue #151).
       deps.pool.clearQuotaUnavailable(account.id)
+      const cliTier = inferAccountPlanTier({
+        groups: deps.lastCliUsageGroups?.(),
+        quotas: cliFamilies,
+      })
+      if (cliTier !== undefined) {
+        deps.pool.setAccountPlanTier?.(account.id, cliTier)
+      }
       deps.pool.updateAccountQuotas(account.id, cliFamilies, email)
       return cliFamilies
     }
@@ -306,7 +327,16 @@ export async function refreshAccountQuotaPipeline(
       const previous = account.quotaUnavailable
       // A free-tier refusal tracks the weekly window; an unlicensed account is
       // re-probed sooner because a fresh licence can arrive at any time.
-      const retryMs = reason === 'no_summary_access' ? QUOTA_FREE_TIER_RETRY_MS : QUOTA_LICENSE_RETRY_MS
+      // `no_summary_access` describes the free-tier SHAPE, not a proven free
+      // plan: an account that already reported a 5-hour window is a paid account
+      // being refused transiently. Freezing it for a week left its Gemini row on
+      // a multi-day-old snapshot while Argon kept advancing (2026-11-23).
+      const has5hEvidence = Object.values(account.quotas ?? {}).some(
+        (q) => typeof q?.remainingFraction === 'number',
+      )
+      const retryMs = reason === 'no_summary_access'
+        ? (has5hEvidence ? QUOTA_SUMMARY_REFUSED_RETRY_MS : QUOTA_FREE_TIER_RETRY_MS)
+        : QUOTA_LICENSE_RETRY_MS
       deps.pool.noteQuotaUnavailable(account.id, {
         reason,
         since: previous?.reason === reason ? previous.since : now,
@@ -368,6 +398,24 @@ export async function refreshAccountQuotaPipeline(
       }
       deps.pool.forgetDedicatedGroup(account.id, 'argon')
     }
+  }
+
+  const restTier = inferAccountPlanTier({
+    groups: summaryGroups,
+    quotas: familyQuotas,
+    quotaUnavailable: currentUnavailReason === 'no_summary_access'
+      ? {
+        reason: 'no_summary_access',
+        since: now,
+        retryAfter: now + (Object.values(account.quotas ?? {}).some((q) => typeof q?.remainingFraction === 'number')
+          ? QUOTA_SUMMARY_REFUSED_RETRY_MS
+          : QUOTA_FREE_TIER_RETRY_MS),
+      }
+      : account.quotaUnavailable,
+    modelIds: Object.keys(modelsCatalog),
+  })
+  if (restTier !== undefined) {
+    deps.pool.setAccountPlanTier?.(account.id, restTier)
   }
 
   deps.pool.updateAccountQuotas(account.id, familyQuotas, email)

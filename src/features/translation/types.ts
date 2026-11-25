@@ -15,7 +15,14 @@ export const MIN_TEXT_LIMIT = 200
 
 export interface TranslationRecord {
   version: 1
-  turn: number
+  /**
+   * Always `null` for new records so DSH's `payloadCoordinates(event)` treats
+   * the record as session-scoped and never rewrites `currentTurn` when a user
+   * translates an older turn mid-session. Legacy records hold the integer turn.
+   */
+  turn: number | null
+  /** The translated turn number (preferred over legacy `turn`). */
+  sourceTurn?: number
   /** seq of the translated assistant message — the client anchors the card just below it. */
   anchorSeq: number
   text: string
@@ -145,6 +152,8 @@ export interface TranslationServiceDeps {
   poolQuotaHops?: () => number
   log?: (msg: string) => void
   now?: () => number
+  /** Run `fn` after `ms` (injected so tests drive the auto-translate back-off). */
+  schedule?: (fn: () => Promise<unknown>, ms: number) => void
 }
 
 export interface TranslateTurnOptions {

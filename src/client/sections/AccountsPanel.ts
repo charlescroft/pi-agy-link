@@ -6,12 +6,18 @@
 // busy scoping and host-derived progress survive modal close/reopen.
 
 import { buildAccountModelRows, type AccountModelDisplayItem } from '../../common/account-models.ts';
-import type { AccountPoolData, ManagedAccount } from '../../common/pool-types.ts';
+import { argonSharesGoogleGroup, type AccountPlanTier, type AccountPoolData, type ManagedAccount } from '../../common/pool-types.ts';
+import { renderDuplicateBadge } from './duplicate-badge.ts';
+import { resolveFamilyActiveIds, resolveFamilyPinnedIds } from './active-account-ids.ts';
+import { accountDisplayAlias as aliasOf, type AliasTranslator } from './account-alias.ts';
+import { resolveAccountPlanTier } from '../../common/plan-tier.ts';
 import {
 	QUOTA_FAMILIES,
-	isAccountCriticalAuth,
+	accountAuthState,
 	isAccountFullyCooling,
 	isFamilyCooling,
+	isFamilyInCooldown,
+	type AccountAuthState,
 	type QuotaFamily,
 } from '../../common/quota-bench.ts';
 import { effortLabel } from '../../common/reasoning.ts';
@@ -64,24 +70,6 @@ export interface AccountsPanelProps {
 	handlers: AccountsPanelHandlers;
 }
 
-function resolveFamilyActiveIds(
-	pool: AccountPoolData | undefined,
-	optimisticActiveByFamily: Partial<Record<QuotaFamily, string>> | undefined,
-	optimisticActiveId: string | null | undefined,
-): Partial<Record<QuotaFamily, string>> {
-	const out: Partial<Record<QuotaFamily, string>> = {};
-	for (const fam of QUOTA_FAMILIES) {
-		out[fam] =
-			optimisticActiveByFamily?.[fam] ??
-			(fam === 'google' ? optimisticActiveId ?? undefined : undefined) ??
-			pool?.resolvedActiveAccountIds?.[fam] ??
-			(fam === 'google'
-				? (pool?.activeAccountId ?? pool?.lastActiveAccountId ?? pool?.activeAccountIds?.google ?? pool?.primaryAccountId)
-				: pool?.activeAccountIds?.[fam]);
-	}
-	return out;
-}
-
 export function AccountsPanel(props: AccountsPanelProps): unknown {
 	const {
 		t, pool, accounts, accountModels, loadingAction, quotaRefreshing = [], warmupState,
@@ -94,24 +82,27 @@ export function AccountsPanel(props: AccountsPanelProps): unknown {
 		loadingAction === `${action}:${acc.id}`;
 
 	const activeIds = resolveFamilyActiveIds(pool, optimisticActiveByFamily, optimisticActiveId);
+	const pinnedIds = resolveFamilyPinnedIds(pool, optimisticActiveByFamily, optimisticActiveId);
 	const now = Date.now();
 
 	return accounts.map((acc: ManagedAccount) => {
 		const isPrimary = acc.id === pool?.primaryAccountId;
-		const isAuthRequired = isAccountCriticalAuth(acc);
+		const authState = accountAuthState(acc);
+		const isAuthRequired = authState !== 'healthy';
 		const isFullyCooling = isAccountFullyCooling(acc, now);
 		const isSyncing = loadingAction === `refresh:${acc.id}` || loadingAction === 'refresh:all' || quotaRefreshing.includes(acc.id);
 		const isWarming = loadingAction === `warmup:${acc.id}` || (warmupState?.running === true && warmupState.activeAccountIds.includes(acc.id));
-		const hasAnyActiveFamily = Boolean(
-			acc.enabled &&
-			!isAuthRequired &&
-			QUOTA_FAMILIES.some((fam) =>
-				(fam !== 'argon' || acc.quotas.argon !== undefined) &&
-				!isFamilyCooling(acc, fam, now) &&
-				activeIds[fam] === acc.id,
-			),
+		// A real pin is "in use" (blue); a mere eligibility RESOLUTION is a
+		// prediction with a quieter accent. Only always-visible families count.
+		const frameFamilies = QUOTA_FAMILIES.filter((fam) =>
+			(fam === 'google' || fam === 'argon') &&
+			(fam !== 'argon' || acc.quotas.argon !== undefined) &&
+			acc.enabled && !isAuthRequired && !isFamilyCooling(acc, fam, now) &&
+			activeIds[fam] === acc.id,
 		);
-		const dotColor = !acc.enabled ? '#64748b' : isAuthRequired ? '#ef4444' : isFullyCooling ? '#f59e0b' : '#10b981';
+		const hasPinnedFamily = frameFamilies.some((fam) => pinnedIds[fam] === acc.id);
+		const hasPredictedFamily = !hasPinnedFamily && frameFamilies.length > 0;
+		const dotColor = !acc.enabled ? '#64748b' : authState === 'review' ? '#f59e0b' : isAuthRequired ? '#ef4444' : isFullyCooling ? '#f59e0b' : '#10b981';
 		const isEditingProxy = editingProxyId === acc.id;
 		const isEditingAlias = editingAliasId === acc.id;
 		const isExpanded = expandedModels[acc.id] ?? false;
@@ -122,24 +113,29 @@ export function AccountsPanel(props: AccountsPanelProps): unknown {
 			cursor: 'default',
 			padding: '10px 14px',
 			marginBottom: '8px',
-			...(hasAnyActiveFamily ? {
+			...(hasPinnedFamily ? {
 				borderColor: 'var(--dsw-alias-state-business-primary, #3b82f6)',
 				boxShadow: 'var(--agy-shadow-card-primary)',
+			} : hasPredictedFamily ? {
+				// "预计使用": a quiet violet, no glow — never mistakable for "in use".
+				borderColor: 'rgba(139, 92, 246, 0.45)',
 			} : {}),
 			...(!acc.enabled ? { opacity: 0.72 } : {}),
 		};
-		const legacyDefault = acc.defaultAlias === undefined && acc.systemHome && acc.alias === '主账号 (系统登录)';
-		const displayAlias = acc.defaultAlias || legacyDefault
-			? acc.systemHome ? t('account.defaultAlias') : t('account.aliasDefault', { number: accIndex + 1 })
-			: acc.alias;
+		const displayAlias = accountDisplayAlias(acc, accIndex, t);
 
 		const childModels = buildAccountModelRows(acc, accountModels?.[acc.id]);
 		const renderQuotaBar = (label: string, familyKey: QuotaFamily): unknown => {
 			const cooling = isFamilyCooling(acc, familyKey, now);
 			const isFamActive = Boolean(acc.enabled && !isAuthRequired && !cooling && activeIds[familyKey] === acc.id);
-			const canSetFamActive = Boolean(acc.enabled && !isAuthRequired && !cooling && activeIds[familyKey] !== acc.id);
+			const isFamPinned = Boolean(isFamActive && pinnedIds[familyKey] === acc.id);
+			const isFamPredicted = Boolean(isFamActive && !isFamPinned);
+			// A prediction must be pinnable, otherwise the account serves a family
+			// with no way to confirm it.
+			const canSetFamActive = Boolean(acc.enabled && !isAuthRequired && !cooling && !isFamPinned);
 			return renderFamilyQuotaBar(t, label, familyKey, acc, isSyncing, {
 				isActive: isFamActive,
+				predicted: isFamPredicted,
 				canSetActive: canSetFamActive,
 				settingActive: loadingAction === `active:${acc.id}:${familyKey}`,
 				clearingCooldown: loadingAction === `clearCooldown:${acc.id}:${familyKey}`,
@@ -157,13 +153,13 @@ export function AccountsPanel(props: AccountsPanelProps): unknown {
 			style: cardStyle,
 		},
 			renderCardHeader(t, acc, {
-				isPrimary, isAuthRequired, dotColor, isEditingProxy, isSyncing, isWarming, isEditingAlias,
-				displayAlias, accIndex, accounts, pool, loadingAction, accountActionBusy, handlers, setEditingProxyId, setEditingAliasId,
+				isPrimary, isAuthRequired, authState, dotColor, isEditingProxy, isSyncing, isWarming, isEditingAlias,
+				displayAlias, accountModelIds: accountModels?.[acc.id]?.map((m) => m.id), accIndex, accounts, pool, loadingAction, accountActionBusy, handlers, setEditingProxyId, setEditingAliasId,
 			}),
 			h('div', { key: 'agy-body', style: S.quotaBox },
 				renderQuotaUnavailableNote(t, acc),
 				renderQuotaBar('Gemini', 'google'),
-				acc.quotas.argon ? renderQuotaBar('Argon', 'argon') : null,
+				(acc.quotas.argon || (!argonSharesGoogleGroup(acc) && isFamilyInCooldown(acc, 'argon', now))) ? renderQuotaBar('Argon', 'argon') : null,
 				h(Button, {
 					variant: 'dashed',
 					style: {
@@ -193,15 +189,22 @@ export function AccountsPanel(props: AccountsPanelProps): unknown {
 	});
 }
 
+/** Card label: a generated default alias is re-rendered in the active locale. */
+function accountDisplayAlias(acc: ManagedAccount, accIndex: number, t: Translator): string {
+	return aliasOf(t as unknown as AliasTranslator, acc, accIndex);
+}
+
 interface CardHeaderCtx {
 	isPrimary: boolean;
 	isAuthRequired: boolean;
+	authState: AccountAuthState;
 	dotColor: string;
 	isEditingProxy: boolean;
 	isEditingAlias: boolean;
 	isSyncing: boolean;
 	isWarming: boolean;
 	displayAlias: string;
+	accountModelIds?: readonly string[];
 	accIndex: number;
 	accounts: ManagedAccount[];
 	pool: AccountPoolData | undefined;
@@ -218,16 +221,57 @@ function extractActionUrl(text?: string): string | undefined {
 	return m ? m[0] : undefined;
 }
 
+function renderPlanTierBadge(t: Translator, tier: AccountPlanTier | undefined): unknown {
+	if (!tier || tier === 'unknown') return null;
+	const palette: Record<Exclude<AccountPlanTier, 'unknown'>, { bg: string; text: string; border: string }> = {
+		ultra: { bg: 'rgba(139, 92, 246, 0.14)', text: '#8b5cf6', border: 'rgba(139, 92, 246, 0.4)' },
+		pro: { bg: 'rgba(59, 130, 246, 0.14)', text: '#3b82f6', border: 'rgba(59, 130, 246, 0.4)' },
+		free: { bg: 'var(--agy-bg-subbox)', text: 'var(--agy-text-secondary)', border: 'var(--agy-border-subbox)' },
+		enterprise: { bg: 'rgba(16, 185, 129, 0.14)', text: '#10b981', border: 'rgba(16, 185, 129, 0.4)' },
+	};
+	const c = palette[tier];
+	const label = t(`plan.${tier}` as never);
+	return h('span', {
+		className: `agy-plan-badge agy-plan-${tier}`,
+		title: label,
+		style: {
+			...S.badgeTag!,
+			background: c.bg,
+			color: c.text,
+			borderColor: c.border,
+			fontSize: '10px',
+			fontWeight: 700,
+			padding: '1px 6px',
+			letterSpacing: '0.02em',
+			whiteSpace: 'nowrap',
+		},
+	}, label);
+}
+
 function renderStatusBadges(t: Translator, acc: ManagedAccount, ctx: CardHeaderCtx): unknown[] {
-	const { isAuthRequired } = ctx;
-	const unavailReason = acc.quotaUnavailable?.reason;
-	const isTos = isAuthRequired && (unavailReason === 'tos_violation' || /\bTOS_VIOLATION\b|violation of Terms of Service/i.test(acc.authError ?? ''));
-	const isValidation = isAuthRequired && !isTos && (unavailReason === 'validation_required' || /\bVALIDATION_REQUIRED\b/i.test(acc.authError ?? ''));
-	const authLabel = isTos ? t('status.tosBanned') : isValidation ? t('status.validationRequired') : t('status.authRequired');
+	const { isAuthRequired, authState } = ctx;
+	const planTier = resolveAccountPlanTier(acc, ctx.accountModelIds);
+	// The badge must say which KIND of problem this is: only `relogin`/`tos` mean
+	// "your login is gone". `review` is a flag awaiting proof, so it is amber and
+	// tells the user the plugin is re-checking instead of begging for a re-login.
+	const authLabel = authState === 'tos'
+		? t('status.tosBanned')
+		: authState === 'validation'
+			? t('status.validationRequired')
+			: authState === 'review'
+				? t('status.authReview')
+				: t('status.authRequired');
+	const authColor = authState === 'review'
+		? { color: '#b45309', borderColor: '#fcd34d', bg: 'rgba(245, 158, 11, 0.14)' }
+		: { color: '#ef4444', borderColor: '#fca5a5', bg: 'var(--agy-badge-email-bg)' };
+	const authTitle = authState === 'review'
+		? `${acc.authError || authLabel} · ${t('status.authReviewHint')}`
+		: (acc.authError || authLabel);
 	const actionUrl = isAuthRequired
 		? (extractActionUrl(acc.authError) ?? (typeof acc.quotaUnavailable?.actionUrl === 'string' && acc.quotaUnavailable.actionUrl.startsWith('https://') ? acc.quotaUnavailable.actionUrl : undefined))
 		: undefined;
 	return [
+		renderPlanTierBadge(t, planTier),
 		acc.email ? h('span', {
 			style: {
 				...S.badgeTag!,
@@ -256,12 +300,12 @@ function renderStatusBadges(t: Translator, acc: ManagedAccount, ctx: CardHeaderC
 		}, uiIcon('globe', 10, 'var(--agy-badge-proxy-text)'), t('status.proxy')) : null,
 		isAuthRequired ? h(actionUrl ? 'a' : 'span', {
 			...(actionUrl ? { href: actionUrl, target: '_blank', rel: 'noopener noreferrer' } : {}),
-			title: acc.authError || authLabel,
+			title: authTitle,
 			style: {
 				...S.badgeTag!,
-				background: 'var(--agy-badge-email-bg)',
-				color: '#ef4444',
-				borderColor: '#fca5a5',
+				background: authColor.bg,
+				color: authColor.color,
+				borderColor: authColor.borderColor,
 				gap: '3px',
 				fontSize: '10px',
 				padding: '1px 5px',
@@ -270,7 +314,7 @@ function renderStatusBadges(t: Translator, acc: ManagedAccount, ctx: CardHeaderC
 				flexShrink: 0,
 				textDecoration: actionUrl ? 'underline' : 'none',
 			},
-		}, uiIcon('alert', 10, '#ef4444'), authLabel) : null,
+		}, uiIcon('alert', 10, authColor.color), authLabel) : null,
 		!acc.enabled ? h('span', {
 			style: {
 				...S.badgeTag!,
@@ -284,11 +328,12 @@ function renderStatusBadges(t: Translator, acc: ManagedAccount, ctx: CardHeaderC
 			},
 			title: t('status.disabled'),
 		}, uiIcon('power', 10, '#64748b'), t('status.disabled')) : null,
+		renderDuplicateBadge(t, acc, ctx.accounts),
 	];
 }
 
 function renderHeaderBadges(t: Translator, acc: ManagedAccount, ctx: CardHeaderCtx): unknown {
-	const { isPrimary, dotColor, displayAlias, accIndex, accounts, handlers } = ctx;
+	const { isPrimary, dotColor, displayAlias, accIndex, accounts, handlers, isEditingAlias, setEditingAliasId } = ctx;
 	return h('div', { className: 'agy-card-title-cluster', style: { display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap', minWidth: 0 } },
 		h('span', {
 			style: {
@@ -323,8 +368,33 @@ function renderHeaderBadges(t: Translator, acc: ManagedAccount, ctx: CardHeaderC
 			style: { background: dotColor, boxShadow: `0 0 6px ${dotColor}aa`, marginLeft: '1px' },
 		}),
 		h('span', {
-			style: { fontWeight: 700, fontSize: '13px', color: 'var(--agy-text-primary)', whiteSpace: 'nowrap' },
-			title: displayAlias,
+			className: 'agy-card-alias',
+			style: {
+				fontWeight: 700,
+				fontSize: '13px',
+				color: 'var(--agy-text-primary)',
+				whiteSpace: 'nowrap',
+				overflow: 'hidden',
+				textOverflow: 'ellipsis',
+				maxWidth: '100%',
+				cursor: 'text',
+				borderRadius: '4px',
+				padding: '0 3px',
+				margin: '0 -3px',
+				borderBottom: isEditingAlias ? '1px dashed var(--agy-text-secondary)' : '1px dashed transparent',
+			},
+			title: `${t('account.renameTitle')} · ${displayAlias}`,
+			// Inline rename: clicking the name itself opens the editor. No separate
+			// button — the label IS the affordance.
+			onClick: () => setEditingAliasId(isEditingAlias ? null : acc.id),
+			onKeyDown: (e: { key?: string; preventDefault?: () => void }) => {
+				if (e.key === 'Enter' || e.key === ' ') {
+					e.preventDefault?.();
+					setEditingAliasId(isEditingAlias ? null : acc.id);
+				}
+			},
+			role: 'button',
+			tabIndex: 0,
 		}, displayAlias),
 	);
 }
@@ -347,7 +417,7 @@ function renderMetaRow(t: Translator, acc: ManagedAccount, ctx: CardHeaderCtx): 
 
 function renderCardHeader(t: Translator, acc: ManagedAccount, ctx: CardHeaderCtx): unknown {
 	const {
-		isEditingProxy, isAuthRequired, isSyncing, isWarming, isEditingAlias, displayAlias, accounts, pool, loadingAction, accountActionBusy, handlers, setEditingProxyId, setEditingAliasId,
+		isEditingProxy, isAuthRequired, isSyncing, isWarming, displayAlias, accounts, pool, loadingAction, accountActionBusy, handlers, setEditingProxyId,
 	} = ctx;
 	return h('div', {
 		className: 'agy-card-header',
@@ -371,8 +441,8 @@ function renderCardHeader(t: Translator, acc: ManagedAccount, ctx: CardHeaderCtx
 		},
 			renderHeaderBadges(t, acc, ctx),
 			renderActionButtons(t, acc, {
-				isEditingProxy, isAuthRequired, isSyncing, isWarming, isEditingAlias, displayAlias,
-				showRemove: accounts.length > 1, pool, loadingAction, accountActionBusy, handlers, setEditingProxyId, setEditingAliasId,
+				isEditingProxy, isAuthRequired, isSyncing, isWarming, displayAlias,
+				showRemove: accounts.length > 1, pool, loadingAction, accountActionBusy, handlers, setEditingProxyId,
 			}),
 		),
 		renderMetaRow(t, acc, ctx),
@@ -381,7 +451,6 @@ function renderCardHeader(t: Translator, acc: ManagedAccount, ctx: CardHeaderCtx
 
 function renderActionButtons(t: Translator, acc: ManagedAccount, ctx: {
 	isEditingProxy: boolean;
-	isEditingAlias: boolean;
 	isAuthRequired: boolean;
 	isSyncing: boolean;
 	isWarming: boolean;
@@ -392,20 +461,13 @@ function renderActionButtons(t: Translator, acc: ManagedAccount, ctx: {
 	accountActionBusy: (acc: ManagedAccount, action: string) => boolean;
 	handlers: AccountsPanelHandlers;
 	setEditingProxyId: (id: string | null) => void;
-	setEditingAliasId: (id: string | null) => void;
 }): unknown {
-	const { isEditingProxy, isAuthRequired, isSyncing, isWarming, isEditingAlias, displayAlias, showRemove, pool, loadingAction, accountActionBusy, handlers, setEditingProxyId, setEditingAliasId } = ctx;
+	const { isEditingProxy, isAuthRequired, isSyncing, isWarming, displayAlias, showRemove, pool, loadingAction, accountActionBusy, handlers, setEditingProxyId } = ctx;
 	const effectiveProxy = acc.proxyUrl || pool?.systemProxy;
 	return h('div', {
 		className: 'agy-card-actions',
-		style: { display: 'flex', gap: '4px', alignItems: 'center', flexShrink: 0 },
+		style: { display: 'flex', gap: '4px', alignItems: 'center', flexWrap: 'wrap', maxWidth: '100%', flexShrink: 0 },
 	},
-		h(Button, {
-			variant: 'default', size: 'sm', className: 'agy-btn',
-			style: { gap: '3px', fontSize: '11px', padding: '1px 6px', height: '22px' },
-			title: t('account.renameTitle'),
-			onClick: () => setEditingAliasId(isEditingAlias ? null : acc.id),
-		}, ` ${t('account.rename')}`),
 		h(Button, {
 			variant: acc.enabled ? 'default' : 'primary', size: 'sm', className: 'agy-btn',
 			style: { gap: '3px', fontSize: '11px', padding: '1px 6px', height: '22px' },
@@ -422,13 +484,16 @@ function renderActionButtons(t: Translator, acc: ManagedAccount, ctx: {
 			disabled: isSyncing,
 			onClick: () => void handlers.refreshQuota(acc.id),
 		}, ...(isSyncing ? [Spinner(), t('account.syncing')] : [uiIcon('refresh', 10), ` ${t('account.sync')}`])),
-		isAuthRequired && handlers.beginReauth ? h(Button, {
-			variant: 'primary', size: 'sm', className: 'agy-btn',
+		// Re-login is ALWAYS available (not only after an auth failure): the user
+		// may want to re-authenticate a healthy account, switch its Google
+		// identity, or refresh a token that Google revoked server-side.
+		handlers.beginReauth ? h(Button, {
+			variant: isAuthRequired ? 'primary' : 'default', size: 'sm', className: 'agy-btn',
 			style: { gap: '3px', fontSize: '11px', padding: '1px 6px', height: '22px' },
 			title: t('account.reauthTitle'),
 			disabled: accountActionBusy(acc, 'reauth'),
 			onClick: () => void handlers.beginReauth!(acc),
-		}, ...(loadingAction === `reauth:${acc.id}` ? [Spinner(), t('account.reauthing')] : [uiIcon('externalLink', 10, '#ffffff'), ` ${t('account.reauth')}`])) : null,
+		}, ...(loadingAction === `reauth:${acc.id}` ? [Spinner(), t('account.reauthing')] : [uiIcon('externalLink', 10, isAuthRequired ? '#ffffff' : 'var(--agy-text-secondary)'), ` ${t('account.reauth')}`])) : null,
 		acc.enabled && !isAuthRequired ? h(Button, {
 			variant: 'default', size: 'sm', className: 'agy-btn',
 			style: { gap: '3px', fontSize: '11px', padding: '1px 6px', height: '22px', justifyContent: 'center' },
@@ -470,8 +535,8 @@ function renderChildModels(t: Translator, childModels: readonly AccountModelDisp
 			const pColor = pct === null ? 'var(--agy-text-secondary)' : pct <= 20 ? 'var(--agy-quota-low-text)' : pct <= 50 ? 'var(--agy-quota-med-text)' : 'var(--agy-quota-high-text)';
 			const effortTag = model.efforts.length > 0 ? model.efforts.map(effortLabel).join('/') : '';
 			return h('div', { key: `${model.family}-${model.id}`, className: 'agy-submodel-row' },
-				h('div', { key: 'left', style: { display: 'flex', alignItems: 'center', gap: '6px', minWidth: 0, flexWrap: 'wrap' } },
-					h('span', { key: 'label', style: { fontWeight: 500, color: 'var(--agy-text-primary)' } }, `[${model.familyLabel}] ${model.name}`),
+				h('div', { key: 'left', style: { display: 'flex', alignItems: 'center', gap: '6px', minWidth: 0, flexWrap: 'wrap', flex: '1 1 140px' } },
+					h('span', { key: 'label', style: { fontWeight: 500, color: 'var(--agy-text-primary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: '100%' }, title: `[${model.familyLabel}] ${model.name}` }, `[${model.familyLabel}] ${model.name}`),
 					effortTag ? h('span', { key: 'efforts', style: { color: 'var(--agy-text-tertiary)', fontSize: '10px' } }, effortTag) : null,
 				),
 				h('div', { key: 'right', style: { display: 'flex', alignItems: 'center', gap: '8px', flexShrink: 0 } },
@@ -483,7 +548,6 @@ function renderChildModels(t: Translator, childModels: readonly AccountModelDisp
 	);
 }
 
-/* renderCooldownBanner was retired with the cooldown-banner UI in v0.6.55. */
 function renderAliasEditor(
 	t: Translator,
 	acc: ManagedAccount,

@@ -134,7 +134,18 @@ export function shouldUsePromptStdin(argsWithPrompt: readonly string[]): boolean
 // Children that already have a SIGKILL escalation armed (SIGTERM sent once).
 const escalating = new WeakSet<ChildProcess>()
 
-function killTree(child: ChildProcess): void {
+/**
+ * Kill a child AND its descendants.
+ *
+ * agy installs graceful-shutdown handlers; a run wedged in a dial-retry loop
+ * (offline) ignores SIGTERM forever, which made the UI Stop button a no-op.
+ * Every spawn in this module is `detached` on POSIX so the child leads its own
+ * process group and one group signal reaches agy's helpers (task shells,
+ * subagents, MCP servers) too.
+ *
+ * Exported for the ACP transport, which must not invent a second kill policy.
+ */
+export function killTree(child: ChildProcess, opts: { escalateMs?: number } = {}): void {
   if (child.pid === undefined) return
   if (IS_WIN) {
     // No Unix process groups on Windows: kill the whole tree via taskkill.
@@ -145,26 +156,29 @@ function killTree(child: ChildProcess): void {
     }
     return
   }
+  const pid = child.pid
+  let grouped = true
   try {
-    process.kill(-child.pid, 'SIGTERM')
+    process.kill(-pid, 'SIGTERM')
   } catch {
+    // Not a process-group leader (an older, non-detached spawn): signal the
+    // child directly but STILL escalate — a live child that ignores SIGTERM is
+    // exactly the orphan this function exists to prevent.
+    grouped = false
     try {
       child.kill('SIGTERM')
     } catch {
-      // already gone
+      return
     }
-    return
   }
-  // agy installs graceful-shutdown handlers; a run wedged in a dial-retry
-  // loop (offline) ignores SIGTERM forever, which made the UI Stop button
-  // a no-op. Escalate to SIGKILL for the whole group shortly after.
   if (escalating.has(child)) return
   escalating.add(child)
-  const pid = child.pid
   const escalate = setTimeout(() => {
-    try { process.kill(-pid, 'SIGKILL') } catch { /* group already gone */ }
+    if (grouped) {
+      try { process.kill(-pid, 'SIGKILL') } catch { /* group already gone */ }
+    }
     try { child.kill('SIGKILL') } catch { /* already gone */ }
-  }, 3000)
+  }, opts.escalateMs ?? 3000)
   escalate.unref?.()
   child.once('exit', () => {
     clearTimeout(escalate)
@@ -316,7 +330,7 @@ function armTurnCap(child: ChildProcess, opts: RunOptions, state: RunState): voi
   }
 }
 
-function isBackgroundStderrNoise(line: string): boolean {
+export function isBackgroundStderrNoise(line: string): boolean {
   return (
     line.includes('fetchAvailableModels') ||
     line.includes('loadCodeAssist') ||
@@ -324,7 +338,10 @@ function isBackgroundStderrNoise(line: string): boolean {
     line.includes('FetchConfig') ||
     line.includes('ListExperiments') ||
     line.includes('daily-cloudcode-pa.googleapis.com') ||
-    line.includes('http_helpers.go')
+    line.includes('http_helpers.go') ||
+    (line.includes('run.go:') && /retrying in|RESOURCE_EXHAUSTED|code 429/i.test(line)) ||
+    line.includes('Reloading system slash commands') ||
+    line.includes('Slash commands unchanged')
   )
 }
 
@@ -470,7 +487,11 @@ function awaitOutcome(
 export function startAgyProcess(opts: RunOptions): RunningProcess {
   const started = Date.now()
   const viaCmd = IS_WIN && isCmdShim(opts.bin)
-  const isNode = IS_WIN && /\.(mjs|js|cjs)$/i.test(opts.bin)
+  // A `.mjs`/`.js`/`.cjs` "bin" is a NODE SCRIPT on every platform, not just
+  // Windows: spawning it directly works there only because CreateProcess
+  // resolves the association, while POSIX needs an exec bit and a shebang it
+  // does not have (EACCES / ENOEXEC). Run it through the running Node binary.
+  const isNode = /\.(mjs|js|cjs)$/i.test(opts.bin)
   const env = withAgyQuietEnv(opts.env ?? process.env)
   // Issue #49: the quiet env cannot stop agy's internal `--bg-updater` child
   // (that chain allocates its own console), so pre-empt the update *check*

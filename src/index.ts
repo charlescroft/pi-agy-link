@@ -12,20 +12,21 @@ import type { Context } from '@deepseek-ai/cordis'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { PROVIDER_ID } from './common/types.ts'
+import { AUTH_FAST_REVERIFY_MS } from './common/pool-types.ts'
 import { defineAgyAskTool } from './host/ask-tool.ts'
 import { defineAgyImageTool } from './host/image-tool.ts'
-import { agyCommandDefinition } from './host/commands.ts'
+import { agyCommandDefinition, buildAgyCommandDeps } from './host/commands.ts'
+import { btwCommandDefinition } from './host/btw-command.ts'
 import { tslCommandDefinition } from './host/tsl-command.ts'
-import { writeDoctorReport } from './host/diagnostics.ts'
-import { defineAgyMirrorTool } from './host/mirror-tool.ts'
-import { runAgyOnce } from './host/oneshot.ts'
+import { defineAgyMirrorTool, MIRROR_TOOL_NAME } from './host/mirror-tool.ts'
 import type { ToolExecution, PreToolDecision } from '@deepseek-ai/dsh-tools'
-import { MIN_AGY_VERSION, compareVersions, isolatedHomeEnv, parseVersion, probeProcess } from './host/runner.ts'
+import { MIN_AGY_VERSION, compareVersions, isolatedHomeEnv } from './host/runner.ts'
 import { agyNotInstalledMessage } from './provider/call-context.ts'
 import { sweepDir } from './host/media.ts'
 import { agyMcpConfigPath, registerBridgeMcpConfig, startMcpBridge, teardownBridgeState, type ToolsServiceLike } from './host/mcp-bridge.ts'
 import type { GoalServiceLike } from './host/commands/shared.ts'
 import { runBootHygiene } from './host/boot-hygiene.ts'
+import { scheduleBootMaintenance } from './host/boot-maintenance.ts'
 import { closeProxyAgents } from './host/net.ts'
 import { setRuntimeAgyVersion } from './host/oauth.ts'
 import { createHostServices } from './host/services.ts'
@@ -39,65 +40,117 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
   const services = createHostServices(ctx, entryConfig)
   const {
     getConfig, log, bin, version, store, pool, quota, warmup, catalog, auth, poolAuth, runs,
-    adapter, acpPool, ecosystem, imageService, translation, setOverride, notifyPicker, readEffortUnsupported, rememberEffortUnsupported,
+    adapter, acpPool, ecosystem, imageService, translation, btw, setOverride, notifyPicker, readEffortUnsupported, rememberEffortUnsupported,
     sessionsSvc, sessionAuto, mediaDir, bridgeState, webServerPort,
   } = services
 
   // Boot-time pool/store hygiene: stale staging logs, keychains, credential slot.
   runBootHygiene(services)
 
+  // Everything expensive (staging/log sweeps, the ecosystem mirror, stale presence
+  // locks, orphaned MCP servers) is deferred to one idle pass: a pool of 8 accounts
+  // otherwise pays hundreds of file stats plus a full copy per account before the
+  // first frame, and leaves the previous run's MCP children behind.
+  const stopBootMaintenance = scheduleBootMaintenance({
+    accounts: () => services.pool.getAccounts(),
+    sweepStaging: () => services.pool.sweepStaleStaging(),
+    sweepLogs: () => services.pool.sweepOldLogs(getConfig().logRetentionDays),
+    ...(getConfig().syncAccountCustomizations ? { syncEcosystem: () => services.ecosystem?.syncAll() } : {}),
+    log,
+    reapOrphans: getConfig().reapOrphanMcp,
+  })
+  ctx.effect(() => () => stopBootMaintenance())
+
   // Track version probe completion so the 5s boot quota refresh never races
   // `agy --version` (preventing fallback UA version skew on the first poll).
   let versionProbePromise: Promise<void> | null = null
 
   // ---- dormant detection + background probes ----
-  // Defer version/catalog spawns so plugin load does not immediately create
-  // agy child processes (Windows conhost flash, issue #23). Catalog refresh
-  // is also driven lazily by adapter.listModels / stream.
-  const bootProbeTimer = setTimeout(() => {
-    void (async () => {
-      if (!getConfig().enabled) {
-        services.status.dormantReason = 'disabled by config'
-        log('dormant: disabled by config')
-        return
-      }
-      const currentBin = bin()
-      if (!currentBin) {
-        // Same actionable wording as the turn-level error: the badge shows this
-        // string, so it must say where we looked and how to point us at a
-        // binary installed outside the probed locations.
-        services.status.dormantReason = agyNotInstalledMessage(getConfig())
-        log('dormant: agy binary not found')
-        return
-      }
-      versionProbePromise = (async () => {
-        try {
-          const v = await probeProcess(currentBin, ['--version'], 10_000, undefined, undefined, getConfig().suppressAgyAutoUpdate)
-          services.status.version = parseVersion(v.stdout)
-          setRuntimeAgyVersion(services.status.version)
-          catalog.syncAgyVersion(services.status.version)
-          if (services.status.version && compareVersions(services.status.version, MIN_AGY_VERSION) < 0) {
-            services.status.dormantReason = 'agy ' + services.status.version + ' is older than ' + MIN_AGY_VERSION + ' — run: agy update'
-            log('dormant: ' + services.status.dormantReason)
-            return
-          }
-          services.status.dormantReason = null
-          log('agy detected: ' + (services.status.version ?? 'unknown version'))
-        } catch {
-          log('version probe failed — continuing with fallback catalog')
+  // Boot probes are deliberately cheap and deferrable. Every `agy` spawn costs
+  // a process, a credential-slot read and (for `models`) a full MCP-server boot
+  // storm from the user's own registry, so a probe must never run while a real
+  // turn is in flight and must never fan out over the whole pool.
+  //
+  // Before this guard the boot path was: 4s timer -> `agy --version` ->
+  // `agy models` (~4.6s, forking every MCP server) -> warmAccounts(8). Eight
+  // accounts meant tens of seconds of background churn on every DSH start, on
+  // top of the MCP processes it orphaned. Now the probe waits for an idle
+  // moment, refreshes only the ACTIVE account eagerly, and leaves every other
+  // account lazy (ensureAccountCatalog loads it on first use) unless the
+  // opt-in pool-wide catalog actually needs them.
+  const BOOT_PROBE_DELAY_MS = 4_000
+  const BOOT_PROBE_RETRY_MS = 20_000
+  let bootProbeTimer: ReturnType<typeof setTimeout> | null = null
+  let bootProbeAttempts = 0
+  let bootProbeStopped = false
+
+  const runBootProbe = async (): Promise<void> => {
+    if (!getConfig().enabled) {
+      services.status.dormantReason = 'disabled by config'
+      log('dormant: disabled by config')
+      return
+    }
+    const currentBin = bin()
+    if (!currentBin) {
+      // Same actionable wording as the turn-level error: the badge shows this
+      // string, so it must say where we looked and how to point us at a
+      // binary installed outside the probed locations.
+      services.status.dormantReason = agyNotInstalledMessage(getConfig())
+      log('dormant: agy binary not found')
+      return
+    }
+    versionProbePromise = (async () => {
+      try {
+        services.status.version = await services.resolveVersion()
+        setRuntimeAgyVersion(services.status.version)
+        catalog.syncAgyVersion(services.status.version)
+        if (services.status.version && compareVersions(services.status.version, MIN_AGY_VERSION) < 0) {
+          services.status.dormantReason = 'agy ' + services.status.version + ' is older than ' + MIN_AGY_VERSION + ' — run: agy update'
+          log('dormant: ' + services.status.dormantReason)
+          return
         }
-      })()
-      await versionProbePromise
-      if (services.status.dormantReason !== null) return
-      const poolData = services.pool.getPoolData()
-      const activeId = services.pool.getActiveAccountId('google') ?? poolData.lastActiveAccountId ?? poolData.primaryAccountId
-      await catalog.refreshIfNeeded(activeId).catch(() => undefined)
-      notifyPicker()
+        services.status.dormantReason = null
+        log('agy detected: ' + (services.status.version ?? 'unknown version'))
+      } catch {
+        log('version probe failed — continuing with fallback catalog')
+      }
+    })()
+    await versionProbePromise
+    if (services.status.dormantReason !== null) return
+
+    const poolData = services.pool.getPoolData()
+    const activeId = services.pool.getActiveAccountId('google') ?? poolData.lastActiveAccountId ?? poolData.primaryAccountId
+    // ONE spawn for the account the picker actually shows.
+    await catalog.refreshIfNeeded(activeId).catch(() => undefined)
+    notifyPicker()
+    // Only the opt-in pool-wide catalog needs every account discovered; the
+    // per-account rows otherwise load lazily on first use, so we never pay
+    // N x (agy models + MCP boot storm) at startup again.
+    if (getConfig().poolWideCatalog) {
       void catalog.warmAccounts(services.pool.getAccounts()).catch(() => undefined)
-    })();
-  }, 4_000)
-  bootProbeTimer.unref?.()
-  ctx.effect(() => () => clearTimeout(bootProbeTimer))
+    }
+  }
+
+  const scheduleBootProbe = (delayMs: number): void => {
+    if (bootProbeStopped) return
+    bootProbeTimer = setTimeout(() => {
+      // A turn is running: come back later instead of competing with it for the
+      // spawn slot, the credential slot, and the user's first token.
+      if (bootProbeAttempts < 30 && services.adapter.activeRunCount() > 0) {
+        bootProbeAttempts++
+        scheduleBootProbe(BOOT_PROBE_RETRY_MS)
+        return
+      }
+      void runBootProbe()
+    }, delayMs)
+    bootProbeTimer.unref?.()
+  }
+
+  scheduleBootProbe(BOOT_PROBE_DELAY_MS)
+  ctx.effect(() => () => {
+    bootProbeStopped = true
+    if (bootProbeTimer !== null) clearTimeout(bootProbeTimer)
+  })
 
   // Catalog freshness without probing from listModels(): refreshIfNeeded()
   // honours its TTL, so this costs at most one `agy models` spawn per window
@@ -139,47 +192,21 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
   // settings directory; registering here would put an unconfigured
   // antigravity into the provider-add list and confuse the UI state.
 
-  // ---- /agy command ----
+  // ---- /agy, /tsl, and /btw commands ----
   ctx.commands.register(
-    agyCommandDefinition({
-      cfg: getConfig,
-      bin,
-      version,
-      auth: () => auth,
-      catalog: () => catalog,
-      store: () => store,
-      pool: () => pool,
-      poolAuth: () => poolAuth,
-      quota: () => quota,
-      lastRun: () => services.lastRun,
-      imageService: () => imageService,
-      acpStatus: () => acpPool.status(),
-      ecosystem: () => ecosystem,
-      runOnce: (req) => runAgyOnce({
-        cfg: getConfig,
-        bin,
-        pool: () => pool,
-        acquire: (sig) => services.semaphore.acquire(sig),
-        log,
-        effortUnsupported: () => readEffortUnsupported(),
-        onEffortUnsupported: (model) => rememberEffortUnsupported(model),
-      }, req),
-      setOverride,
-      notifyPicker,
-      sessions: () => sessionsSvc(),
-      goals: () => (ctx.get('goals') as GoalServiceLike | undefined) ?? ((ctx as unknown as { goals?: GoalServiceLike }).goals),
-      agents: () => (ctx.get('agents') as { get(id: unknown): unknown } | undefined) ?? ((ctx as unknown as { agents?: { get(id: unknown): unknown } }).agents),
-      runDoctor: async () => {
-        return writeDoctorReport({
-          cfg: getConfig,
-          bin,
-          version,
-          catalog: () => catalog,
-          store: () => store,
-          recentLines: () => services.lastParser.recentLines,
-          effortUnsupported: () => adapter.effortUnsupportedModels(),
-        })
-      },
+    agyCommandDefinition(
+      buildAgyCommandDeps({
+        services,
+        goals: () => (ctx.get('goals') as GoalServiceLike | undefined) ?? ((ctx as unknown as { goals?: GoalServiceLike }).goals),
+        agents: () => (ctx.get('agents') as { get(id: unknown): unknown } | undefined) ?? ((ctx as unknown as { agents?: { get(id: unknown): unknown } }).agents),
+      }),
+    ),
+  )
+
+  ctx.commands.register(
+    btwCommandDefinition({
+      btw: () => btw,
+      isWebActive: () => webServerPort.current !== undefined,
     }),
   )
 
@@ -237,11 +264,33 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
   // one-shot ctx.get('tools') silently loses every registration when it
   // races startup — which left the mirror unregistered and every span cut
   // failing with `unknown tool "agy_tool"`.
-  const toolsSvcRef: { current: { register: (t: unknown) => unknown } | null } = { current: null }
+  let pluginDisposing = false
+  const toolsSvcRef: { current: { register: (t: unknown) => unknown; get?: (name: string, scope?: unknown) => unknown } | null } = { current: null }
   const askToolDispose = { current: null as null | (() => void) }
   const imageToolDispose = { current: null as null | (() => void) }
   const mirrorToolDispose = { current: null as null | (() => void) }
   const preExecuteDispose = { current: null as null | (() => void) }
+  const resolveAgentsSvc = (): { get(id: unknown): unknown } | undefined => {
+    const svc = ctx.get('agents') as { get(id: unknown): unknown } | undefined
+    return svc ?? (ctx as unknown as { agents?: { get(id: unknown): unknown } }).agents
+  }
+  // Live liveness gate for AgyAdapter / EventMapper: never emit an `agy_tool`
+  // tool-call while the plugin is disposing, before `tools` has mounted, or
+  // when an agent scope's `tools.restrict({ allow })` hides `agy_tool`.
+  services.setMirrorToolCheck((sessionId?: string): boolean => {
+    if (pluginDisposing || mirrorToolDispose.current === null || toolsSvcRef.current === null) {
+      return false
+    }
+    if (typeof toolsSvcRef.current.get === 'function') {
+      try {
+        const agent = sessionId ? resolveAgentsSvc()?.get(sessionId) : undefined
+        return toolsSvcRef.current.get(MIRROR_TOOL_NAME, agent) !== undefined
+      } catch {
+        return true
+      }
+    }
+    return true
+  })
   const syncAskTool = (): void => {
     const want = getConfig().askTool && bin() !== null
     if (want && askToolDispose.current === null && toolsSvcRef.current) {
@@ -366,7 +415,11 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
 
   // Background quota refresh: reads local token files only (no agy spawns,
   // no Keychain prompts), then one HTTPS call per account per poll interval
-  // (default 15 min, configurable; clamped to at least 60s). Restricted
+  // (default 60 min via quotaPollIntervalMs, configurable at runtime through
+  // the settings route / `/agy config quota-poll`, clamped to at least 60s).
+  // The account currently in use is additionally refreshed as soon as it
+  // settles a run (see quota/freshness.ts), so the panel is not stuck on the
+  // hourly snapshot. Restricted
   // accounts (cooldown / auth-quarantined) are skipped by refreshAllQuotas.
   // Background quota refresh: 5s boot pass awaits `versionProbePromise` if in
   // flight so User-Agent carries the detected agy version from the first poll.
@@ -390,6 +443,18 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
       clearTimeout(boot)
       clearInterval(timer)
     }
+  })
+
+  // Fast self-heal for 需重新登录 flags; only flags past their own back-off run.
+  ctx.effect(() => {
+    if (!getConfig().enabled) return () => undefined
+    let running = false
+    const timer = setInterval(() => {
+      if (running || !getConfig().enabled) return
+      running = true
+      void quota.reverifyFlaggedAccounts().catch(() => undefined).finally(() => { running = false })
+    }, AUTH_FAST_REVERIFY_MS)
+    timer.unref?.(); return () => clearInterval(timer)
   })
 
   // Scheduled weekly quota auto-warmup (opt-in): monitors 7-day quota windows
@@ -484,8 +549,13 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
 
   ctx.effect(() => {
     return () => {
+      // Flip BEFORE tearing down ACP/tools so any trailing tool event flushed
+      // by disposal cannot emit a doomed `agy_tool` call (`UNKNOWN_TOOL`).
+      pluginDisposing = true
       bridgeDisposed = true
+      services.backgroundWakeup.dispose()
       services.translationWorkers?.dispose()
+      services.btw.dispose()
       acpPool.dispose()
       auth.dispose()
       void poolAuth.cancel()

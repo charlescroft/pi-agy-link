@@ -12,6 +12,7 @@ import { dirname, join } from 'node:path'
 import { SessionStore, SENT_IMAGE_IDS_MAX } from '../src/host/sessions.ts'
 import { mergeSentImageIds } from '../src/provider/finalize.ts'
 import { runBootHygiene } from '../src/host/boot-hygiene.ts'
+import { runMaintenancePass } from '../src/host/boot-maintenance.ts'
 import type { HostServices } from '../src/host/services.ts'
 import { selectSessionAccount } from '../src/provider/account-selection.ts'
 import type { AccountPoolManager } from '../src/host/pool.ts'
@@ -186,7 +187,7 @@ function hygieneServices(over: {
   } as unknown as HostServices
 }
 
-test('boot-hygiene: sweeps staging dirs and old logs (non-darwin/win32 path, no spawn)', () => {
+test('boot-hygiene: staging/log sweeps are deferred, not run on the plugin-load path', () => {
   const restore = setPlatform('linux')
   const logs: string[] = []
   try {
@@ -197,8 +198,22 @@ test('boot-hygiene: sweeps staging dirs and old logs (non-darwin/win32 path, no 
       logs,
     })
     runBootHygiene(services)
-    assert.ok(logs.includes('swept 2 stale staging dir(s)'))
-    assert.ok(logs.includes('swept 3 old log file(s)'))
+    // Startup must stay cheap: a pool of N accounts no longer pays N staging
+    // walks plus the ecosystem mirror before the first frame.
+    assert.equal(logs.some((l) => l.includes('stale staging')), false)
+    assert.equal(logs.some((l) => l.includes('old log file')), false)
+
+    // The deferred pass owns them now, and reports one summary line.
+    const result = runMaintenancePass({
+      accounts: () => [],
+      sweepStaging: () => 2,
+      sweepLogs: () => 3,
+      log: (m) => logs.push(m),
+      reapOrphans: false,
+    })
+    assert.equal(result.staging, 2)
+    assert.equal(result.logs, 3)
+    assert.ok(logs.some((l) => l.includes('maintenance: swept') && l.includes('2 staging dir(s)') && l.includes('3 old log(s)')))
   } finally {
     restore()
   }
@@ -305,6 +320,31 @@ test('account-selection: ineligible sticky account falls through to selectAccoun
   const { deps } = selectionDeps(pool, { 's1:acc_x': { conversationId: 'c', lastMessageCount: 0, updatedAt: 5 } })
   const out = await selectSessionAccount({ deps, cfg: cfgSelect(), model: 'gemini-3.8-flash', isAux: false, sessionKey: 's1' })
   assert.equal(out.account?.id, 'acc_x')
+})
+
+test('account-selection: win32 + parallelSameAccount still honours a bound session over the pool pointer', async () => {
+  // The pack-share rule exists so sessions with NO binding converge on one
+  // credential slot. It must not override a session that already ran on an
+  // account: that silently hops a live conversation between accounts (the
+  // adapter-level regression is 'session sticks to current account').
+  const stickyAcc = account('acc_sticky')
+  const poolAcc = account('acc_pool')
+  const { pool, calls } = selPool({ accounts: [stickyAcc, poolAcc], select: () => poolAcc, lastActive: 'acc_pool' })
+  const { deps } = selectionDeps(pool, { 's1:acc_sticky': { conversationId: 'c', lastMessageCount: 0, updatedAt: 5 } })
+  const restore = setPlatform('win32')
+  try {
+    const out = await selectSessionAccount({
+      deps,
+      cfg: cfgSelect({ parallelSameAccount: true }),
+      model: 'gemini-3.8-flash',
+      isAux: false,
+      sessionKey: 's1',
+    })
+    assert.equal(out.account?.id, 'acc_sticky', 'the session keeps the account it already ran on')
+    assert.deepEqual(calls.select, [], 'the pool candidate is not consulted when a binding is usable')
+  } finally {
+    restore()
+  }
 })
 
 test('account-selection: win32 + parallelSameAccount pins the pool candidate directly', async () => {
@@ -1172,17 +1212,21 @@ test('handleGoal: an unknown phase falls back to the neutral emoji and the clear
 })
 
 test('handleGoal: complete/pause/resume error without a goal or without append', () => {
-  for (const action of ['complete', 'pause', 'resume']) {
+  for (const [action, startPhase] of [['complete', 'active'], ['pause', 'active'], ['resume', 'paused']] as const) {
     assert.equal(handleGoal(cmdDeps(fakeStore()), ctx(action, { id: 's1', session: goalSession([]) })).kind, 'error')
-    const noAppend = goalSession([goalEvent()])
+    const noAppend = goalSession([goalEvent({ phase: startPhase })])
     assert.match(handleGoal(cmdDeps(fakeStore()), ctx(action, { id: 's1', session: noAppend })).text ?? '', /cannot append/)
   }
 })
 
 test('handleGoal: complete/pause/resume/clear append the right transition', () => {
-  for (const [action, phase] of [['complete', 'complete'], ['pause', 'paused'], ['resume', 'active']] as const) {
+  for (const [action, startPhase, phase] of [
+    ['complete', 'active', 'complete'],
+    ['pause', 'active', 'paused'],
+    ['resume', 'paused', 'active'],
+  ] as const) {
     const appended: Array<{ t: string; d: Record<string, unknown> }> = []
-    const session = goalSession([goalEvent()], (t, d) => appended.push({ t, d: d as Record<string, unknown> }))
+    const session = goalSession([goalEvent({ phase: startPhase })], (t, d) => appended.push({ t, d: d as Record<string, unknown> }))
     const out = handleGoal(cmdDeps(fakeStore()), ctx(action, { id: 's1', session }))
     assert.equal(out.kind, 'success')
     assert.equal(appended[0]?.t, 'goal/change')

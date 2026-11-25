@@ -14,18 +14,16 @@ import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import {
-  isTerminalAuthError,
-  needsAuthReverify,
-  shouldPollAccount,
   type FamilyQuotaInfo,
   type ManagedAccount,
   type ModelFamily,
 } from '../common/pool-types.ts'
 import type { AccountPoolManager } from './pool.ts'
 import { readPrimaryCredential, parseCredentialDoc, credentialFingerprint, writePrimaryCredential, credentialSlotMutex } from './credential-slot.ts'
-import { readAgyUsage, usageGroupsToFamilies } from './agy-usage.ts'
+import { readAgyUsage, usageGroupsToFamilies, type AgyUsageGroup } from './agy-usage.ts'
+import { supportsSshIsolation } from '../runtime/agy/env.ts'
 import { buildAgyEnvWithProxy, pickProxy } from '../runtime/net/account-env.ts'
-import { QUOTA_FORCE_CONCURRENCY } from '../common/timeouts.ts'
+import { CLI_USAGE_TIMEOUT_RETRY_MS } from '../common/timeouts.ts'
 import { CLI_TOKEN_SAFETY_MS, prepareCliToken as prepareCliTokenImpl } from '../features/quota/cli-token.ts'
 
 import {
@@ -39,8 +37,12 @@ import {
   type UserQuotaResponse,
 } from '../domain/quota/parse.ts'
 import { refreshAccountQuotaPipeline, type QuotaRefreshDeps } from '../features/quota/refresh.ts'
+import {
+  reverifyFlaggedAccounts,
+  sweepPoolQuotas,
+  type PoolSweepDeps,
+} from '../features/quota/pool-sweep.ts'
 import { EndpointHealth } from '../features/quota/endpoint-health.ts'
-import { sweepAccountsByEgress } from '../features/quota/sweep.ts'
 import {
   fetchAvailableModels as fetchAvailableModelsImpl,
   fetchQuotaSummary as fetchQuotaSummaryImpl,
@@ -54,6 +56,7 @@ import {
 } from '../features/quota/http.ts'
 import {
   getStoredToken as getStoredTokenImpl,
+  cliTokenSource,
   getValidAccessToken as getValidAccessTokenImpl,
   isCurrentAccountGrant as isCurrentAccountGrantImpl,
   persistRefreshedToken as persistRefreshedTokenImpl,
@@ -136,6 +139,10 @@ export class QuotaService {
   private readonly summaryFailures = new Map<string, QuotaSummaryFailure | null>()
   /** accountIds with a refresh in flight, so the console can show real progress. */
   private readonly refreshingIds = new Set<string>()
+  /** Last raw CLI `/usage` groups per accountId (used for planTier inference). */
+  private readonly lastCliUsageGroups = new Map<string, readonly AgyUsageGroup[]>()
+  /** accountId -> don't spawn `agy /usage` again before this time (it timed out). */
+  private readonly cliUsageSkipUntil = new Map<string, number>()
 
   /**
    * @param globalProxy resolves the plugin-wide proxy URL; used when the
@@ -229,17 +236,41 @@ export class QuotaService {
   ): Promise<Partial<Record<ModelFamily, FamilyQuotaInfo>> | null> {
     const bin = this.cliDeps.bin?.()
     if (!bin) return null
-    // Fast reject, no keystore read and no spawn: an isolated account's own
-    // directory cannot be the store's owner. This keeps the poll cheap on a
-    // multi-account pool and behaves identically on every platform.
-    if (account.dir && !account.systemHome) {
-      return null
+    // The CLI path is anti-ban-preferred, but a probe that keeps timing out
+    // must not make every "同步" click pay 19s before the REST fallback runs.
+    // Skip it for a while after a failure, per account.
+    if (Date.now() < (this.cliUsageSkipUntil.get(account.id) ?? 0)) return null
+    const isIsolated = Boolean(account.dir && !account.systemHome)
+    if (isIsolated) {
+      // agy >= 1.5 with SSH_CONNECTION (injected by isolatedHomeEnv) bypasses
+      // the shared OS keyring / Windows Credential Manager and reads ONLY this
+      // account's isolated token file (verified live on Windows agy 1.5.12).
+      // Also safe on Linux/macOS where D-Bus / per-HOME isolation applies for
+      // free accounts (`no_summary_access`, issue #143).
+      const canIsolateCli =
+        supportsSshIsolation(this.agyVersion()) ||
+        (process.platform !== 'win32' && account.quotaUnavailable?.reason === 'no_summary_access')
+      if (!canIsolateCli) return null
+      if (!(await this.prepareCliToken(account, false))) return null
+      const env = buildAgyEnvWithProxy({
+        account,
+        proxy: pickProxy(account.proxyUrl, this.globalProxy()),
+      })
+      const groups = await readAgyUsage({
+        bin,
+        env,
+        timeoutMs: 20_000,
+        preemptAutoUpdate: this.cliDeps.preemptAutoUpdate?.(),
+      })
+      if (groups === null) {
+        this.cliUsageSkipUntil.set(account.id, Date.now() + CLI_USAGE_TIMEOUT_RETRY_MS)
+        return null
+      }
+      this.cliUsageSkipUntil.delete(account.id)
+      this.lastCliUsageGroups.set(account.id, groups)
+      return usageGroupsToFamilies(groups)
     }
 
-    // On Windows, the OS credential store (gemini:antigravity) is a single shared slot.
-    // Secondary runs temporarily swap this slot under credentialSlotMutex. To prevent
-    // reading a secondary's numbers or having the slot swapped mid-flight while
-    // `agy -p /usage` is running, serialize under credentialSlotMutex.
     let releaseMutex: (() => void) | null = null
     if (process.platform === 'win32') {
       try {
@@ -249,22 +280,14 @@ export class QuotaService {
           shouldProceed: () => true,
         })
       } catch {
-        // Mutex contention (e.g. secondary account turn active) — fall back to safe REST path immediately
         return null
       }
     }
 
     try {
-      // The owner itself still needs proof: while a secondary runs, the slot is
-      // temporarily handed that account's credential, and a CLI read then would
-      // return the secondary's numbers under the primary's row.
       if (!(await this.cliSlotHoldsAccount(account))) {
         return null
       }
-      // A spawn with a nearly-expired token makes agy lose its own 10s keyring
-      // race, fall back to INTERACTIVE OAuth and open the user's browser (9 of
-      // 375 hourly polls here, every one with <=60s of token life). Bring the
-      // credential into the safety window first; skip the CLI if that fails.
       if (!(await this.prepareCliToken(account))) {
         return null
       }
@@ -278,10 +301,21 @@ export class QuotaService {
         timeoutMs: 20_000,
         preemptAutoUpdate: this.cliDeps.preemptAutoUpdate?.(),
       })
-      return groups === null ? null : usageGroupsToFamilies(groups)
+      if (groups === null) {
+        this.cliUsageSkipUntil.set(account.id, Date.now() + CLI_USAGE_TIMEOUT_RETRY_MS)
+        return null
+      }
+      this.cliUsageSkipUntil.delete(account.id)
+      this.lastCliUsageGroups.set(account.id, groups)
+      return usageGroupsToFamilies(groups)
     } finally {
       releaseMutex?.()
     }
+  }
+
+  /** Same safety-window prep for an SSH-isolated account run elsewhere (external lease): it reads only its own token file, so the slot is never written. */
+  prepareIsolatedCliToken(account: ManagedAccount): Promise<boolean> {
+    return this.prepareCliToken(account, false)
   }
 
   /**
@@ -293,10 +327,24 @@ export class QuotaService {
    * is what agy loads (the on-disk document is only a mirror); `syncSlot` does
    * that and is wired by the host, which owns the mutex we are already holding.
    */
-  private async prepareCliToken(account: ManagedAccount): Promise<boolean> {
-    const syncSlot = this.cliDeps.syncSlot;
+  /**
+   * The credential agy will load for a CLI quota read. On Windows the
+   * system-HOME primary loads the Credential Manager slot, not the on-disk
+   * mirror; the safety gate must inspect that (issue #199).
+   */
+  private async readCliLoadedToken(account: ManagedAccount): Promise<StoredToken | null> {
+    if (cliTokenSource(process.platform, account) === 'slot') {
+      const slot = await this.readSystemKeychainToken()
+      if (slot && (slot.accessToken || slot.refreshToken)) return slot
+    }
+    return this.getStoredToken(account, true)
+  }
+
+  private async prepareCliToken(account: ManagedAccount, withSlotSync = true): Promise<boolean> {
+    const syncSlot = withSlotSync ? this.cliDeps.syncSlot : undefined;
     return prepareCliTokenImpl({
-      readStored: () => this.getStoredToken(account, true),
+      // Inspect the credential agy will actually load, not the mirror (issue #199).
+      readStored: () => this.readCliLoadedToken(account),
       // Ask for the SAME window the gate below enforces: the default 60s buffer
       // would hand back a token that the re-read then rejects, wasting a
       // refresh round-trip and skipping the CLI anyway.
@@ -318,8 +366,21 @@ export class QuotaService {
     const slot = await this.readSystemKeychainToken()
     if (slot === null) return false
     const stored = await this.getStoredToken(account, false)
-    if (stored === null) return false
-    return sameCredentialGrant(slot, stored)
+    if (stored !== null) return sameCredentialGrant(slot, stored)
+    // Native `agy` sign-in on Linux/macOS stores credentials ONLY in the OS
+    // keyring with no `~/.gemini/antigravity-cli/antigravity-oauth-token` file
+    // on disk (issue #143 `branch: "stored-null"`). For the systemHome primary
+    // account on non-Windows (where secondaries never swap the global slot),
+    // verify the slot does not belong to any sibling isolated account.
+    if (account.systemHome && process.platform !== 'win32') {
+      for (const other of this.pool.getAccounts()) {
+        if (other.id === account.id || !other.dir || other.systemHome) continue
+        const sibling = await this.getStoredToken(other, false)
+        if (sibling !== null && sameCredentialGrant(slot, sibling)) return false
+      }
+      return true
+    }
+    return false
   }
 
   /** Dedicated account proxy wins, then the global config proxy, then detected system proxy. */
@@ -470,92 +531,39 @@ export class QuotaService {
       writePrimaryCredential: (cred, baseDir) => writePrimaryCredential(cred, baseDir),
       credentialFingerprint: (raw) => credentialFingerprint(raw),
       summaryFailure: () => this.summaryFailures.get(account.id) ?? null,
+      lastCliUsageGroups: () => this.lastCliUsageGroups.get(account.id),
     }
     return refreshAccountQuotaPipeline(deps, account, force)
   }
 
   /**
-   * Refresh quota statistics for all accounts in the pool.
-   * Automatic polling (force=false) skips restricted accounts (disabled /
-   * auth-quarantined / in cooldown) so the poller never keeps knocking on
-   * Google endpoints for accounts already known to be limited. Manual force
-   * refresh from the UI refreshes everything.
-   *
-   * Before gating, a ZERO-NETWORK identity reconciliation runs for flagged
-   * slots: an external `agy logout` + re-login writes the new email into the
-   * newest CLI logs, and detecting that locally lets us reset the stale
-   * quarantine/cooldowns so the slot rejoins polling — no extra request to
-   * Google is made for this check (risk-control neutral).
+   * Refresh quota statistics for all accounts in the pool (hourly background
+   * poll, or a user-triggered sweep). Scheduling lives in features/quota/pool-sweep.ts;
+   * this method only supplies the I/O seams.
    */
   async refreshAllQuotas(force = false): Promise<void> {
-    let accounts = this.pool.getAccounts()
-    if (!force) {
-      const now = Date.now()
-      for (const acc of accounts) {
-        const flagged = acc.authRequired || Object.values(acc.cooldowns ?? {}).some((cd) => cd && cd.cooldownUntil > now)
-        if (!acc.systemHome || !flagged) continue
-        const home = acc.systemHome || !acc.dir ? homedir() : acc.dir
-        let detected: string | undefined
-        if (process.platform === 'win32') {
-          const stored = readPrimaryCredential(this.pool.dir)
-          if (stored?.email) detected = stored.email
-        }
-        if (!detected) {
-          const fromLogs = detectEmailFromAgyLogs(home)
-          const siblingEmails = new Set(
-            this.pool
-              .getAccounts()
-              .filter((a) => a.id !== acc.id && a.email)
-              .map((a) => a.email!),
-          )
-          if (fromLogs && !siblingEmails.has(fromLogs)) {
-            detected = fromLogs
-          }
-        }
-        if (detected && detected !== acc.email) {
-          this.pool.resetAccountIdentity(acc.id, detected)
-        }
-      }
-      // Auth-flagged accounts re-enter the poll once their flag is stale
-      // enough: one token-endpoint verification either clears the flag (the
-      // common transient false positive) or re-stamps it. This is what makes
-      // "needs re-login" self-heal without a manual quota refresh.
-      accounts = accounts.filter((acc) => shouldPollAccount(acc) || needsAuthReverify(acc))
-      // Background sweeps stay sequential with a 2-second gap. Only the
-      // credential-store owner can spawn a CLI now (see readCliUsageFamilies),
-      // so this is no longer about CLI contention — it keeps the unattended,
-      // hourly REST burst gentle instead. An hourly sweep has no latency budget
-      // worth trading that safety margin for; explicit user refreshes below run
-      // fully concurrently.
-      for (let i = 0; i < accounts.length; i++) {
-        const acc = accounts[i]!
-        await this.refreshAccountQuota(acc, false).catch(() => null)
-        if (i < accounts.length - 1) {
-          await new Promise((resolve) => setTimeout(resolve, staggerJitterMs()))
-        }
-      }
-      return
-    }
-    // Even on manual force refresh, never touch disabled or terminally TOS-banned
-    // accounts: knocking on a banned account from the same proxy egress risks
-    // correlating sibling accounts.
-    accounts = accounts.filter((acc) => acc.enabled && !isTerminalAuthError(acc.authError))
-    const nextForceGapMs = (): number =>
-      this.cliDeps.forceStaggerMs?.() ??
-      (process.env.NODE_TEST_CONTEXT !== undefined ? 0 : 400 + Math.floor(Math.random() * 450))
+    await sweepPoolQuotas(this.sweepDeps(), force)
+  }
 
-    // Isolated accounts run pure REST calls and never touch the Windows OS
-    // Credential Manager slot; only the single `systemHome` account uses
-    // `credentialSlotMutex` inside `readCliUsageFamilies`. Keep bounded
-    // per-egress concurrency across all platforms to avoid slow serial sweeps.
-    const concurrency = Math.max(1, Math.floor(this.cliDeps.forceConcurrency?.() ?? QUOTA_FORCE_CONCURRENCY))
-    await sweepAccountsByEgress(accounts, {
-      egressOf: (acc) => this.proxyFor(acc) || '__direct__',
-      run: async (acc) => {
-        await this.refreshAccountQuota(acc, force).catch(() => null)
-      },
-      staggerMs: nextForceGapMs,
-      concurrency,
-    })
+  /**
+   * Fast self-heal for 需重新登录 flags (2-minute timer, 2m → 30m back-off):
+   * a false positive clears in one request, a dead login backs off.
+   */
+  async reverifyFlaggedAccounts(): Promise<void> {
+    await reverifyFlaggedAccounts(this.sweepDeps())
+  }
+
+  /** I/O seams for the pool-wide passes. */
+  private sweepDeps(): PoolSweepDeps {
+    return {
+      pool: this.pool,
+      refreshAccountQuota: (account, force) => this.refreshAccountQuota(account, force),
+      proxyOf: (account) => this.proxyFor(account),
+      detectEmailFromLogs: (home) => detectEmailFromAgyLogs(home),
+      readStoredPrimaryEmail: () => readPrimaryCredential(this.pool.dir)?.email,
+      systemHome: () => homedir(),
+      ...(this.cliDeps.forceStaggerMs === undefined ? {} : { forceStaggerMs: this.cliDeps.forceStaggerMs }),
+      ...(this.cliDeps.forceConcurrency === undefined ? {} : { forceConcurrency: this.cliDeps.forceConcurrency }),
+    }
   }
 }

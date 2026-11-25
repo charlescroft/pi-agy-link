@@ -4,10 +4,18 @@
 // (markAccountActive / agyOnAccount).
 import { LlmError } from '@deepseek-ai/dsh-llm'
 import { Err, type PluginConfig } from '../common/types.ts'
-import { modelFamilyOf, type ManagedAccount, type ModelFamily } from '../common/pool-types.ts'
+import { modelFamilyOf, sharedArgonPeerFamily, type ManagedAccount, type ModelFamily } from '../common/pool-types.ts'
+import { resolveModelSlug } from '../domain/models/parse.ts'
+import { isModelQuotaClear } from '../domain/accounts/selection.ts'
 import type { AccountPoolManager } from '../host/pool.ts'
 import type { SessionStore } from '../host/sessions.ts'
-import { PREFERRED_CLAUDE, PREFERRED_GEMINI_FLASH, PREFERRED_OPENAI } from '../common/model-lineup.ts'
+import {
+  PREFERRED_CLAUDE,
+  PREFERRED_GEMINI_ARGON,
+  PREFERRED_GEMINI_FLASH,
+  PREFERRED_GEMINI_HYDROGEN,
+  PREFERRED_OPENAI,
+} from '../common/model-lineup.ts'
 
 export interface AccountSelectionDeps {
   pool?: AccountPoolManager
@@ -32,6 +40,16 @@ export interface AccountSelectionInput {
   isAux: boolean
   sessionKey: string
   reasoningEffort?: string
+  /**
+   * A SECOND model whose own quota bucket must also be clear for this call
+   * (image generation: driver model + image model share the family pool but not
+   * the same bucket). Empty/undefined keeps the historical behaviour.
+   */
+  quotaModel?: string
+  /** Accounts that just failed THIS request's quota bucket; never pick them again. */
+  avoidAccountIds?: readonly string[]
+  /** Allow switching to a widely-supported model when zero accounts can serve a scarce model (compaction / session-title). */
+  allowAuxModelFallback?: boolean
 }
 
 export interface AccountSelectionResult {
@@ -40,8 +58,14 @@ export interface AccountSelectionResult {
   activeModel: string
 }
 
-/** Session affinity: reuse the account this session last ran for THIS family, if eligible and not superseded by a manual switch. */
-function stickyAccount(
+/**
+ * Session affinity: reuse the account this session last ran for THIS family, if eligible and not superseded by a manual switch.
+ *
+ * Exported because the header badge must describe the SAME account the
+ * scheduler would pick. A second, badge-local copy of this rule is exactly how
+ * the readout drifted from reality (reported 2026-11-23).
+ */
+export function stickyAccount(
   deps: AccountSelectionDeps,
   family: ModelFamily,
   sessionKey: string,
@@ -61,10 +85,15 @@ function stickyAccount(
       deps.store.delete(k)
       continue
     }
-    if (b.model && b.model.trim() !== '' && modelFamilyOf(b.model) !== family) continue
+    const peerFam = sharedArgonPeerFamily(boundAcc, family)
+    if (b.model && b.model.trim() !== '') {
+      const bFam = modelFamilyOf(b.model)
+      if (bFam !== family && bFam !== peerFam) continue
+    }
     // If the user explicitly switched/reordered accounts in the UI or CLI after
     // this binding was written, honor the user's explicit choice immediately.
-    if (familyPinAt > 0 && b.updatedAt < familyPinAt) continue
+    const effectivePinAt = Math.max(familyPinAt, peerFam ? (poolData.manualPinAtByFamily?.[peerFam] ?? 0) : 0)
+    if (effectivePinAt > 0 && b.updatedAt < effectivePinAt) continue
     if (b.updatedAt > latestUpdated) {
       mostRecent = boundAcc
       latestUpdated = b.updatedAt
@@ -76,6 +105,42 @@ function stickyAccount(
       : pool.isAccountEligible(mostRecent, family))
     ? mostRecent
     : undefined
+}
+
+/**
+ * Pick a widely-available model + eligible account when zero accounts can serve
+ * a scarce model for background auxiliary work (compaction / session-title).
+ */
+export function pickAuxFallbackCandidate(
+  pool: AccountPoolManager,
+  preferredFamily: ModelFamily,
+  requestedModel: string,
+): { account: ManagedAccount; family: ModelFamily; activeModel: string } | null {
+  const reqSlug = resolveModelSlug(requestedModel)
+  const seen = new Set<string>(reqSlug ? [reqSlug] : [])
+  const sameFamilyMap: Partial<Record<ModelFamily, readonly string[]>> = {
+    google: [PREFERRED_GEMINI_FLASH, PREFERRED_GEMINI_HYDROGEN, PREFERRED_GEMINI_ARGON],
+    argon: [PREFERRED_GEMINI_FLASH, PREFERRED_GEMINI_HYDROGEN, PREFERRED_GEMINI_ARGON],
+    anthropic: [PREFERRED_CLAUDE],
+    openai: [PREFERRED_OPENAI],
+  }
+  const ordered = [
+    ...(sameFamilyMap[preferredFamily] ?? []),
+    PREFERRED_GEMINI_FLASH,
+    PREFERRED_CLAUDE,
+    PREFERRED_OPENAI,
+  ]
+  for (const cand of ordered) {
+    const slug = resolveModelSlug(cand)
+    if (!slug || seen.has(slug)) continue
+    seen.add(slug)
+    const fam = modelFamilyOf(slug)
+    const acc = pool.selectAccount(fam, slug)
+    if (acc !== null && acc !== undefined) {
+      return { account: acc, family: fam, activeModel: slug }
+    }
+  }
+  return null
 }
 
 /** Cross-family failover when the requested family has no account left. */
@@ -197,34 +262,57 @@ export async function selectSessionAccount(input: AccountSelectionInput): Promis
 
   const pool = deps.pool
   let account: ManagedAccount | undefined
-  // Windows has one global credential slot; align sessions to the pool's
-  // active candidate so they share it lock-free (parallelSameAccount).
-  if (pool !== undefined && !isAux && sessionKey !== '' && process.platform === 'win32' && cfg.parallelSameAccount) {
-    account = pool.selectAccount(family, activeModel) ?? undefined
+  const avoid = new Set(input.avoidAccountIds ?? [])
+  const quotaModel = (input.quotaModel ?? '').trim()
+  const quotaClear = (acc: ManagedAccount | undefined): acc is ManagedAccount =>
+    acc !== undefined &&
+    !avoid.has(acc.id) &&
+    (quotaModel === '' || isModelQuotaClear(acc, family, quotaModel, Date.now()))
+  // Session affinity comes FIRST on every platform: the account this session
+  // already ran on is the one its credential slot most likely still holds, and
+  // hopping accounts mid-conversation swaps that slot and the quota the user is
+  // watching (spec: "Turn 2 MUST stay on Turn 1's account while it has quota").
+  // The Windows pack-share below therefore only decides for sessions that have
+  // no usable binding — a fresh session still follows the pool's candidate so
+  // concurrent runs keep sharing one credential slot.
+  if (pool !== undefined && !isAux && sessionKey !== '') {
+    const sticky = stickyAccount(deps, family, sessionKey, activeModel)
+    if (quotaClear(sticky)) account = sticky
   }
-  if (account === undefined && pool !== undefined && !isAux && sessionKey !== '') {
-    account = stickyAccount(deps, family, sessionKey, activeModel)
+  if (account === undefined && pool !== undefined && !isAux && sessionKey !== '' && process.platform === 'win32' && cfg.parallelSameAccount) {
+    account = pool.selectAccount(family, activeModel) ?? undefined
   }
   if (account === undefined && pool !== undefined) {
-    account = pool.selectAccount(family, activeModel) ?? undefined
+    if (quotaModel !== '' && typeof pool.findAccount === 'function') {
+      // Image-style call: pick WITHOUT moving the family's sticky pointer.
+      const picked = pool.findAccount(family, activeModel, quotaModel, input.avoidAccountIds) ?? undefined
+      if (quotaClear(picked)) account = picked
+    } else {
+      const picked = pool.selectAccount(family, activeModel) ?? undefined
+      if (quotaClear(picked)) account = picked
+    }
   }
-  if (
-    account !== undefined
-    && pool !== undefined
-    && (family === 'google' || !pool.getPoolData().lastActiveAccountId)
-    && pool.getPoolData().lastActiveAccountId !== account.id
-  ) {
-    // Record in-use account without stamping manualPinAt or overwriting global
-    // family pins from an older session's sticky affinity.
+  if (account !== undefined && pool !== undefined) {
+    // Record the account actually serving this family, without stamping
+    // manualPinAt. Family-scoped: an Argon pick must not rewrite the Gemini
+    // pointer, but it MUST make the Argon row truthful.
     if (typeof pool.markAccountActive === 'function') {
-      pool.markAccountActive(account.id)
+      pool.markAccountActive(account.id, family)
     } else {
       pool.setActiveAccount(account.id, family)
     }
   }
 
   if (account === undefined && pool !== undefined && pool.getAccounts().length > 0) {
-    if (cfg.autoFallbackModel) {
+    if (input.allowAuxModelFallback) {
+      const auxFb = pickAuxFallbackCandidate(pool, family, activeModel)
+      if (auxFb !== null) {
+        account = auxFb.account
+        family = auxFb.family
+        activeModel = auxFb.activeModel
+      }
+    }
+    if (account === undefined && cfg.autoFallbackModel) {
       const fb = crossFamilyFallback(deps, family)
       if (fb !== null) {
         account = fb.account

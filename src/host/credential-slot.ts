@@ -55,6 +55,11 @@ import {
 } from '../domain/credentials/docs.ts'
 import { resolvePrimaryCredentialAt } from '../domain/credentials/resolve.ts'
 import { acquireCredentialSlotAt } from '../domain/credentials/slot.ts'
+import {
+  recoverPrimarySlotAt,
+  reinstallAccountCredentialAt,
+  type PrimaryRecoveryResult,
+} from '../domain/credentials/guards.ts'
 import type { SlotIo } from '../domain/credentials/platform.ts'
 import type { SlotLease } from '../domain/credentials/lease.ts'
 
@@ -128,6 +133,8 @@ export interface ResolveOptions {
    * degraded (refresh-token-less) document.
    */
   force?: boolean
+  /** Refuse to overwrite an unrecognised external standalone AGY sign-in in the Windows slot (#145). */
+  respectExternalSignIn?: boolean
 }
 
 function resolveIo(options: ResolveOptions): SlotIo {
@@ -207,7 +214,62 @@ export async function acquireCredentialSlot(
     ...(options.parallel === undefined ? {} : { parallel: options.parallel }),
     ...(options.proxyUrl === undefined ? {} : { proxyUrl: options.proxyUrl }),
     ...(options.force === undefined ? {} : { force: options.force }),
+    ...(options.respectExternalSignIn === undefined ? {} : { respectExternalSignIn: options.respectExternalSignIn }),
   })
+}
+
+/**
+ * Put the PRIMARY credential back into the Windows slot once nothing else holds
+ * it. Called when an account switch drains away the last process of the other
+ * account, and from the idle sweep — an account switch must never leave the
+ * machine holding someone else's login.
+ *
+ * Refuses (reason 'busy') while a same-identity run or a queued switch is live:
+ * overwriting the slot under a running agy would feed it the wrong credential at
+ * its next in-run token refresh.
+ */
+export async function recoverPrimaryCredential(
+  pool: AccountPoolManager | undefined,
+  options: ResolveOptions = {},
+): Promise<PrimaryRecoveryResult> {
+  const io = resolveIo(options)
+  if (io.platform !== 'win32') return { restored: false, reason: 'already-primary' }
+  const { baseDir, homeDir } = resolvedDirs(options)
+  return recoverPrimarySlotAt(pool, {
+    baseDir,
+    homeDir,
+    platform: io,
+    log: options.log ?? noop,
+    ...(options.proxyUrl === undefined ? {} : { proxyUrl: options.proxyUrl }),
+    ...(options.force === undefined ? {} : { force: options.force }),
+    ...(options.respectExternalSignIn === undefined ? {} : { respectExternalSignIn: options.respectExternalSignIn }),
+  })
+}
+
+/**
+ * Force `raw` into the Windows slot, ignoring leases. Only for the identity
+ * mismatch recovery path, where the slot provably holds the wrong account and no
+ * lease can be trusted to fix it.
+ */
+export function reinstallCredential(
+  raw: string,
+  options: ResolveOptions = {},
+  label = 'primary',
+): boolean {
+  const io = resolveIo(options)
+  if (io.platform !== 'win32') return false
+  const { baseDir, homeDir } = resolvedDirs(options)
+  return reinstallAccountCredentialAt(
+    raw,
+    {
+      baseDir,
+      homeDir,
+      platform: io,
+      log: options.log ?? noop,
+      ...(options.proxyUrl === undefined ? {} : { proxyUrl: options.proxyUrl }),
+    },
+    label,
+  )
 }
 
 // ---- frozen public surface (moved implementations) ------------------------
@@ -247,4 +309,8 @@ export {
   SLOT_HANDOFF_TIMEOUT_MS,
   type SlotHandoff,
 } from '../domain/credentials/handoff.ts'
-export { fastPathRunCount, isSlotSwitchPending } from '../domain/credentials/slot.ts'
+export {
+  fastPathRunCount,
+  isSlotSwitchPending,
+} from '../domain/credentials/slot.ts'
+export { slotGuardStats, type PrimaryRecoveryResult } from '../domain/credentials/guards.ts'

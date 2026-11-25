@@ -4,6 +4,9 @@
 // token-shaped strings redacted before anything hits disk.
 import { chmodSync, mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { describeStartupCost } from './boot-maintenance.ts'
+import { findDuplicateEmailGroups } from '../common/account-duplicates.ts'
+import { agyMcpConfigPath } from './mcp-bridge.ts'
 import { stateDir } from '../common/config.ts'
 import type { PluginConfig } from '../common/types.ts'
 import { agyBinDiagnostics } from '../runtime/agy/bin.ts'
@@ -18,6 +21,8 @@ export interface DoctorDeps {
   catalog: () => ModelCatalog
   store: () => SessionStore
   recentLines: () => readonly string[];
+  /** Pool accounts, for the startup-cost section. */
+  accounts?: () => readonly { id: string; dir?: string; systemHome?: boolean }[]
   /** Models agy refused `--effort` for (issue #67); absent = none known. */
   effortUnsupported?: () => readonly string[]
 }
@@ -93,10 +98,13 @@ export function writeDoctorReport(deps: DoctorDeps): string {
       (cfg.suppressAgyAutoUpdate ? describeAgyAutoUpdate() : 'not suppressed (suppressAgyAutoUpdate=false)'),
   )
   // The full config is dumped for support: scrub values that can carry
-  // credentials (proxyUrl) instead of emitting them into a 0644 file.
+  // credentials (proxyUrl, agySettings) instead of emitting them into a 0644 file.
   const cfgDump: Record<string, unknown> = { ...cfg, extraArgs: cfg.extraArgs.length }
   if (typeof cfgDump.proxyUrl === 'string' && cfgDump.proxyUrl !== '') {
     cfgDump.proxyUrl = redactProxyUrl(cfgDump.proxyUrl as string)
+  }
+  if (typeof cfgDump.agySettings === 'string' && cfgDump.agySettings !== '') {
+    cfgDump.agySettings = redactLine(cfgDump.agySettings)
   }
   lines.push('- plugin config: ' + JSON.stringify(cfgDump))
   lines.push('- catalog: ' + cat.source + ' — ' + cat.models.length + ' models' + (cat.lastError === undefined ? '' : ' — error: ' + cat.lastError))
@@ -112,6 +120,25 @@ export function writeDoctorReport(deps: DoctorDeps): string {
   lines.push('- conversation bindings: ' + Object.keys(bindings).length)
   for (const [k, b] of Object.entries(bindings)) {
     lines.push('  - ' + k + ' -> ' + b.conversationId + ' @ ' + new Date(b.updatedAt).toISOString())
+  }
+  if (deps.accounts !== undefined) {
+    // Duplicate Google identities: one quota, one credential slot, two rows.
+    try {
+      for (const group of findDuplicateEmailGroups(deps.accounts() as never)) {
+        lines.push('- duplicate account: ' + group.email + ' -> ' + group.aliases.join(', ') + ' (shares one quota; remove the extra row)')
+      }
+    } catch {
+      // diagnostics must never fail the command
+    }
+  }
+  if (deps.accounts !== undefined) {
+    // Why startup was slow, and what the next spawn will still pay.
+    try {
+      const registry = agyMcpConfigPath('', process.env)
+      for (const line of describeStartupCost(registry, deps.accounts() as never)) lines.push(line)
+    } catch {
+      // diagnostics must never fail the command
+    }
   }
   lines.push('- node: ' + process.version + ' — ' + process.platform + ' ' + process.arch)
   lines.push('')
