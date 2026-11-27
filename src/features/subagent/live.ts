@@ -14,6 +14,16 @@
  * SUBAGENT_STATE_ALIVE, so descriptor state cannot prove life; recent transcript
  * activity can, and the round ending (tracker.stop) settles the rest.
  */
+export interface BackgroundTaskSnapshot {
+  id: string
+  command?: string
+  status?: string
+  logPath?: string
+  outputTail: string
+  startedAt?: number
+  [key: string]: unknown
+}
+
 export const SUBAGENT_LIVE_WINDOW_MS = 10 * 60_000
 
 export interface SubagentSnapshotItem {
@@ -39,15 +49,55 @@ export interface SessionSubagentSnapshot extends SubagentSnapshot {
 
 export interface SubagentTrackable {
   snapshot(): SubagentSnapshot
+  backgroundTasks?(): BackgroundTaskSnapshot[]
 }
 
 const live = new Map<string, SubagentTrackable[]>()
+const bgTaskSinks = new Set<(tasks: BackgroundTaskSnapshot[]) => void>()
+
+export function registerBackgroundTaskWidgetSink(sink: (tasks: BackgroundTaskSnapshot[]) => void): () => void {
+  bgTaskSinks.add(sink)
+  return () => {
+    bgTaskSinks.delete(sink)
+  }
+}
+
+export function hasBackgroundTaskWidgetSink(): boolean {
+  return bgTaskSinks.size > 0
+}
+
+export function snapshotBackgroundTasks(sessionKey?: string): BackgroundTaskSnapshot[] {
+  const byId = new Map<string, BackgroundTaskSnapshot>()
+  const entries = sessionKey ? [[sessionKey, live.get(sessionKey) ?? []] as const] : Array.from(live.entries())
+  for (const [, trackers] of entries) {
+    for (const tr of trackers) {
+      const list = tr.backgroundTasks?.() ?? []
+      for (const item of list) {
+        byId.set(item.id, item)
+      }
+    }
+  }
+  return Array.from(byId.values())
+}
+
+export function notifyBackgroundTasksChanged(): void {
+  if (bgTaskSinks.size === 0) return
+  const tasks = snapshotBackgroundTasks()
+  for (const sink of bgTaskSinks) {
+    try {
+      sink(tasks)
+    } catch {
+      // ignore sink errors
+    }
+  }
+}
 
 export function attachSubagentTracker(sessionKey: string, tracker: SubagentTrackable): void {
   if (sessionKey === '') return
   const list = live.get(sessionKey) ?? []
   if (!list.includes(tracker)) list.push(tracker)
   live.set(sessionKey, list)
+  notifyBackgroundTasksChanged()
 }
 
 export function detachSubagentTracker(sessionKey: string, tracker: SubagentTrackable): void {
@@ -57,6 +107,7 @@ export function detachSubagentTracker(sessionKey: string, tracker: SubagentTrack
   const next = list.filter((t) => t !== tracker)
   if (next.length === 0) live.delete(sessionKey)
   else live.set(sessionKey, next)
+  notifyBackgroundTasksChanged()
 }
 
 /** Every session that currently has at least one tracked subagent. */

@@ -9,6 +9,7 @@ import { defaultConfig, type AgyEvent } from '../src/common/types.ts'
 import { AcpSessionPool } from '../src/features/acp/pool.ts'
 import { runAcpAttempt } from '../src/features/acp/run-attempt.ts'
 import { SubagentTracker } from '../src/features/subagent/tracker.ts'
+import { registerBackgroundTaskWidgetSink, type BackgroundTaskSnapshot } from '../src/features/subagent/live.ts'
 import { TaskActivityTracker, formatTaskLogLine, summarizeMessageJson } from '../src/features/subagent/task-activity.ts'
 import { AgyAdapter } from '../src/host/adapter.ts'
 import { ModelCatalog } from '../src/host/models.ts'
@@ -378,6 +379,59 @@ describe('background task visibility (tasks/*.log, messages/*.json, RUNNING card
       else process.env.HOME = prevHome
       if (prevUserProfile === undefined) delete process.env.USERPROFILE
       else process.env.USERPROFILE = prevUserProfile
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test('SubagentTracker routes background tasks to widget sink and suppresses thinking-block lines when sink is registered', () => {
+    const root = mkdtempSync(join(tmpdir(), 'agy-tracker-widget-'))
+    const convDir = join(root, '.gemini', 'antigravity-cli', 'conversations')
+    const brainBase = join(root, '.gemini', 'antigravity-cli', 'brain')
+    const mainBrain = join(brainBase, 'main-conv-widget')
+    const tasksDir = join(mainBrain, '.system_generated', 'tasks')
+    mkdirSync(convDir, { recursive: true })
+    mkdirSync(tasksDir, { recursive: true })
+    setAgyDbDir(convDir)
+
+    const events: AgyEvent[] = []
+    const snapshots: BackgroundTaskSnapshot[][] = []
+    let activity = 0
+    const unregister = registerBackgroundTaskWidgetSink((tasks) => {
+      snapshots.push(tasks)
+    })
+    const tracker = new SubagentTracker({
+      conversationId: 'main-conv-widget',
+      sessionKey: 'sess-widget-1',
+      accountHome: root,
+      pollIntervalMs: 5_000,
+      onEvent: (ev) => events.push(ev),
+      noteActivity: () => {
+        activity += 1
+      },
+    })
+
+    try {
+      tracker.start()
+      writeFileSync(join(tasksDir, 'task-77.log'), 'compiling step 1\nCommand exited with code 0.\n')
+      tracker.poll()
+
+      assert.equal(
+        events.some((e) => e.kind === 'step' && e.text.includes('[后台任务 · task-77]')),
+        false,
+        'thinking block must not receive background task log lines when widget sink is active',
+      )
+      assert.ok(activity >= 2)
+      const latest = snapshots.at(-1) ?? []
+      const task = latest.find((t) => t.id === 'task-77')
+      assert.ok(task, 'widget sink must receive structured background task snapshot')
+      assert.equal(task.kind, 'background_task')
+      assert.equal(task.source, 'agy')
+      assert.equal(task.state, 'complete')
+      assert.ok(task.outputTail.includes('compiling step 1'))
+      assert.ok(task.logPath?.endsWith('task-77.log'))
+    } finally {
+      tracker.stop()
+      unregister()
       rmSync(root, { recursive: true, force: true })
     }
   })

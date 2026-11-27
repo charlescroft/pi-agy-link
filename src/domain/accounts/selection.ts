@@ -12,6 +12,7 @@ import {
   argonSharesGoogleGroup,
   baseModelSlug,
   effectiveFamilyCooldown,
+  resolveFamilyPinnedId,
   type FamilyQuotaInfo,
   type ManagedAccount,
   type ModelFamily,
@@ -24,7 +25,7 @@ import {
 } from '../../common/quota-bench.ts'
 import { computeQuotaPacing, FIVE_HOUR_WINDOW_MS, WEEKLY_WINDOW_MS } from '../../common/quota-pacing.ts'
 
-export { isQuotaBenched, LOW_QUOTA_5H, LOW_QUOTA_WEEKLY }
+export { isQuotaBenched, LOW_QUOTA_5H, LOW_QUOTA_WEEKLY, resolveFamilyPinnedId }
 
 /** Why a pool account cannot serve a family right now (diagnostics only). */
 export type AccountIneligibilityReason = 'disabled' | 'auth' | 'cooldown' | 'quota' | 'unsupported' | 'model-unsupported' | 'model-cooldown'
@@ -75,6 +76,28 @@ export function explainIneligibility(
 }
 
 /**
+ * Find the pinned candidate in `candidates` for `family`, honouring the
+ * shared-group `google` <-> `argon` peer pointer when `family`'s own pointer
+ * is absent or points elsewhere.
+ */
+export function findPinnedCandidate(
+  candidates: readonly ManagedAccount[],
+  activeAccountIds: Partial<Record<ModelFamily, string>> | undefined,
+  family: ModelFamily,
+): ManagedAccount | undefined {
+  const directId = activeAccountIds?.[family]
+  if (directId) {
+    const direct = candidates.find((a) => a.id === directId)
+    if (direct) return direct
+  }
+  const peerFam = family === 'argon' ? 'google' : family === 'google' ? 'argon' : undefined
+  const peerId = peerFam ? activeAccountIds?.[peerFam] : undefined
+  if (!peerId) return undefined
+  const peer = candidates.find((a) => a.id === peerId)
+  return peer && argonSharesGoogleGroup(peer) ? peer : undefined
+}
+
+/**
  * Pick an eligible account WITHOUT mutating any active pointer.
  *
  * Used by cross-model requests (image generation): rotating a model-scoped
@@ -101,11 +124,8 @@ export function pickEligibleAccount(
         isModelQuotaClear(acc, input.family, input.quotaModel, input.now)),
   )
   if (candidates.length === 0) return null
-  return (
-    candidates.find((acc) => acc.id === input.activeId) ??
-    orderByExpiry(accounts, candidates, input.family, input.activeId, input.now)[0] ??
-    null
-  )
+  const active = candidates.find((acc) => acc.id === input.activeId)
+  return active ?? orderByExpiry(accounts, candidates, input.family, input.activeId, input.now)[0] ?? null
 }
 
 /**
@@ -257,8 +277,9 @@ export function orderByExpiry(
 
 /**
  * Pure, side-effect-free lookup of the active eligible account ID for a given
- * family. Honors a still-eligible family pin first, then falls back to the
- * first eligible candidate in rotation order without mutating pool state.
+ * family. Honors a still-eligible family pin (or shared google<->argon peer)
+ * first, then falls back to the first eligible candidate in rotation order
+ * without mutating pool state.
  */
 export function resolveEligibleActiveAccountId(
   accounts: readonly ManagedAccount[],
@@ -268,14 +289,10 @@ export function resolveEligibleActiveAccountId(
   now = Date.now(),
   model?: string,
 ): string | undefined {
-  const pinnedId = activeAccountIds?.[family]
-  if (pinnedId) {
-    const pinned = accounts.find((a) => a.id === pinnedId)
-    if (pinned && isAccountEligible(pinned, family, now, pool, model)) {
-      return pinned.id
-    }
-  }
   const candidates = accounts.filter((acc) => isAccountEligible(acc, family, now, pool, model))
   if (candidates.length === 0) return undefined
-  return orderByExpiry(accounts, candidates, family, pinnedId, now)[0]?.id
+  const pinned = findPinnedCandidate(candidates, activeAccountIds, family)
+  if (pinned) return pinned.id
+  const fromId = resolveFamilyPinnedId(accounts, activeAccountIds, family)
+  return orderByExpiry(accounts, candidates, family, fromId, now)[0]?.id
 }

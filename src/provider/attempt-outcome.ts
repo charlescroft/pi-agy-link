@@ -44,6 +44,7 @@ import {
   buildSpawnArgs,
   createAttemptRecorder,
   createAttemptSlot,
+  orchestratorSettingsCoveredByAcp,
   resolveEffectiveAgySettings,
   type AttemptDeps,
   type AttemptInput,
@@ -465,6 +466,7 @@ export async function handleAttemptOutcome(
       clearRateLimitFailover: (key) => deps.clearRateLimitFailover(key),
       sharesSingleEgress: () => deps.sharesSingleEgress(),
       ...(deps.onRun === undefined ? {} : { onRun: deps.onRun }),
+      ...(deps.log === undefined ? {} : { log: deps.log }),
     })
     // The run settled on `input.account`: refresh just that account so the panel
     // stops showing the pre-turn snapshot (throttled host-side).
@@ -507,20 +509,26 @@ export async function* runAgyAttempt(
   // the slot, exactly as the former inline block did — the trim warning is
   // logged even when the dispatch later aborts.
   const spawn = buildSpawnArgs(input, recorder.printTimeoutMinutes, deps.log)
+  const attemptInput: AttemptInput = { ...input, prompt: spawn.prompt }
   // Dispatch sees the NUL-sanitized prompt: its failure path clears the
   // in-flight marker with the same string the former inline block used.
-  const slot = yield* dispatchCredentialSlot(deps, { ...input, prompt: spawn.prompt })
-  recorder.setTrackerSession?.(input.sessionKey)
-  const effectiveAgySettings = resolveEffectiveAgySettings(input)
-  if ((input.transport ?? input.cfg.transport) === 'acp' && deps.runAcp && !input.jsonSchema && !effectiveAgySettings && !input.isAux) {
-    const acpRec = await deps.runAcp(deps, { ...input, prompt: spawn.prompt }, slot).catch(() => null)
+  const slot = yield* dispatchCredentialSlot(deps, attemptInput)
+  recorder.rec.accountId = attemptInput.account?.id
+  recorder.setTrackerSession?.(attemptInput.sessionKey)
+  const effectiveAgySettings = resolveEffectiveAgySettings(attemptInput)
+  // Orchestrator-only overrides are written to the account's settings.json by
+  // the ACP path itself, so they no longer force the batch CLI (issue #204).
+  // Free-form agySettings still do: persisting them would outlive one call.
+  const acpCoversSettings = orchestratorSettingsCoveredByAcp(attemptInput)
+  if ((attemptInput.transport ?? attemptInput.cfg.transport) === 'acp' && deps.runAcp && !attemptInput.jsonSchema && (!effectiveAgySettings || acpCoversSettings)) {
+    const acpRec = await deps.runAcp(deps, attemptInput, slot).catch(() => null)
     if (acpRec !== null) {
       recorder.stop()
       return acpRec
     }
   }
-  const spawned = await startAttemptProcess(deps, input, spawn, recorder, slot)
-  void handleAttemptOutcome(deps, input, { ...spawned, recorder, slot, spawn }).catch((err) => {
+  const spawned = await startAttemptProcess(deps, attemptInput, spawn, recorder, slot)
+  void handleAttemptOutcome(deps, attemptInput, { ...spawned, recorder, slot, spawn }).catch((err) => {
     slot.releaseOnce()
     recorder.rec.settle({ kind: 'error', code: Err.PROCESS_EXIT, message: 'internal error: ' + brief(String(err)) })
   })

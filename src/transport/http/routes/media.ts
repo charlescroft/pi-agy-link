@@ -4,8 +4,9 @@ import { createHash } from 'node:crypto'
 import { existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir, tmpdir } from 'node:os'
+import { stateDir } from '../../../common/config.ts'
 import {
-  handleMediaRequest,
+  handleMediaRequestAsync,
   handleAssetRequest,
   handleOpenFile,
   type HttpRequestLike,
@@ -54,8 +55,11 @@ function handleMermaid(services: HostServices, req: unknown, res: unknown): void
   }
 }
 
-export function collectWorkspaceRoots(services: HostServices): string[] {
-  const { getConfig, mediaDir, activeCwds } = services
+export function collectWorkspaceRoots(
+  services: HostServices,
+  opts: { includeDownloadsAndTmp?: boolean; includePersistedCwds?: boolean } = {},
+): string[] {
+  const { getConfig, mediaDir, activeCwds, store } = services
   const roots: string[] = []
   const cfgRoot = getConfig().workspaceRoot
   if (cfgRoot) roots.push(cfgRoot)
@@ -71,23 +75,39 @@ export function collectWorkspaceRoots(services: HostServices): string[] {
     }
   }
 
+  // Read-only media preview also honours workspaces from persisted sessions so
+  // historical chat transcripts can still preview videos/images after a restart.
+  if (opts.includePersistedCwds !== false && typeof store?.all === 'function') {
+    try {
+      for (const binding of Object.values(store.all())) {
+        const c = binding?.cwd
+        if (typeof c === 'string' && c !== '' && !roots.includes(c) && existsSync(c)) roots.push(c)
+      }
+    } catch {
+      // ignore
+    }
+  }
+
   const cwd = process.cwd()
   if (!roots.includes(cwd)) roots.push(cwd)
 
+  const includeDownloadsAndTmp = opts.includeDownloadsAndTmp !== false
   const home = homedir()
   const allowedUserDirs = [
     join(home, 'Developer'),
     join(home, 'Workspace'),
     join(home, 'Projects'),
     join(home, 'Desktop'),
-    join(home, 'Downloads'),
+    ...(includeDownloadsAndTmp ? [join(home, 'Downloads')] : []),
   ]
   for (const d of allowedUserDirs) {
     if (existsSync(d) && !roots.includes(d)) roots.push(d)
   }
 
-  const tmp = tmpdir()
-  if (tmp && existsSync(tmp) && !roots.includes(tmp)) roots.push(tmp)
+  if (includeDownloadsAndTmp) {
+    const tmp = tmpdir()
+    if (tmp && existsSync(tmp) && !roots.includes(tmp)) roots.push(tmp)
+  }
 
   try {
     for (const b of brainDirCandidates()) {
@@ -102,12 +122,21 @@ export function collectWorkspaceRoots(services: HostServices): string[] {
 
 function handleMedia(services: HostServices, req: unknown, res: unknown): void {
   const roots = collectWorkspaceRoots(services)
-  handleMediaRequest(req as HttpRequestLike, res as HttpResponseLike, { workspaceRoots: roots })
+  const conn = services.connection?.()
+  void handleMediaRequestAsync(req as HttpRequestLike, res as HttpResponseLike, {
+    workspaceRoots: roots,
+    cacheDir: join(stateDir(), 'media-cache'),
+    ...(conn ? { connection: conn } : {}),
+  })
 }
 
 function handleOpen(services: HostServices, req: unknown, res: unknown): void {
-  const roots = collectWorkspaceRoots(services)
-  handleOpenFile(req as HttpRequestLike, res as HttpResponseLike, { workspaceRoots: roots })
+  const roots = collectWorkspaceRoots(services, { includeDownloadsAndTmp: false, includePersistedCwds: false })
+  const conn = services.connection?.()
+  handleOpenFile(req as HttpRequestLike, res as HttpResponseLike, {
+    workspaceRoots: roots,
+    ...(conn ? { connection: conn } : {}),
+  })
 }
 
 function handleAssets(req: unknown, res: unknown, assetDir: string): void {

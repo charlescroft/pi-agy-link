@@ -2,6 +2,18 @@
 import type { HostServices } from '../../../host/services.ts'
 import { methodOf, readBody, runRoute, sendJson, type RawRes, type RouteRegistrar } from '../respond.ts'
 
+/**
+ * Workspace roots the panel should scan: every active session's directory.
+ *
+ * `/agy skills` resolves one root for its session (configured workspaceRoot,
+ * else that session's cwd). The panel has no session, so it covers all of them
+ * and lets the service pin the configured root when there is one (issue #219).
+ */
+function panelWorkspaceRoots(services: HostServices): string[] {
+  if (typeof services.activeCwds !== 'function') return []
+  return services.activeCwds().filter((cwd): cwd is string => typeof cwd === 'string' && cwd.trim() !== '')
+}
+
 function handleGetEcosystem(services: HostServices, req: unknown, res: unknown): void {
   if (methodOf(req) !== 'GET') {
     sendJson(res as RawRes, 405, { error: 'GET only' })
@@ -13,7 +25,7 @@ function handleGetEcosystem(services: HostServices, req: unknown, res: unknown):
       sendJson(res as RawRes, 503, { ok: false, error: 'ecosystem service unavailable' })
       return
     }
-    sendJson(res as RawRes, 200, { ok: true, ...eco.inspect() })
+    sendJson(res as RawRes, 200, { ok: true, ...eco.inspect(undefined, panelWorkspaceRoots(services)) })
   })
 }
 
@@ -29,8 +41,10 @@ function handleSyncEcosystem(services: HostServices, req: unknown, res: unknown)
       return
     }
     await readBody(req)
-    const report = eco.syncAll({ force: true })
-    const snapshot = eco.inspect()
+    const report = typeof eco.syncAllAsync === 'function'
+      ? await eco.syncAllAsync({ force: true })
+      : eco.syncAll({ force: true })
+    const snapshot = eco.inspect(undefined, panelWorkspaceRoots(services))
     sendJson(res as RawRes, 200, { ok: true, report, snapshot })
   })
 }

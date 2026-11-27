@@ -221,6 +221,59 @@ export function RuntimeControlsSection(props: RuntimeControlsProps): unknown {
 			loadingAction,
 			setCfg,
 		}),
+		h(Row, {
+			left: rowCaption(t('config.mcpBridgeScope'), t('config.mcpBridgeScopeDesc')),
+			right: segGroup((['all', 'host-only'] as const).map(scope => h(Button, {
+				key: scope,
+				variant: (status.mcpBridgeScope ?? 'all') === scope ? 'segActive' : 'seg',
+				disabled: loadingAction === 'config:mcpBridgeScope',
+				onClick: () => void setCfg('mcpBridgeScope', scope),
+			}, t(scope === 'all' ? 'config.mcpScopeAll' : 'config.mcpScopeHostOnly')))),
+		}),
+		// Issue #201: a user with a dedicated /btw plugin may not want this one
+		// registered. Off needs a restart (commands are registered at startup).
+		boolRow({
+			t,
+			title: t('config.btwEnabled'),
+			desc: t('config.btwEnabledDesc'),
+			cfgKey: 'btwEnabled',
+			value: status.btwEnabled !== false,
+			loadingAction,
+			setCfg,
+		}),
+		// The `/a*` shortcut family can crowd DSH's slash menu for users who mostly
+		// run other models. Off needs a restart (commands are registered at startup).
+		boolRow({
+			t,
+			title: t('config.slashCommandsEnabled'),
+			desc: t('config.slashCommandsEnabledDesc'),
+			cfgKey: 'slashCommandsEnabled',
+			value: status.slashCommandsEnabled !== false,
+			loadingAction,
+			setCfg,
+		}),
+		// Only the /tsl command entry: automatic and button-triggered translation
+		// keep working. Off needs a restart (commands are registered at startup).
+		boolRow({
+			t,
+			title: t('config.tslEnabled'),
+			desc: t('config.tslEnabledDesc'),
+			cfgKey: 'tslEnabled',
+			value: status.tslEnabled !== false,
+			loadingAction,
+			setCfg,
+		}),
+		// Keep media previews inside DSH (sidebar / lightbox) and hide host OS
+		// app launches. Remote Cloudflare/LAN browsers enforce this automatically.
+		boolRow({
+			t,
+			title: t('config.builtInMediaPreviewOnly'),
+			desc: t('config.builtInMediaPreviewOnlyDesc'),
+			cfgKey: 'builtInMediaPreviewOnly',
+			value: status.builtInMediaPreviewOnly === true,
+			loadingAction,
+			setCfg,
+		}),
 		renderAgentRow({ ...props, draft: agentDraft, setDraft: setAgentDraft }),
 	);
 }

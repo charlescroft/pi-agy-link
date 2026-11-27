@@ -1,9 +1,11 @@
 // AgyAdapter — turns one DSH model call into an agy process/ACP session,
 // maps its event stream onto StreamChunks, and binds DSH sessions to agy
 // conversations for multi-turn continuity (spec §3, ADR-4/ADR-7).
+import { diagnoseBridge, type BridgeDiagnostic } from '../common/bridge-tools.ts'
 import { homedir } from 'node:os'
 import { LlmAdapter, LlmError, type GenerateOptions, type LlmModelInfo, type LlmProviderInfo, type LlmResolvedModelInfo, type StreamChunk } from '@deepseek-ai/dsh-llm'
-import type { AgyGenerateOptions } from '../common/protocol.ts'
+import { withBridgeStep } from './bridge-steps.ts'
+import type { AgyGenerateOptions, BridgeLease } from '../common/protocol.ts'
 import { resolveCallContext, effectivePermissionMode } from '../provider/call-context.ts'
 import { purposePolicy } from '../provider/purpose-policy.ts'
 import { driveSpan as driveSpanImpl } from '../provider/span.ts'
@@ -16,12 +18,17 @@ import { deliverContext } from '../provider/context-delivery.ts'
 export { calcPromptTokens, mergeSentImageIds } from '../provider/finalize.ts'
 import { selectSessionAccount } from '../provider/account-selection.ts'
 import { buildPromptPlan } from '../provider/prompt.ts'
+import { extractLeadingAgySlash, formatWithLeadingAgySlash } from '../provider/leading-slash.ts'
+import { INTERRUPTION_NOTICE, hasNewHumanTask, promptIdentity } from '../provider/prompt-identity.ts'
+import { logOnce } from '../provider/log-once.ts'
+export { hasNewHumanTask } from '../provider/prompt-identity.ts'
 import { buildAgyArgs, resolveAttemptOverrides, waitForRunSettle, type AttemptDeps, type AttemptInput } from '../provider/attempt.ts'
 import { runAgyAttempt } from '../provider/attempt-outcome.ts'
 export { STATUS_NOTICE_BLOCK_INDEX, awaitWithNotices } from '../provider/notices.ts'
 export { AGY_PROMPT_SAFE_BYTES, AGY_SINGLE_MESSAGE_MAX_BYTES, buildDigest, collectUnsentImageRefs, elideMiddle, isRealUserMessage, isSyntheticHarnessMessage, latestUserMessageAny, latestUserTaskText, utf8Bytes } from '../provider/prompt-text.ts'
 import { Err, accountsShareSingleEgress, PROVIDER_ID, type PluginConfig } from '../common/types.ts'
 import { isAgyLinkNoticeSource } from '../common/agy-link-source.ts'
+import { ActiveRunTracker, type LiveSessionAccount } from './active-runs.ts'
 import type { RunRecording } from './recording.ts'
 import { defaultEffortFor, findEntry, resolveModelSlug } from './models.ts'
 import { detectSystemProxy } from './wincred.ts'
@@ -33,8 +40,6 @@ export { parseEffortUnsupported, parseModelNotRecognized } from '../provider/eff
 import { detectContinuation } from '../provider/continuation.ts'
 export { detectContinuation, toolCallIdOf } from '../provider/continuation.ts'
 
-// ---- stream() -------------------------------------------------------------
-
 export class AgyAdapter extends LlmAdapter {
   private readonly recentlyCompactedSessions = new Map<string, number>()
   /** Effort-refusal cache (learned from agy refusals; issue #67). */
@@ -42,14 +47,11 @@ export class AgyAdapter extends LlmAdapter {
   /** Failover / rate-limit / network-streak retry budgets. */
   private readonly failover = new FailoverBudget()
 
+  bridgeDiagnostic: BridgeDiagnostic | null = null
   private readonly warnedKeys = new Set<string>()
-  /** sessionKey -> in-flight run, for steer-time preemption. */
-  private readonly activeRuns = new Map<string, RunRecording>()
-  /**
-   * sessionKey -> prompt info for duplicate submission debounce.
-   * `inFlight` is true from submit until the run settles (or spawn throws),
-   * so a settled failure can never wall a legitimate retry.
-   */
+  /** sessionKey -> in-flight run + pre-spawn pending account assignment. */
+  private readonly activeRuns = new ActiveRunTracker()
+  /** sessionKey -> canonical prompt + in-flight flag for duplicate debounce/steer. */
   private readonly activeSessionPrompts = new Map<string, { prompt: string; startedAt: number; inFlight: boolean }>()
   /** accountId -> timestamp of last spawn for spacing throttling */
   private readonly lastAccountSpawnTime = new Map<string, number>()
@@ -86,6 +88,11 @@ export class AgyAdapter extends LlmAdapter {
     return this.activeRuns.size
   }
 
+  /** Live in-flight (or pre-spawn pending) account for `sessionKey`, if any. */
+  activeAccountForSession(sessionKey: string): LiveSessionAccount | undefined {
+    return this.activeRuns.activeAccountFor(sessionKey)
+  }
+
   /** True when `--effort` must not be passed to this model. */
   isEffortUnsupported(model: string): boolean {
     return this.effortPolicy.isUnsupported(model)
@@ -97,13 +104,7 @@ export class AgyAdapter extends LlmAdapter {
   }
 
   private warnOnce(key: string, msg: string): void {
-    if (this.warnedKeys.has(key)) return
-    if (this.warnedKeys.size >= 512) {
-      const oldest = this.warnedKeys.values().next().value
-      if (oldest !== undefined) this.warnedKeys.delete(oldest)
-    }
-    this.warnedKeys.add(key)
-    this.deps.log?.('WARNING: ' + msg)
+    logOnce(this.warnedKeys, key, () => this.deps.log?.('WARNING: ' + msg))
   }
 
   private noteNetworkFailure(sessionKey: string): number {
@@ -136,7 +137,7 @@ export class AgyAdapter extends LlmAdapter {
   private clearInFlightPrompt(sessionKey: string, prompt: string): void {
     if (sessionKey === '') return
     const ap = this.activeSessionPrompts.get(sessionKey)
-    if (ap === undefined || ap.prompt !== prompt) return
+    if (ap === undefined || ap.prompt !== promptIdentity(prompt)) return
     this.activeSessionPrompts.set(sessionKey, { ...ap, inFlight: false })
   }
 
@@ -199,7 +200,6 @@ export class AgyAdapter extends LlmAdapter {
     }
   }
 
-  /** Build the agy argv for one call. Exported for tests. */
   buildArgs(opts: Parameters<typeof buildAgyArgs>[0]): string[] {
     return buildAgyArgs(opts)
   }
@@ -214,7 +214,11 @@ export class AgyAdapter extends LlmAdapter {
       }
     }
     yield* streamWithEffortRetry({
-      streamAttempt: (opts, suppressEffort) => this.streamAttempt(opts, suppressEffort),
+      streamAttempt: (opts, suppressEffort) => {
+        const cfg = this.deps.getConfig()
+        return withBridgeStep(cfg.mcpBridge ? this.deps.enterBridgeStep?.(opts) : undefined,
+          lease => this.streamAttempt(opts, cfg, suppressEffort, lease))
+      },
       learnEffortUnsupported: (model) => this.learnEffortUnsupported(model),
       catalogAdvertisesEffort: (model) => this.deps.catalog.advertisedEfforts(model).length > 0,
       pool: this.deps.pool,
@@ -222,21 +226,18 @@ export class AgyAdapter extends LlmAdapter {
     }, effective)
   }
 
-  private async *streamAttempt(options: AgyGenerateOptions, suppressEffort = false): AsyncIterable<StreamChunk> {
+  private async *streamAttempt(options: AgyGenerateOptions, cfg: PluginConfig, suppressEffort: boolean, lease?: BridgeLease): AsyncIterable<StreamChunk> {
     const ctx = resolveCallContext({
-      options,
-      cfg: this.deps.getConfig(),
+      options, cfg,
       bin: this.deps.bin(),
-      ...(this.deps.sessionCwd === undefined
-        ? {}
-        : { sessionCwd: (id: string) => this.deps.sessionCwd?.(id) }),
+      ...(this.deps.sessionCwd === undefined ? {} : { sessionCwd: (id: string) => this.deps.sessionCwd?.(id) }),
       warnOnce: (key: string, message: string) => this.warnOnce(key, message),
     })
-    const { cfg, bin, isReview, isTitle, isCompaction, isTranslate, isImage, isAux } = ctx
+    const { bin, isReview, isTitle, isCompaction, isTranslate, isImage, isAux } = ctx
     const { permissionMode, sessionKey, workspaceRoot, isCodeMode, hasToolSupport } = ctx
+    if (!isAux) this.bridgeDiagnostic = diagnoseBridge(cfg, options.tools, (key, msg, level) =>
+      logOnce(this.warnedKeys, key, () => this.deps.log?.(msg, level)))
     const policy = purposePolicy(ctx)
-    // Keep the local alias: TypeScript's aliased-condition narrowing makes
-    // `else if (isTranslateSession)` narrow `translateSession` below.
     const translateSession = ctx.translateSession
     const isTranslateSession = translateSession !== null
     // DSH synthetic lifecycle continuations: short-circuit on goal completion
@@ -258,15 +259,7 @@ export class AgyAdapter extends LlmAdapter {
     const livePlanMode = sessionKey !== '' && this.deps.sessionPlanMode ? this.deps.sessionPlanMode(sessionKey) : undefined
     const supportsPlanExit = Boolean(options.tools?.some((t) => t.name === 'exit_plan_mode'))
       && isPlanMode(options.messages, options.system, livePlanMode)
-    // `exit_plan_mode` exists only in active DSH plan mode: a current-turn signal.
-    const agyPermissionMode = effectivePermissionMode(permissionMode, supportsPlanExit, isAux)
-
-    // ---- native tool mirroring: continuation spans (v0.3) ----
-    // When the previous span cut on a completed agy tool step, DSH dispatched
-    // the agy_tool mirror (which replayed the recorded output) and is now
-    // calling us again to continue the SAME run. Resume the recording from
-    // the cursor encoded in the trailing tool-result callId — no new process,
-    // no prompt assembly, no digest.
+    // Native tool mirroring continuation spans (v0.3): resume live RunRecording without re-running prompt assembly.
     const continuation = detectContinuation(options.messages)
     if (continuation !== null) {
       const rec = this.deps.runs.get(continuation.runId)
@@ -277,6 +270,7 @@ export class AgyAdapter extends LlmAdapter {
       const deadNoResult = rec !== undefined && rec.isSettled && deadFailure === null && !rec.hasFinishableEventFrom(continuation.eventIndex + 1, mirrorLive)
       const deadRevivable = deadFailure !== null && isRevivableFailure(deadFailure.code)
       if (rec !== undefined && !deadNoResult && !deadRevivable && !(deadFailure !== null && this.claimFailover(sessionKey, deadFailure.code))) {
+        lease?.resume()
         yield* driveSpanImpl(this.deps, rec, continuation.eventIndex + 1, policy.mirrorTools && hasToolSupport, isCodeMode, goalContext, supportsGoalUpdate, supportsPlanExit, options.signal, undefined, false, sessionKey)
         return
       }
@@ -296,9 +290,9 @@ export class AgyAdapter extends LlmAdapter {
         )
       }
     }
-    // Session ownership (steer preemption + duplicate debounce) is decided
-    // AFTER prompt assembly below, so an identical retry can never abort a
-    // live long-running tool (issue #33), while a true steer still can.
+    // Session ownership: steer preemption + duplicate debounce AFTER prompt assembly.
+    const forcedPlan = !isAux && sessionKey !== '' && (this.deps.consumeForcedPlanMode?.(sessionKey) ?? false)
+    const agyPermissionMode = effectivePermissionMode(permissionMode, supportsPlanExit || forcedPlan, isAux)
     const catalog = this.deps.catalog.get()
     const rawModel = options.model
     const model = resolveModelSlug(rawModel)
@@ -329,7 +323,6 @@ export class AgyAdapter extends LlmAdapter {
       }
     }
 
-    // ---- prompt assembly (ADR-7) is handled by buildPromptPlan below ----
     const messages = options.messages
 
     // Sliding-window TAT rate limit protection per minute (zero thundering herd)
@@ -373,7 +366,7 @@ export class AgyAdapter extends LlmAdapter {
     let activeModel = selection.activeModel
     // The account is final here: record it as *the* in-use account for Google
     // (or bootstrap when none is set) without hijacking it on Argon/Claude/GPT turns.
-    if (account && !isAux) this.deps.pool?.markAccountActive(account.id, family)
+    if (account && !isAux && !options.agyQuotaModel) this.deps.pool?.markAccountActive(account.id, family)
     // Image callers need the account's HOME to find agy's artifact directory
     // (`<home>/.gemini/antigravity-cli/brain/<conversation>/`). The hook is
     // advisory: a throwing listener must never break a run.
@@ -387,6 +380,7 @@ export class AgyAdapter extends LlmAdapter {
     }
 
     const plan = await buildPromptPlan({
+      bridgeServer: lease?.serverName,
       options,
       cfg,
       ctx,
@@ -397,17 +391,10 @@ export class AgyAdapter extends LlmAdapter {
       deps: {
         store: this.deps.store,
         ...(this.deps.readImage === undefined ? {} : { readImage: this.deps.readImage }),
-        getActiveRun: (key: string) => {
-          const rec = this.activeRuns.get(key)
-          if (rec === undefined) return undefined
-          return {
-            isSettled: rec.isSettled,
-            conversationId: rec.conversationId,
-            ...(rec.accountHome === undefined ? {} : { accountHome: rec.accountHome }),
-          }
-        },
+        getActiveRun: (key: string) => this.activeRuns.promptView(key),
         recentlyCompactedSessions: this.recentlyCompactedSessions,
-        deliverContext: (digest: string, key: string, extraAddDirs: string[]) => deliverContext(digest, key, extraAddDirs, cfg),
+        deliverContext: (digest: string, key: string, extraAddDirs: string[], opts?: import('../provider/context-delivery.ts').DeliverContextOptions) =>
+          deliverContext(digest, key, extraAddDirs, cfg, opts),
       },
     })
     let prompt = plan.prompt
@@ -419,11 +406,6 @@ export class AgyAdapter extends LlmAdapter {
     const compactionNotice = plan.compactionNotice
     const newlySentImageIds = plan.newlySentImageIds
     const lastAssistantIdx = plan.lastAssistantIdx
-
-    // Intentionally no prompt-side "recovery boundary" injection: keyword
-    // matching on user text (missing/not found/enoent) false-positives and
-    // is a plugin-side prompt injection. Guidance for missing_file lives in
-    // /agy status via classifyToolError (commands.ts).
 
     // Session ownership: steer preemption + duplicate-submission debounce.
     //
@@ -444,21 +426,34 @@ export class AgyAdapter extends LlmAdapter {
       }
       const prevPrompt = this.activeSessionPrompts.get(sessionKey)
       const liveRun = this.activeRuns.get(sessionKey)
-      const runLive = liveRun !== undefined && !liveRun.isSettled
-      const samePrompt = prevPrompt !== undefined && prevPrompt.prompt === prompt
+      const runLive = liveRun !== undefined && !liveRun.isSettled && !liveRun.isAbortRequested
+      // Compare the CANONICAL prompt: the interruption notice injected below is transport metadata
+      // and used to poison the stored baseline, so continuation replays used to look like steers.
+      // (issue #205).
+      const identity = promptIdentity(prompt)
+      // A harness lifecycle hop (tool result / context append, no new typed
+      // turn) is never a steer: it is a continuation of the live run. Treat it
+      // as the same request so the rescue below resumes the cut span instead of
+      // aborting the run that produced it (issue #205).
+      const lifecycleHop = !hasNewHumanTask(messages)
+      const samePrompt = prevPrompt !== undefined && (prevPrompt.prompt === identity || lifecycleHop)
       if (runLive && samePrompt) {
         // Rescue an identical prompt if the live run already cut a span instead of failing BUSY.
         const rescueFrom = liveRun.lastCutIndex !== null ? liveRun.lastCutIndex + 1 : null
         if (rescueFrom !== null) {
           this.deps.log?.(
-            'duplicate-debounce rescue: identical prompt for a live agy run ' + liveRun.runId + ' — re-driving from event ' + rescueFrom + ' instead of throwing BUSY',
+            (lifecycleHop ? 'lifecycle-continuation rescue: no new human turn for live agy run ' : 'duplicate-debounce rescue: identical prompt for a live agy run ')
+              + liveRun.runId + ' — re-driving from event ' + rescueFrom + ' instead of throwing BUSY',
           )
-          this.activeSessionPrompts.set(sessionKey, { prompt, startedAt: now, inFlight: true })
+          this.activeSessionPrompts.set(sessionKey, { prompt: identity, startedAt: now, inFlight: true })
+          lease?.resume()
           yield* driveSpanImpl(this.deps, liveRun, rescueFrom, policy.mirrorTools && hasToolSupport, isCodeMode, goalContext, supportsGoalUpdate, supportsPlanExit, options.signal, undefined, false, sessionKey)
           return
         }
         throw new LlmError(
-          'Duplicate request ignored: an identical request is already running for this session.',
+          lifecycleHop
+            ? 'Duplicate request ignored: a harness continuation arrived while the same request is still running for this session.'
+            : 'Duplicate request ignored: an identical request is already running for this session.',
           Err.BUSY,
         )
       }
@@ -507,6 +502,7 @@ export class AgyAdapter extends LlmAdapter {
               binding.interrupted = true
             }
           }
+          liveRun.markAbortRequested()
           liveRun.requestAbort?.()
           const exited = await waitForRunSettle(liveRun, 3_500)
           if (!exited) {
@@ -515,12 +511,14 @@ export class AgyAdapter extends LlmAdapter {
               'the preempted agy run did not exit within 3.5s — starting the replacement anyway; its late write-back is ignored because the newer run owns the session',
             )
           }
-          if (!wasConsumable && !prompt.includes('the previous turn was interrupted')) {
-            prompt = '[the previous turn was interrupted before it finished — do not continue or answer that unfinished work; respond only to the newest request below]\n\n' + prompt
+          if (!wasConsumable && !prompt.includes(INTERRUPTION_NOTICE)) {
+            const slash = extractLeadingAgySlash(prompt)
+            prompt = slash ? formatWithLeadingAgySlash(slash, INTERRUPTION_NOTICE) : `${INTERRUPTION_NOTICE}\n\n${prompt}`
           }
         }
       }
-      this.activeSessionPrompts.set(sessionKey, { prompt, startedAt: now, inFlight: true })
+      if (liveRun !== undefined && !liveRun.isSettled && liveRun.isAbortRequested) await waitForRunSettle(liveRun, 1_500)
+      this.activeSessionPrompts.set(sessionKey, { prompt: identity, startedAt: now, inFlight: true })
     }
 
     // Dispatch to attempt-outcome.ts. Inject private state callbacks so adapter owns activeRuns/failover.
@@ -541,12 +539,7 @@ export class AgyAdapter extends LlmAdapter {
       ...(this.deps.onAccountUsed === undefined ? {} : { onAccountUsed: this.deps.onAccountUsed }),
       ...(this.deps.ensureFreshToken === undefined ? {} : { ensureFreshToken: this.deps.ensureFreshToken }),
       clearInFlightPrompt: (key: string, p: string) => this.clearInFlightPrompt(key, p),
-      registerActiveRun: (key: string, r: RunRecording) => this.activeRuns.set(key, r),
-      unregisterActiveRun: (key: string, r: RunRecording) => {
-        if (this.activeRuns.get(key) === r) this.activeRuns.delete(key)
-      },
-      isSuperseded: (key: string, r: RunRecording) =>
-        this.activeRuns.get(key) !== undefined && this.activeRuns.get(key) !== r,
+      ...this.activeRuns.attemptHooks(),
       noteNetworkFailure: (key: string) => this.noteNetworkFailure(key),
       clearNetworkStreak: (key: string) => this.clearNetworkStreak(key),
       dropFailoverBudget: (key: string) => this.failover.dropBudget(key),
@@ -563,6 +556,7 @@ export class AgyAdapter extends LlmAdapter {
       ...(this.deps.reinstallCredentialSlot === undefined ? {} : { reinstallCredentialSlot: this.deps.reinstallCredentialSlot }),
     }
     const attemptInput: AttemptInput = {
+      bridgeRoute: lease?.bind(JSON.stringify([account?.id, permissionMode, options.agyTransport ?? cfg.transport, options.agySandbox ?? cfg.sandbox, options.agyAgent ?? cfg.agent, cfg.mcpBridgeScope, cfg.mcpToolAllowlist])),
       cfg,
       bin,
       permissionMode: agyPermissionMode,
@@ -589,10 +583,17 @@ export class AgyAdapter extends LlmAdapter {
       ...(options.agyAvoidAccountIds === undefined ? {} : { avoidAccountIds: options.agyAvoidAccountIds }),
       ...resolveAttemptOverrides(options, cfg),
     }
-    const rec = yield* runAgyAttempt(attemptDeps, attemptInput)
+    const pendingToken = !isAux && sessionKey !== '' && account !== undefined
+      ? this.activeRuns.setPending(sessionKey, account.id, family)
+      : undefined
+    try {
+      const rec = yield* runAgyAttempt(attemptDeps, attemptInput)
 
-    // First span of the run: stream recorded events until the first
-    // completed tool step cuts it (or the result finishes it).
-    yield* driveSpanImpl(this.deps, rec, 0, policy.mirrorTools && hasToolSupport, isCodeMode, goalContext, supportsGoalUpdate, supportsPlanExit, options.signal, compactionNotice, false, sessionKey)
+      // First span of the run: stream recorded events until the first
+      // completed tool step cuts it (or the result finishes it).
+      yield* driveSpanImpl(this.deps, rec, 0, policy.mirrorTools && hasToolSupport, isCodeMode, goalContext, supportsGoalUpdate, supportsPlanExit, options.signal, compactionNotice, false, sessionKey)
+    } finally {
+      if (pendingToken !== undefined) this.activeRuns.clearPending(sessionKey, pendingToken)
+    }
   }
 }

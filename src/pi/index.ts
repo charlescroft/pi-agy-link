@@ -20,6 +20,11 @@ import type { Context as CordisContext } from './dsh-shims/cordis.ts'
 import type { Message, StreamChunk, TokenUsage } from './dsh-shims/dsh-llm.ts'
 import type { AccountPlanTier, ManagedAccount, ModelFamily } from '../common/pool-types.ts'
 import { parseCompactLimitValue, resolveEffectiveCompactLimit } from '../common/compact-threshold.ts'
+import {
+  registerBackgroundTaskWidgetSink,
+  snapshotBackgroundTasks,
+  type BackgroundTaskSnapshot,
+} from '../features/subagent/live.ts'
 
 export const AGY_PROVIDER_ID = 'agy-link'
 export const AGY_PROVIDER_NAME = 'Antigravity (agy CLI)'
@@ -249,6 +254,7 @@ function buildWidgetState(services: ReturnType<typeof createHostServices>): AgyW
       effectiveCompactLimit: effectiveContextWindow,
       modelApiMaxRetries: Number(cfg.modelApiMaxRetries ?? 3),
       slimPromptRules: cfg.slimPromptRules !== false,
+      promptMaxBytes: Number(cfg.promptMaxBytes ?? 150000),
       transport: cfg.transport || 'acp',
       acpActiveProcesses: Number(acpSt.activeProcesses ?? 0),
       acpSessions: Number(acpSt.sessions ?? 0),
@@ -312,6 +318,72 @@ function publishAgyUi(ctx: ExtensionContext | undefined, services: ReturnType<ty
   } catch {
     // Ignore stale ExtensionContext after session replacement or shutdown
   }
+}
+
+function publishBackgroundTasksUi(ctx: ExtensionContext | undefined, tasks: BackgroundTaskSnapshot[]): void {
+  if (!ctx) return
+  try {
+    if (!ctx.hasUI) return
+    if ((ctx as unknown as { mode?: string }).mode === 'rpc') {
+      ctx.ui.setWidget('background-tasks', [JSON.stringify(tasks)])
+    }
+  } catch {
+    // Ignore stale ExtensionContext after session replacement or shutdown
+  }
+}
+
+function translateAgyAskQuestionToPiToolArgs(input: unknown): { questions: Array<{ header: string; question: string; multiSelect: boolean; options: Array<{ label: string; description: string }> }> } | null {
+  if (!input || typeof input !== 'object') return null
+  const rawQuestions = (input as { questions?: unknown }).questions
+  if (!Array.isArray(rawQuestions) || rawQuestions.length === 0) return null
+
+  const out: Array<{ header: string; question: string; multiSelect: boolean; options: Array<{ label: string; description: string }> }> = []
+  for (let qi = 0; qi < Math.min(rawQuestions.length, 4); qi++) {
+    const q = rawQuestions[qi]
+    if (!q || typeof q !== 'object') continue
+    const qObj = q as Record<string, unknown>
+    const qText = typeof qObj.question === 'string' ? qObj.question.trim() : ''
+    const rawOpts = Array.isArray(qObj.options) ? qObj.options : []
+    if (!qText || rawOpts.length < 2) continue
+
+    const rawHeader = typeof qObj.header === 'string' && qObj.header.trim() !== ''
+      ? qObj.header.trim()
+      : `Q${qi + 1}`
+    const header = rawHeader.length > 16 ? rawHeader.slice(0, 16) : rawHeader
+    const multiSelect = Boolean(qObj.is_multi_select ?? qObj.multiSelect ?? false)
+
+    const options: Array<{ label: string; description: string }> = []
+    for (let oi = 0; oi < Math.min(rawOpts.length, 4); oi++) {
+      const opt = rawOpts[oi]
+      let label = ''
+      let description = ''
+      if (typeof opt === 'string') {
+        const s = opt.trim()
+        label = s.length > 58 ? `${s.slice(0, 57)}…` : s
+        description = s
+      } else if (opt && typeof opt === 'object') {
+        const oObj = opt as Record<string, unknown>
+        const rawLabel = typeof oObj.label === 'string' ? oObj.label.trim() : ''
+        const rawDesc = typeof oObj.description === 'string' ? oObj.description.trim() : ''
+        const base = rawLabel || rawDesc
+        label = base.length > 58 ? `${base.slice(0, 57)}…` : base
+        description = rawDesc || rawLabel
+      }
+      if (!label) continue
+      if (/^(other|type something\.?)$/i.test(label)) {
+        label = `Option ${oi + 1}`
+      }
+      options.push({ label, description: description || label })
+    }
+    if (options.length < 2) continue
+    out.push({
+      header,
+      question: qText.endsWith('?') || qText.endsWith('？') ? qText : `${qText}?`,
+      multiSelect,
+      options,
+    })
+  }
+  return out.length > 0 ? { questions: out } : null
 }
 
 function extractActiveToolsForDsh(context: {
@@ -498,7 +570,7 @@ export default function (pi: ExtensionAPI): void {
     accounts: () => services.pool.getAccounts(),
     sweepStaging: () => services.pool.sweepStaleStaging(),
     sweepLogs: () => services.pool.sweepOldLogs(services.getConfig().logRetentionDays),
-    ...(services.getConfig().syncAccountCustomizations ? { syncEcosystem: () => services.ecosystem?.syncAll() } : {}),
+    ...(services.getConfig().syncAccountCustomizations ? { syncEcosystem: () => { services.ecosystem?.syncAll() } } : {}),
     log: services.log,
     reapOrphans: services.getConfig().reapOrphanMcp,
   })
@@ -516,6 +588,9 @@ export default function (pi: ExtensionAPI): void {
   }
 
   let lastUiCtx: ExtensionContext | undefined
+  const unregisterBackgroundTaskSink = registerBackgroundTaskWidgetSink((tasks) => {
+    publishBackgroundTasksUi(lastUiCtx, tasks)
+  })
   let lastQuotaRefreshAt = 0
   let bgQuotaRefreshing = false
   let bgQuotaTimer: ReturnType<typeof setInterval> | null = null
@@ -625,6 +700,9 @@ export default function (pi: ExtensionAPI): void {
             typeof context?.systemPrompt === 'string' &&
             /context summarization assistant|ONLY output the structured summary|summariz|compaction/i.test(context.systemPrompt)
           const effectiveTools = isCompactionCall ? [] : activeTools
+          const hasPiAskUserQuestion = Boolean(
+            effectiveTools?.some((t) => t.name === 'ask_user_question'),
+          )
           const iter = services.adapter.stream({
             provider: AGY_PROVIDER_ID,
             model: model.id,
@@ -714,15 +792,29 @@ export default function (pi: ExtensionAPI): void {
                 } catch {
                   // Keep empty fallback object when raw arguments fail JSON parse
                 }
+                const rawName = String(rawChunk.block.name || 'agy_tool')
+                const bridgedArgs =
+                  hasPiAskUserQuestion &&
+                  rawName === 'agy_tool' &&
+                  parsedArgs.tool === 'ask_question'
+                    ? translateAgyAskQuestionToPiToolArgs(parsedArgs.input)
+                    : null
+                const finalName = bridgedArgs ? 'ask_user_question' : rawName
+                const finalArgs = bridgedArgs ?? parsedArgs
+                const finalRawArgs = bridgedArgs ? JSON.stringify(bridgedArgs) : rawArgs
                 const toolCall = {
                   type: 'toolCall' as const,
                   id: String(rawChunk.block.id || `call_${Date.now()}`),
-                  name: String(rawChunk.block.name || 'agy_tool'),
-                  arguments: parsedArgs,
+                  name: finalName,
+                  arguments: finalArgs,
                 }
                 partial.content[tcIdx] = toolCall
-                stream.push({ type: 'toolcall_delta', contentIndex: tcIdx, delta: rawArgs, partial })
+                stream.push({ type: 'toolcall_delta', contentIndex: tcIdx, delta: finalRawArgs, partial })
                 stream.push({ type: 'toolcall_end', contentIndex: tcIdx, toolCall: toolCall as any, partial })
+                if (bridgedArgs) {
+                  finishReason = 'toolUse'
+                  break
+                }
               } else if (rawChunk.block.type === 'reasoning' && thinkingIndex !== null) {
                 stream.push({ type: 'thinking_end', contentIndex: thinkingIndex, content: thinkingAcc, partial })
                 thinkingIndex = null
@@ -813,12 +905,14 @@ export default function (pi: ExtensionAPI): void {
     recordSessionCwd(ctx)
     startBgQuotaTimer()
     publishAgyUi(ctx, services)
+    publishBackgroundTasksUi(ctx, snapshotBackgroundTasks())
   })
 
   pi.on('session_switch', async (_event, ctx) => {
     lastUiCtx = ctx
     recordSessionCwd(ctx)
     publishAgyUi(ctx, services)
+    publishBackgroundTasksUi(ctx, snapshotBackgroundTasks())
   })
 
   pi.on('turn_start', async (_event, ctx) => {
@@ -836,6 +930,7 @@ export default function (pi: ExtensionAPI): void {
   pi.on('session_shutdown', async () => {
     mirrorToolActive = false
     lastUiCtx = undefined
+    unregisterBackgroundTaskSink()
     stopBootMaintenance()
     if (bgQuotaTimer) {
       clearInterval(bgQuotaTimer)
@@ -1206,6 +1301,47 @@ export default function (pi: ExtensionAPI): void {
         services.setOverride('slimPromptRules', on)
         publishAgyUi(ctx, services)
         emitOutput(ctx, `Slim execution guardrails: ${on ? 'enabled' : 'disabled'}`)
+        return
+      }
+      if (sub === 'prompt-max-bytes' || sub === 'prompt-budget') {
+        const rawVal = (rest[0] || '').trim().toLowerCase()
+        if (!rawVal || rawVal === 'status' || rawVal === 'show') {
+          const cur = Number(services.getConfig().promptMaxBytes ?? 150000)
+          emitOutput(
+            ctx,
+            `Current promptMaxBytes: ${cur === 0 ? '0 (unlimited)' : `${cur} bytes`} (usage: /agy prompt-max-bytes <bytes|default|0>)`,
+          )
+          return
+        }
+        if (rawVal === 'default' || rawVal === 'reset') {
+          services.setOverride('promptMaxBytes', 150_000)
+          publishAgyUi(ctx, services)
+          emitOutput(ctx, 'promptMaxBytes reset to default (150000 bytes)')
+          return
+        }
+        if (rawVal === 'off' || rawVal === 'unlimited' || rawVal === '0') {
+          services.setOverride('promptMaxBytes', 0)
+          publishAgyUi(ctx, services)
+          emitOutput(ctx, 'promptMaxBytes set to 0 (unlimited)')
+          return
+        }
+        const m = /^(\d+(?:\.\d+)?)\s*(k|kb|m|mb)?$/i.exec(rawVal)
+        if (!m) {
+          emitOutput(ctx, 'Usage: /agy prompt-max-bytes <bytes (e.g. 150000, 150k, 1m)|default|0>', 'error')
+          return
+        }
+        const base = Number(m[1])
+        const unit = (m[2] || '').toLowerCase()
+        const bytes = Math.round(
+          unit === 'm' || unit === 'mb' ? base * 1_000_000 : unit === 'k' || unit === 'kb' ? base * 1_000 : base,
+        )
+        if (!Number.isFinite(bytes) || bytes < 10_000 || bytes > 5_000_000) {
+          emitOutput(ctx, 'promptMaxBytes must be 0 (unlimited) or between 10000 and 5000000 bytes', 'error')
+          return
+        }
+        services.setOverride('promptMaxBytes', bytes)
+        publishAgyUi(ctx, services)
+        emitOutput(ctx, `promptMaxBytes set to ${bytes} bytes`)
         return
       }
       if (sub === 'plugin' && rest[0] && rest[1]) {

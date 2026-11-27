@@ -1,11 +1,5 @@
 // Pure prompt-text helpers: message flattening, harness-message sniffing,
 // image-ref collection, UTF-8 budget arithmetic and the ADR-7 history digest.
-//
-// These lived in src/host/adapter.ts next to the prompt-assembly block. They
-// are moved here verbatim (no behaviour change) so the prompt planner in
-// ./prompt.ts can use them without importing the adapter (which imports the
-// planner — that would be a cycle). The adapter re-exports them unchanged so
-// existing call sites and tests keep importing from the same module.
 import { mkdir, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import type { Message } from '@deepseek-ai/dsh-llm'
@@ -15,6 +9,7 @@ import { isMirrorToolNotFoundText, MIRROR_TOOL_RELOAD_NOTICE } from '../common/m
 import { stateDir } from '../common/config.ts'
 import { stripNulBytes } from '../host/runner.ts'
 import { sweepDir, mediaKindFor, type ImageRefLike, type MediaRefLike } from '../host/media.ts'
+export type { MediaRefLike }
 
 export type ForeignSource = { source?: { kind?: string; provider?: string; callId?: string; replayState?: unknown } }
 
@@ -128,38 +123,42 @@ export function isAcpReportMessage(m: Message): boolean {
   return kind === ACP_REPORT_SOURCE_KIND
 }
 
+const SYNTHETIC_SOURCE_KINDS = new Set([
+  'time-context', 'skill-catalog', 'runtime-context', 'model-selection', 'system-reminder',
+  'dsh-session-title-llm', 'tool-goal', 'plan-mode', 'agent-instructions', 'synthetic',
+  'tmux-context', 'working-directory', 'ptc-mode', 'repeat-tool-reminder', 'user-approval',
+  'working-context', 'tool-catalog',
+])
+
+export function snapshotSource(message: Message): string | undefined {
+  const source = message.source as { kind?: string; form?: string; plugin?: string } | undefined
+  if (message.role !== 'user' || !source?.kind || source.kind === 'user') return
+  if (source.kind === 'runtime-context' || source.form === 'snapshot') return JSON.stringify([source.kind, source.plugin])
+}
+
 export function isSyntheticHarnessMessage(m: Message): boolean {
   if (isToolResultMessage(m)) return false
+  if (snapshotSource(m)) return true
   const src = (m as unknown as ForeignSource).source
   const kind = src?.kind
   if (kind !== undefined && kind !== '' && kind !== 'user') {
-    if (
-      kind === 'time-context' ||
-      kind === 'skill-catalog' ||
-      kind === 'runtime-context' ||
-      kind === 'model-selection' ||
-      kind === 'system-reminder' ||
-      kind === 'dsh-session-title-llm' ||
-      kind === 'tool-goal' ||
-      kind === 'plan-mode' ||
-      kind === 'agent-instructions' ||
-      kind === 'synthetic'
-    ) {
-      return true
-    }
     // An ACP report is the agent's own narration of background work that
     // finished after the turn; dropping it would hide the outcome from a later
     // context rebuild (session reset / CLI fallback).
+    if (['agent-message', 'team-message', 'subagent-settled'].includes(kind.replace(/^plugin:/, ''))) return false
     if (kind === ACP_REPORT_SOURCE_KIND) return false
     // dsh-agy-link's own background wake carries instruction text the model must
     // act on, so it is never stripped as context noise.
     if (kind === AGY_LINK_NOTICE_KIND) return false
+    // Memory recall snapshots must ride along without being stripped as noise (#158).
+    if (kind === MEMORY_SNAPSHOT_SOURCE_KIND) return false
+    if (SYNTHETIC_SOURCE_KINDS.has(kind)) return true
+    if (kind.endsWith('-working-context') || kind.endsWith('-tool-catalog')) return true
     // Each DSH context producer names its own kind (`plugin:memory`,
     // `plugin:recall`, …) — dsh-llm has no shared catch-all `plugin` kind.
     if (kind.startsWith('plugin:')) return true
-    if (kind === 'plugin' && (src as { form?: string }).form === 'snapshot') {
-      return true
-    }
+    const form = (src as { form?: string }).form
+    if (form === 'snapshot' || form === 'catalog') return true
   }
   const text = textOf(m).trim()
   if (
@@ -170,7 +169,8 @@ export function isSyntheticHarnessMessage(m: Message): boolean {
     text.startsWith('[conversation so far]') ||
     text.startsWith('<goal_complete>') ||
     text.startsWith('<goal_blocked>') ||
-    text.startsWith('A skill is a reusable set of task-specific instructions')
+    text.startsWith('A skill is a reusable set of task-specific instructions') ||
+    (kind !== 'user' && text.startsWith('[Working Context:'))
   ) {
     return true
   }
@@ -244,6 +244,11 @@ export function latestUserMessageAny(messages: readonly Message[]): string {
   return ''
 }
 
+/** True for a dsh-mnemon memory snapshot (role:user, but never the task text). */
+export function isMemorySnapshotMessage(m: Message): boolean {
+  return sourceKindOf(m) === MEMORY_SNAPSHOT_SOURCE_KIND
+}
+
 const MULTIMODAL_BLOCK_TYPES = new Set(['image', 'file', 'document', 'pdf', 'audio', 'video', 'attachment'])
 
 function mediaRefFromBlock(b: UnknownBlock): MediaRefLike | null {
@@ -292,7 +297,7 @@ function collectImageRefs(m: Message, out: ImageRefLike[]): void {
   walk(m.content as readonly unknown[] | undefined)
 }
 
-function collectMediaRefs(m: Message, out: MediaRefLike[]): void {
+export function collectMediaRefs(m: Message, out: MediaRefLike[]): void {
   const walk = (blocks: readonly unknown[] | undefined): void => {
     for (const raw of blocks ?? []) {
       const b = raw as UnknownBlock | undefined
@@ -383,13 +388,13 @@ export function collectUnsentImageRefs(
 
 /** agy 1.4.x silently truncates a single user message at 192,000 UTF-8 bytes
  * (measured: a 300 KB ASCII prompt kept exactly 192,000 B; a 490 KB CJK prompt
- * kept 191,998 B) and the cut lands on the TAIL. Every prompt we build must
- * stay under that with margin, and the live request must sit at the HEAD. */
+ * kept 191,998 B) and the cut lands on the TAIL. Every prompt must stay under
+ * that with margin (AGY_PROMPT_SAFE_BYTES; why that margin: prompt-budget.ts). */
 export const AGY_SINGLE_MESSAGE_MAX_BYTES = 192_000
-export const AGY_PROMPT_SAFE_BYTES = 180_000
+export const AGY_PROMPT_SAFE_BYTES = 150_000
 
 const QUOTED_AGY_SLASH_RE =
-  /(?<![A-Za-z0-9_./:\\-])\/(goal|plan|compact|schedule|browser|grill-me|teamwork|learn|boost)(?![A-Za-z0-9_/-])/gi
+  /(?<![A-Za-z0-9_./:\\-])\/(goal|plan|compact|schedule|browser|grill-me|teamwork|learn|boost|swarm|btw|fork)(?![A-Za-z0-9_/-])/gi
 
 /**
  * Neutralize standalone agy system slash commands (e.g. `/goal`, `/plan`) inside
@@ -492,6 +497,8 @@ export interface DigestBudget {
   toolLineBytes?: number
   /** Include the reserved "User: <latest task>" line (default true). */
   includeTaskLine?: boolean
+  /** Objective path notes for historical attachments placed in-place on their owning User message. */
+  attachmentsByMessage?: ReadonlyMap<Message, readonly string[]>
 }
 
 /**
@@ -523,9 +530,15 @@ export function buildDigest(
     if (isSyntheticHarnessMessage(m)) continue
     // Binary tool output (e.g. a quoted .git blob) can carry NUL bytes; they
     // are illegal in argv and would kill the spawn before agy starts.
-    const text = stripNulBytes(textOf(m))
+    const rawText = stripNulBytes(textOf(m))
+    const media: MediaRefLike[] = []
+    if (m.role === 'user' && !isToolResultMessage(m)) collectMediaRefs(m, media)
+    const imageNotes = media.filter(ref => ref.mediaType.startsWith('image/')).map(ref =>
+      '[earlier image attachment: ' + JSON.stringify(ref.name ?? 'image') + ']')
+    const attBlock = [...imageNotes, ...(budgetOpts.attachmentsByMessage?.get(m) ?? [])].join('\n')
+    const text = rawText !== '' && attBlock !== '' ? `${rawText}\n${attBlock}` : (rawText || attBlock)
     if (text === '') continue
-    if (taskLine !== '' && !isToolResultMessage(m) && m.role === 'user' && text === taskText) continue
+    if (taskLine !== '' && !isToolResultMessage(m) && m.role === 'user' && rawText === taskText && attBlock === '') continue
     const safeText = isToolResultMessage(m) && isMirrorToolNotFoundText(text)
       ? MIRROR_TOOL_RELOAD_NOTICE
       : defuseQuotedSlashCommands(text)

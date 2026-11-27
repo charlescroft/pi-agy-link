@@ -1,14 +1,11 @@
 // Shared host services for dsh-agy-link.
-//
-// Constructs config/log/bin/version, session store, pool, quota, warmup, model
-// catalog, adapter, translation, override writer and live boot status. Session
-// & translation runtime helpers live in ./service-helpers.ts.
 import type { Context } from '@deepseek-ai/cordis'
 import { join } from 'node:path'
 import { writeFileAtomicSync } from '../common/atomic-write.ts'
 import { dshHome, overridesPath, readOverrides, resolveConfig, stateDir } from '../common/config.ts'
 import { PROVIDER_ID, type PluginConfig } from '../common/types.ts'
 import type { ManagedAccount } from '../common/pool-types.ts'
+import { BridgeSteps, enterHostStep } from './bridge-steps.ts'
 import { AgyAdapter } from './adapter.ts'
 import { AuthHelper } from './auth.ts'
 import { TranslationService, TRANSLATION_RECORD_TYPE, type TranslationRecord } from './translate.ts'
@@ -34,7 +31,7 @@ import { AcpSessionPool, runAcpAttempt } from '../features/acp/index.ts'
 import { createPoolQuotaHooks } from '../provider/quota-failover.ts'
 import { PREFERRED_IMAGE_QUOTA_MODEL } from '../common/model-lineup.ts'
 import { BackgroundWakeWatcher, type AgentLike } from '../features/background/watcher.ts'
-import { agyMcpConfigPath, registerBridgeMcpConfig, type BridgeRegistryState } from './mcp-bridge.ts'
+import { agyMcpConfigPath, mcpServerKey, registerBridgeMcpConfig, type BridgeRegistryState } from './mcp-bridge.ts'
 import { readAccountCredential } from './credential-backup.ts'
 import { acquireCredentialSlot, readPrimaryCredential, recoverPrimaryCredential, reinstallCredential } from './credential-slot.ts'
 import { buildCliQuotaDeps } from './quota-cli-deps.ts'
@@ -42,6 +39,7 @@ import { ACP_REPORT_RECORD_TYPE, createSessionRecords } from './session-records.
 import {
   Semaphore,
   createBtwServiceForHost,
+  createForcedPlanGuard,
   findSessionLogFile,
   readSessionImage,
   resolveSessionGoal,
@@ -61,9 +59,10 @@ function safeCtxGet<T>(ctx: Context, name: string): T | undefined {
 
 export function createHostServices(ctx: Context, entryConfig: Record<string, unknown> = {}) {
   const tag = '[dsh-agy-link] '
-  const log = (msg: string) => {
-    const logger = (ctx as unknown as { logger?: { info?: (m: string) => void } }).logger
-    logger?.info?.(tag + msg)
+  const log = (msg: string, level: 'info' | 'warn' = 'info') => {
+    const logger = (ctx as unknown as { logger?: Partial<Record<'info' | 'warn', (m: string) => void>> }).logger
+    if (level === 'warn' && logger?.warn) logger.warn(tag + msg)
+    else logger?.info?.(tag + (level === 'warn' ? 'WARNING: ' : '') + msg)
   }
 
   let binCache: string | null | undefined = undefined
@@ -139,11 +138,10 @@ export function createHostServices(ctx: Context, entryConfig: Record<string, unk
   // `onAccountUsed`; we refresh just that account (throttled) instead of waiting
   // for the next full sweep, so the panel reflects real consumption within
   // minutes. Fire-and-forget: a quota probe must never delay or fail a turn.
-  const quotaRefresher = new AccountQuotaRefresher(async (accountId) => {
-    const acc = pool.getAccount(accountId)
-    if (acc === undefined) return
-    await quota.refreshAccountQuota(acc, false)
-  })
+  const quotaRefresher = new AccountQuotaRefresher(
+    async (accountId) => { const acc = pool.getAccount(accountId); if (acc !== undefined) await quota.refreshAccountQuota(acc, false) },
+    undefined, undefined, { isBusy: () => adapter !== undefined && adapter.activeRunCount() > 0 },
+  )
   const semaphore = new Semaphore(() => getConfig().maxConcurrent)
 
   const getDiscoveryEnv = (account?: ManagedAccount): NodeJS.ProcessEnv => {
@@ -306,6 +304,7 @@ export function createHostServices(ctx: Context, entryConfig: Record<string, unk
     void catalog.forceRefreshAndNotify(newActiveId).catch(() => undefined)
   }
 
+  const bridgeSteps = new BridgeSteps()
   const bridgeState: BridgeRegistryState = { bridge: null, restores: [], log }
   const ecosystem = new EcosystemService({ pool, getConfig, log })
   const auth = new AuthHelper(bin, () => getConfig().suppressAgyAutoUpdate)
@@ -383,6 +382,7 @@ export function createHostServices(ctx: Context, entryConfig: Record<string, unk
     },
   })
   let adapter!: AgyAdapter
+  const forcedPlan = createForcedPlanGuard()
   const backgroundWakeup = new BackgroundWakeWatcher({
     getConfig,
     log,
@@ -437,6 +437,7 @@ export function createHostServices(ctx: Context, entryConfig: Record<string, unk
   let mirrorToolCheck: ((sessionId?: string) => boolean) | undefined = undefined
 
   adapter = new AgyAdapter({
+    enterBridgeStep: options => bridgeState.bridge ? enterHostStep(ctx, bridgeSteps, options, mcpServerKey(bridgeState.bridge.port)) : undefined,
     getConfig,
     catalog,
     store,
@@ -461,6 +462,7 @@ export function createHostServices(ctx: Context, entryConfig: Record<string, unk
     sessionCwd: (sessionId) => sessionWorkspace(sessionId),
     sessionGoal: (sessionId) => resolveSessionGoal(ctx, sessionId),
     sessionPlanMode: (sessionId) => resolveSessionPlanMode(ctx, sessionId),
+    consumeForcedPlanMode: forcedPlan.consume,
     sessionPendingModel: (sessionId) => resolveSessionPendingModel(ctx, sessionId),
     syncSessionModel: (sessionId, model, effort) => syncSessionModelSelection(ctx, sessionId, model, effort),
     onRun: (info) => { lastRun = info },
@@ -579,14 +581,15 @@ export function createHostServices(ctx: Context, entryConfig: Record<string, unk
   })
 
   return {
-    getConfig, log, notifyPicker, bin, version, resolveVersion, status, store, pool, quota, warmup, semaphore,
-    catalog, auth, poolAuth, runs, adapter, acpPool, backgroundWakeup, ecosystem, imageService, translation, translationWorkers, btw, setOverride,
+    getConfig, log, notifyPicker, bin, version, resolveVersion, status, store, pool, quota, quotaRefresher, warmup, semaphore,
+    catalog, auth, poolAuth, runs, adapter, acpPool, backgroundWakeup, ecosystem, imageService, translation, translationWorkers, btw, setOverride, armForcedPlan: forcedPlan.arm,
     readEffortUnsupported: effortStore.read,
     rememberEffortUnsupported: effortStore.remember,
     sessionsSvc, sessionAuto,
     get lastRun() { return lastRun },
     get lastParser() { return lastParser },
-    mediaDir, bridgeState, webServerPort, activeCwds,
+    mediaDir, bridgeState, bridgeSteps, webServerPort, activeCwds,
+    connection: () => safeCtxGet<{ requestRejection(req: { readonly headers: Record<string, string | string[] | undefined> }): 401 | 403 | undefined }>(ctx, 'connection'),
     hostDir: '',
     setMirrorToolCheck: (fn: (sessionId?: string) => boolean): void => { mirrorToolCheck = fn },
     onConfigWritten: (_key: string, _value: unknown): void => undefined,

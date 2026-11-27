@@ -10,18 +10,26 @@
 //  1. `agy` 1.4+ reads MCP servers only from `~/.gemini/config/mcp_config.json`
 //     (or a plugin's own `mcp_config.json`) — a workspace `.mcp.json` is
 //     silently ignored, so that is where the entry has to go.
-//  2. A bridged call must carry the identity of the session that spawned agy,
-//     otherwise every tool that needs a caller (e.g. AgentTeams' coordination
-//     tools) throws `exec.agent was undefined`. The session id travels from the
-//     agy child env (DSH_MCP_SESSION) through bridge.mjs as a header, and the
-//     host resolves it back to an agent.
+//  2. The host grants the step's tools to a session-specific subprocess using
+//     an opaque capability. A process ID or declared session ID is not proof
+//     of ownership of a model step.
 
+import { bridgeAllows, projectBridgeTools, INTERNAL_TOOL_NAMES } from '../common/bridge-tools.ts'
+import type { PluginConfig } from '../common/types.ts'
+export { toMcpName } from '../common/bridge-tools.ts'
+import type { BridgeStep, StepToolSet } from './bridge-steps.ts'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import { existsSync, mkdirSync, readFileSync } from 'node:fs'
 import { basename, dirname, join } from 'node:path'
-import { randomBytes, timingSafeEqual } from 'node:crypto'
+import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
 import { readJsonBody } from './read-json-body.ts'
 import { extractMcpContentBlocks, prepareMcpTools } from './mcp-schema.ts'
+import {
+  annotateDeferredRetry,
+  DEFER_EXECUTE_TOOL_NAME,
+  isDeferredToolSignal,
+  resolveDeferActivationArgs,
+} from './mcp-defer.ts'
 import {
   applySchemaDoctor,
   BRIDGE_SERVER_KEY,
@@ -33,17 +41,6 @@ import {
 import { homedir } from 'node:os'
 
 const MCP_SERVER_KEY = BRIDGE_SERVER_KEY
-
-/**
- * Tools that must NEVER be exposed to an external MCP client. These are
- * internal transports / loopback-only helpers of the plugin itself:
- *  - `run_code`  — the deployment's model-only wrapper around code execution.
- *  - `agy_ask`   — the plugin's own ask tool (would recurse into agy).
- *  - `agy_tool`  — replays recorded agy tool activity back into DSH; calling it
- *                   over the bridge would let the agy child re-enter the bridge.
- * Kept in one place so the /tools listing and the /call guard can never drift.
- */
-const INTERNAL_TOOL_NAMES = new Set(['run_code', 'agy_ask', 'agy_tool', 'agy_image'])
 
 /** Minimal structural view of the DSH tool registry we need. */
 export interface ToolsServiceLike {
@@ -67,6 +64,7 @@ export interface ToolsServiceLike {
     callId?: string
     name?: string
     arguments?: unknown
+    toolSet?: StepToolSet
     agent?: unknown
     /**
      * DSH 0.2.1 PTC nested-dispatch token (#66). 0.2.2 gates PTC on the
@@ -81,11 +79,6 @@ export interface ToolsServiceLike {
      */
     signal: AbortSignal
   }): Promise<unknown>
-}
-
-/** MCP tool names are [a-zA-Z0-9_-]; DSH names may contain dots. */
-export function toMcpName(name: string): string {
-  return name.replace(/[^a-zA-Z0-9_-]/g, '_')
 }
 
 export interface McpBridge {
@@ -148,10 +141,11 @@ function resultText(result: unknown): string {
  */
 function settledToolResult(result: unknown, callId: string): unknown {
   const results = (result as { results?: unknown } | null | undefined)?.results
-  if (!Array.isArray(results) || results.length === 0) return result
-  const settled = results.find((entry) => (entry as { callId?: unknown } | null)?.callId === callId) ?? results[0]
+  if (!Array.isArray(results)) return result
+  const settled = results.find((entry) => (entry as { callId?: unknown } | null)?.callId === callId)
   const inner = (settled as { result?: unknown } | undefined)?.result
-  return inner ?? settled
+  if (inner == null) throw new Error('No settled result for this tool call')
+  return inner
 }
 
 /**
@@ -162,24 +156,15 @@ export function startMcpBridge(opts: {
   bridgeScript: string
   tools: () => ToolsServiceLike | undefined
   allowlist: () => string
+  scope?: () => PluginConfig['mcpBridgeScope']
   /** Map the spawning DSH session id to the agent the call runs on behalf of. */
   resolveAgent?: (sessionId: string) => unknown | Promise<unknown>
+  resolveStep?: (token: string) => BridgeStep | undefined
   log?: (msg: string) => void
   /** Max buffered request-body bytes (tests use a small value). */
   maxBodyBytes?: number
 }): Promise<McpBridge> {
-  /**
-   * Resolve the DSH agent that owns the request's `X-DSH-Session`.
-   *
-   * Shared by `/tools` and `/call`: a preset-scoped tool only exists for a
-   * caller scope, so listing without one hides every tool registered inside a
-   * preset (`present`, `todo_write`, `schedule_*`, `office_*`) even when the
-   * allowlist names it (issue #150). DSH session keys come in two forms — a
-   * top-level web session is `session-<uuid>`, a sub-agent/fork session is a
-   * bare `<uuid>` — so the value is tried as given first (a bare sub-agent key
-   * must not be rewritten) and retried once with the `session-` prefix only
-   * when that finds nothing.
-   */
+  const toolPolicy = () => bridgeAllows(opts.scope?.() ?? 'all', opts.allowlist())
   const resolveSessionAgent = async (req: IncomingMessage): Promise<unknown> => {
     const sessionHeader = String(req.headers['x-dsh-session'] ?? '')
     const resolveSession = async (id: string): Promise<unknown> =>
@@ -191,7 +176,6 @@ export function startMcpBridge(opts: {
     return agent
   }
   const token = randomBytes(24).toString('hex')
-  let callSeq = 0
   const server: Server = createServer((req, res) => {
     void (async () => {
       const url = (req.url ?? '').split('?')[0]
@@ -200,33 +184,23 @@ export function startMcpBridge(opts: {
         sendJson(res, 401, { error: 'unauthorized' })
         return
       }
+      const step = opts.resolveStep?.(String(req.headers['x-dsh-route'] ?? ''))
+      const noStep = !!opts.resolveStep && !step
       if ((req.method === 'GET' || req.method === 'POST') && (url === '/tools' || url === '/mcp/tools')) {
         const svc = opts.tools()
         if (!svc) {
           sendJson(res, 503, { error: 'tools service unavailable' })
           return
         }
-        const allow = opts.allowlist().split(',').map((s) => s.trim()).filter(Boolean)
-        const allowSet = new Set(allow)
-        const used = new Set<string>()
-        // List the CALLER's surface: without a scope the whole preset-registered
-        // tool set is filtered out (issue #150).
-        const rawTools = svc.schemas(await resolveSessionAgent(req))
-          .filter((t) => allow.length === 0 || allowSet.has(t.name))
-          // internal transports / loopback-only helpers are not bridgeable
-          .filter((t) => !INTERNAL_TOOL_NAMES.has(t.name))
-          .map((t) => {
-            const base = toMcpName(t.name)
-            let name = base
-            for (let i = 2; used.has(name); i++) name = base + '__' + i
-            used.add(name)
-            return {
-              name,
-              dshName: t.name,
-              description: t.description,
-              inputSchema: { type: 'object', ...t.parameters },
-            }
-          })
+        const schemas = step?.schemas ?? (noStep ? [] : svc.schemas(await resolveSessionAgent(req)))
+        const allows = toolPolicy()
+        const rawTools = projectBridgeTools(schemas, name => allows(name) && (name !== 'run_code' || !!step))
+          .map(({ name, tool }) => ({
+            name,
+            dshName: tool.name,
+            description: tool.description,
+            inputSchema: { type: 'object', ...tool.parameters },
+          }))
         const tools = prepareMcpTools(rawTools)
         sendJson(res, 200, { tools })
         return;
@@ -248,11 +222,15 @@ export function startMcpBridge(opts: {
           return
         }
         const dshName = typeof parsed.dshName === 'string' ? parsed.dshName : ''
-        if (dshName === '' || INTERNAL_TOOL_NAMES.has(dshName)) {
+        if (dshName === '' || INTERNAL_TOOL_NAMES.has(dshName) || (dshName === 'run_code' && !step)) {
           sendJson(res, 400, { error: 'bad tool name' })
           return;
         }
-        callSeq++
+        if (noStep || (step && !step.schemas.some(tool => tool.name === dshName))) {
+          sendJson(res, 403, { error: 'tool unavailable for this session step' })
+          return
+        }
+        const callId = 'agy-mcp-' + randomUUID()
         // Audit trail: the bridge is the only path from an external agent
         // runtime into DSH tools, and it used to log nothing per call, so a
         // failed run could only be reconstructed from transcripts. Log the
@@ -271,9 +249,9 @@ export function startMcpBridge(opts: {
         // mcpToolAllowlist constrains; filtering only /tools would let a
         // (possibly prompt-injected) child POST /call with an arbitrary dshName
         // and reach tools outside the allowlist. Empty allowlist = all allowed.
-        const allow = opts.allowlist().split(',').map((s) => s.trim()).filter(Boolean)
-        if (allow.length > 0 && !allow.includes(dshName)) {
-          audit('denied: not in allowlist')
+        const allows = toolPolicy()
+        if (!allows(dshName)) {
+          audit('denied: bridge scope or allowlist')
           sendJson(res, 403, { error: 'tool not allowed' })
           return
         }
@@ -283,7 +261,7 @@ export function startMcpBridge(opts: {
           // enforce `exec.agent` reject the call.
           // The spawning session's agent (see resolveSessionAgent): without it
           // a call runs anonymously and `agent_teams` tools reject it.
-          const agent = await resolveSessionAgent(req)
+          const agent = step?.agent ?? await resolveSessionAgent(req)
           // Every DSH tool receives `exec.signal`; tools that await inside their
           // body read it, so a call without one throws
           // `Cannot read properties of undefined (reading 'aborted')`.
@@ -301,36 +279,102 @@ export function startMcpBridge(opts: {
           // token only for a PTC surface: native calls must not carry it (a
           // pre-execute hook treats any parent as a PTC dispatch and then looks
           // for a session-log start that a native call does not have).
-          const callId = 'agy-mcp-' + callSeq
-          const isPtc = svc.schemas(agent).some((tool) => tool.name === 'run_code')
-          const result = await svc.execute({
-            calls: [{
-              type: 'tool-call',
-              id: callId,
-              name: dshName,
-              // The batch API expects the raw model JSON text; it parses it and
-              // keeps malformed input for tool-owned diagnostics.
-              arguments: JSON.stringify(parsed.arguments ?? {}),
-            }],
-            signal: controller.signal,
-            ...(agent === undefined ? {} : { agent }),
-            // DSH 0.2.1 compatibility (ignored by 0.2.2+).
-            callId,
-            name: dshName,
-            arguments: parsed.arguments ?? {},
-            ...(isPtc ? { parent: Symbol(callId) } : {}),
-          })
+          const isPtc = !step && svc.schemas(agent).some((tool) => tool.name === 'run_code')
+          const execSignal = step ? AbortSignal.any([controller.signal, step.signal]) : controller.signal
+          const executeOnce = async (
+            targetName: string,
+            targetArgs: unknown,
+            cid: string,
+          ): Promise<{ settled?: unknown; err?: unknown }> => {
+            try {
+              const result = await svc.execute({
+                calls: [{
+                  type: 'tool-call',
+                  id: cid,
+                  name: targetName,
+                  // The batch API expects the raw model JSON text; it parses it and
+                  // keeps malformed input for tool-owned diagnostics.
+                  arguments: JSON.stringify(targetArgs ?? {}),
+                }],
+                signal: execSignal,
+                ...(step && { toolSet: {
+                  view: (scope?: unknown) => new Map([...step.toolSet.view(scope)].filter(([name]) => allows(name))),
+                } }),
+                ...(agent === undefined ? {} : { agent }),
+                // DSH 0.2.1 compatibility (ignored by 0.2.2+).
+                callId: cid,
+                name: targetName,
+                arguments: targetArgs ?? {},
+                ...(isPtc ? { parent: Symbol(cid) } : {}),
+              })
+              if (step && !Array.isArray((result as { results?: unknown } | null)?.results)) {
+                throw new Error('The host returned no tool batch for this step')
+              }
+              return { settled: settledToolResult(result, cid) }
+            } catch (err) {
+              return { err }
+            }
+          }
+
+          const first = await executeOnce(dshName, parsed.arguments ?? {}, callId)
+          const firstFailed = first.err !== undefined || Boolean((first.settled as { isError?: boolean } | null)?.isError)
+          if (firstFailed) {
+            const failSignal = first.settled ?? first.err
+            const failText = first.settled !== undefined
+              ? resultText(first.settled)
+              : (first.err instanceof Error ? first.err.message : String(first.err))
+            const deferArgs = isDeferredToolSignal(failSignal, failText) && !execSignal.aborted
+              ? resolveDeferActivationArgs({
+                  targetToolName: dshName,
+                  admittedSchemas: step ? step.schemas : svc.schemas(agent),
+                  allows,
+                })
+              : null
+
+            if (deferArgs !== null) {
+              audit('deferred: activating via ' + DEFER_EXECUTE_TOOL_NAME)
+              const activation = await executeOnce(DEFER_EXECUTE_TOOL_NAME, deferArgs, 'agy-mcp-' + randomUUID())
+              const actFailed = activation.err !== undefined || Boolean((activation.settled as { isError?: boolean } | null)?.isError)
+              if (actFailed || execSignal.aborted) {
+                const actErr = activation.settled !== undefined ? resultText(activation.settled) : String(activation.err ?? 'aborted')
+                audit('deferred-activate-failed: ' + actErr.slice(0, 160))
+                sendJson(res, 422, { ok: false, error: `${failText} (${DEFER_EXECUTE_TOOL_NAME}: ${actErr})` })
+                return
+              }
+              const retried = await executeOnce(dshName, parsed.arguments ?? {}, 'agy-mcp-' + randomUUID())
+              const retryFailed = retried.err !== undefined || Boolean((retried.settled as { isError?: boolean } | null)?.isError)
+              if (retryFailed) {
+                const retryErr = retried.settled !== undefined ? resultText(retried.settled) : String(retried.err)
+                audit('deferred-retry-failed: ' + retryErr.slice(0, 200))
+                sendJson(res, 422, { ok: false, error: retryErr })
+                return
+              }
+              audit('deferred-retried caller=' + (agent === undefined ? 'none' : 'agent'))
+              const rawContent = extractMcpContentBlocks(retried.settled)
+              const annotated = annotateDeferredRetry(resultText(retried.settled), rawContent, dshName)
+              sendJson(res, 200, {
+                ok: true,
+                text: annotated.text,
+                ...(annotated.content ? { content: annotated.content } : {}),
+              })
+              return
+            }
+
+            audit((first.settled !== undefined ? 'tool returned error' : 'failed: ' + failText).slice(0, 200))
+            sendJson(res, 422, { ok: false, error: failText })
+            return
+          }
+
           audit('ok caller=' + (agent === undefined ? 'none' : 'agent'))
-          const settled = settledToolResult(result, callId)
-          const content = extractMcpContentBlocks(settled)
+          const content = extractMcpContentBlocks(first.settled)
           sendJson(res, 200, {
             ok: true,
-            text: resultText(settled),
+            text: resultText(first.settled),
             ...(content ? { content } : {}),
           })
         } catch (e) {
           audit('failed: ' + String(e).slice(0, 200))
-          sendJson(res, 200, { ok: false, error: String(e) })
+          sendJson(res, 422, { ok: false, error: String(e) })
         }
         return;
       }

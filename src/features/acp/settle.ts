@@ -64,6 +64,24 @@ export interface AcpPromptOutcome {
   keyringJitter?: boolean
 }
 
+export function buildAcpPromptOutcome(
+  failure: AttemptFailure | null,
+  startedAt: number,
+  stderr: string,
+  cooledInLiveFamilies: AcpPromptOutcome['cooledInLiveFamilies'],
+): AcpPromptOutcome {
+  return {
+    failure,
+    durationMs: Date.now() - startedAt,
+    stderr,
+    rawErrText: '',
+    runLogText: '',
+    silentTimeout: false,
+    empty: false,
+    cooledInLiveFamilies,
+  }
+}
+
 
 export async function settleAcpOutcome(opts: {
   deps: AttemptDeps
@@ -124,6 +142,7 @@ export async function settleAcpOutcome(opts: {
     clearRateLimitFailover: (k) => deps.clearRateLimitFailover(k),
     sharesSingleEgress: () => deps.sharesSingleEgress(),
     ...(deps.onRun === undefined ? {} : { onRun: deps.onRun }),
+    ...(deps.log === undefined ? {} : { log: deps.log }),
   })
 }
 
@@ -156,12 +175,18 @@ export async function finishAcpAttempt(opts: {
       ...(result.cooledInLiveFamilies === undefined ? {} : { cooledInLiveFamilies: result.cooledInLiveFamilies }),
       ...(result.outcomeOverride === undefined ? {} : { outcomeOverride: result.outcomeOverride }),
     })
+    if (!input.isAux && input.account !== undefined && result.failure === null) {
+      deps.onAccountUsed?.(input.account.id, input.family)
+    }
   } finally {
     recorder.stop()
     deps.unregisterActiveRun(sessionKey, recorder.rec)
     slot.releaseOnce()
     deps.clearInFlightPrompt(sessionKey, input.prompt)
     recorder.rec.settle(result.failure)
+    if (input.isAux && !input.persistBinding && typeof proc.closeSession === 'function') {
+      void proc.closeSession(sid)
+    }
     if (!input.isAux && sessionKey !== '') {
       deps.backgroundObserver?.onAttemptSettled?.({
         sessionKey,

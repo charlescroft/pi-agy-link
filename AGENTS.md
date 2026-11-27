@@ -22,9 +22,10 @@
 > ⚠️ **严禁在日常编码与 TDD 循环中直接运行全量测试套件**！系统累计 491 项用例，全量运行耗时较长会严重打断开发心流。日常开发必须遵循两级双环测试：
 
 1. **内环（TDD 极速环，0.3 ~ 2 秒，日常开发必用）**：
-   - 自动基于 Git 变更精准执行关联测试：`pnpm run test:fast`
-   - 指定模块关键字秒级直跑：`pnpm run test:fast <name>`（例如 `pnpm run test:fast models` 仅需 0.5s，`pnpm run test:fast reasoning` 仅需 0.4s）
-   - 单文件直跑：`node --experimental-transform-types --test test/xxx.test.ts`
+   - 自动基于 Git 变更精准执行关联测试：`npm run test:fast`（或 `node scripts/fast-test.mjs`）
+   - 指定模块关键字秒级直跑：`npm run test:fast -- <name>`（例如 `node scripts/fast-test.mjs models`、`node scripts/fast-test.mjs warmup`）
+   - 单文件直跑：`node --experimental-transform-types --test test/<domain>/xxx.test.ts`
+   - 测试按领域分子目录（镜像 `src/` 分层）：新测试放进被测代码所属层，见 [test/README.md](test/README.md) 与 [.spec/testing.md](.spec/testing.md)
 2. **外环（全量回归门禁，仅提 PR 或发版打 Tag 前）**：
    - 全量回归测试：`pnpm test`（确保 491 项用例 100% 全部通过）
 

@@ -142,14 +142,11 @@ reference-counted slot is the strongest isolation the plugin can provide.
   token-guarded HTTP endpoint and registers a zero-dependency stdio MCP
   server in the MCP registry (`~/.gemini/config/mcp_config.json` by default,
   where `agy` 1.4+ actually reads it, merged in and restored on disable).
-  Bridged calls carry caller identity via `DSH_MCP_SESSION` so identity-enforcing
-  tools (such as `agent_teams`) function correctly. Internal loopback-only
-  helpers — `run_code`, `agy_ask`, and the activity-mirror `agy_tool` — are
-  never bridged (excluded from both `/tools` and `/call`); `mcpToolAllowlist`
-  restricts the served set **and is
-  enforced at execution time** — a `/call` for a tool outside the allowlist is
-  refused (403) even when the caller holds the bridge token, so a prompt-injected
-  agy child cannot silently reach tools the operator did not expose. The
+  Bridged calls carry an opaque per-session route. DSH supplies the current
+  model schemas and the admitted tool set for that step. Its PTC executor
+  can call the admitted inner tools. The configured allowlist applies to
+  both layers and recursive AGY helpers are excluded. Account or session
+  changes can require a separate ACP process, increasing memory use. The
   loopback endpoint also caps request bodies (8 MiB → HTTP 413) and compares the
   bearer token in constant time, so a token-holding but prompt-injected child
   cannot OOM the host with an unbounded body or probe the token via timing.
@@ -174,16 +171,9 @@ reference-counted slot is the strongest isolation the plugin can provide.
   tools that require one need a real `agent` or they fail by design.
   Documenting the full DSH-core `execute(exec)` contract and any official
   sessionless-execution API is upstream work, not this bundle.
-- **DSH `send_message` from an agy child** - DSH's sub-agent runtime appends a
-  footer telling the child to report with `send_message({ agent_id: <parent> })`.
-  In an agy run that name resolves to agy's **own** `send_message`, which does
-  not know DSH agent ids and fails with `recipient "..." not found`. The DSH
-  tool itself is bridgeable - add `send_message` to `mcpToolAllowlist` and call
-  it explicitly on the `dsh-tools-<port>` MCP server (agy dispatches MCP calls
-  by server + tool name, so there is no collision with the native tool). The
-  footer still names the native one, so an agy member should report through
-  `agent_teams_send_message` (or an explicit instruction) instead. Root cause is
-  upstream in `@deepseek-ai/dsh-subagent`, which assumes a DSH-native child.
+- **Toolbox size and name collisions.** Select `mcpBridgeScope: host-only` to leave basic file and terminal work to AGY and save room under its 20,000-token toolbox limit. Large extension catalogs can still reach the limit. Narrow `mcpToolAllowlist` when needed.
+  When an advertised tool such as `send_message` also exists in AGY, the prompt names the tool and requires dispatch through `dsh-tools-<port>` for the current DSH session. AGY still controls its own dispatch. Its native messaging tool cannot resolve DSH recipients.
+  A chat step with host tools and a disabled bridge or system-prompt forwarding produces a deduplicated diagnostic (info when both are off, warn when only one is off). The status endpoint records the detected tool names and disabled settings in `bridgeDiagnostic`.
 - **Weekly quota auto-warmup is opt-in (v0.4.74+)** - `autoWarmup` defaults to
   `false` because the feature deliberately bypasses the CLI-first quota path and
   sends minimal `loadCodeAssist` + `generateContent` probes straight to Google's
@@ -208,8 +198,12 @@ reference-counted slot is the strongest isolation the plugin can provide.
 - Gemini effort suffixes fold into one base model with selectable efforts
   (`gemini-3-6-flash` + `--effort`); Claude / GPT-OSS slugs stay verbatim
   (agy rejects `--effort` for them).
-- Compaction / session-title auxiliary calls run as one-shot agy turns in
-  forced `plan` mode, capped at 800K chars of history.
+- Compaction / session-title / `/atw` auxiliary calls reuse the persistent
+  `agy acp` process pool when `transport === 'acp'` (creating ephemeral ACP
+  sessions that are cleaned up with `session/close` on settlement), falling
+  back to one-shot `agy -p` when `--settings` or `--json-schema` is required.
+  Compaction and session-title calls force `plan` mode, capped at 800K chars of
+  history.
 
 ## Upstream behaviors observed
 
@@ -219,6 +213,32 @@ reference-counted slot is the strongest isolation the plugin can provide.
   (upstream issue #36).
 - First unauthenticated call takes ~60-70s to fail (agy waits for a pasted
   code); later failures are faster.
+- **agy silently truncates an oversized prompt (measured on 1.5.18, issue
+  #223).** One message keeps about 191.6 KB; anything beyond it is cut from the
+  TAIL and replaced — in the model's view only — by `<truncated N bytes>`. That
+  marker never leaves agy: neither DSH nor this plugin sees it, so the model
+  just misses the end of a request ("it ignored my last instruction") and
+  nothing points at the cause. agy's own system prompt, tool schemas and skills
+  are counted against the same budget on top of our prompt (at least 27 KB in
+  the reporter's session), so a request that is inside this plugin's own budget
+  can still be cut.
+  - The plugin's limit is lower and never silent: `AGY_PROMPT_SAFE_BYTES`
+    (180,000 B) turns overflow into a history digest, a readable archive file,
+    or an elision with a visible marker. What it cannot do is allow for agy's
+    overhead, which varies per session.
+  - There is no detection yet, and the advertised `contextWindowDefault`
+    (1,048,576 tokens) is a context *window*, not this byte budget — DSH
+    therefore compacts much later than agy truncates.
+  - **Since v0.6.103 the default budget is 150,000 B, leaving 42 KB for agy's
+    own overhead** (it was 180,000, which left 12 KB — less than the 27 KB
+    measured in the reporter's installation). What the plugin gives up goes
+    into its own digest / archive path, which is visible, instead of agy's
+    silent cut.
+  - **If the model still reports truncation, lower `promptMaxBytes` further**
+    (16,000 is the floor; 192,000 the ceiling, since above it the cut
+    returns). Making DSH compact sooner (`contextWindowDefault` 262144 and
+    `compactionMaxChars` 60000 is one configuration the reporter verified)
+    also works, but it is blunter: it changes every session's compaction.
 - **A third-party MCP server registered directly in agy used to kill every
   turn with `INVALID_ARGUMENT` — wrapped now, with one gap left.**
   `<agy home>/.gemini/config/mcp_config.json` is agy's own registry; servers

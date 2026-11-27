@@ -58,12 +58,13 @@ Resolution order (highest first): `DSH_AGY_*` environment variable → runtime o
 | --- | --- | --- | --- |
 | `contextWindowDefault` | `DSH_AGY_CONTEXT_WINDOW` | `1048576` | Context window advertised when agy does not report one |
 | `maxTokensDefault` | `DSH_AGY_MAX_TOKENS` | `65536` | Max output tokens advertised when agy does not report one |
-| `forwardSystemPrompt` | `—` | `false` | Forward the DSH system prompt to agy |
+| `forwardSystemPrompt` | `—` | `false` | Forward the current DSH system prompt and latest producer snapshots to agy on each chat turn, including resumed sessions |
 | `digestMaxChars` | `—` | `8000` | Budget for the history digest sent each turn |
 | `contextTransferMaxChars` | `—` | `660000` | Character cap for the transferred context block |
 | `contextTransferMaxBytes` | `—` | `150000` | Byte cap for the transferred context block |
-| `contextTransferFileAboveBytes` | `—` | `55000` | Files larger than this are elided in the context block |
+| `contextTransferFileAboveBytes` | `—` | `150000` | Files larger than this are elided in the context block |
 | `contextTransferFileMaxBytes` | `—` | `2000000` | Hard cap for an inlined file |
+| `promptMaxBytes` | `DSH_AGY_PROMPT_MAX_BYTES` | `150000` | Byte budget kept for one prompt (v0.6.103+; was 180000). agy's own ceiling is ~192000 and its system prompt, tool schemas and skills count against it too, so the default leaves 42 KB for them. Lower this further (min `16000`) if agy still truncates requests inside the default budget |
 | `compactionMaxChars` | `—` | `800000` | Character budget for compaction input |
 | `allowAuxiliary` | `—` | `true` | Allow auxiliary calls (titles, goal derivation) through the adapter |
 
@@ -82,10 +83,15 @@ Resolution order (highest first): `DSH_AGY_*` environment variable → runtime o
 | Key | Environment | Default | Description |
 | --- | --- | --- | --- |
 | `askTool` | `—` | `false` | Expose the `agy_ask` delegation tool |
-| `mcpBridge` | `DSH_AGY_MCP_BRIDGE` | `false` | Bridge DSH-side MCP servers into agy |
+| `mcpBridge` | `DSH_AGY_MCP_BRIDGE` | `false` | Expose the current DSH model step’s tools to agy. Requires a host that supplies the 0.2.2 step tool set. Without a bound step the bridge advertises no tools. |
+| `mcpBridgeScope` | `DSH_AGY_MCP_BRIDGE_SCOPE` | `all` | `all` exposes the admitted tools. `host-only` omits basic file and terminal tools such as `read`, `edit` and `bash`. Both respect `mcpToolAllowlist` and keep the host-projected PTC executor `run_code` if allowed. Set the scope in Settings → Runtime controls or the plugin config. |
 | `mcpConfigScope` | `DSH_AGY_MCP_CONFIG_SCOPE` | `global` | `global` / `workspace` / `both` |
 | `mcpConfigPath` | `DSH_AGY_MCP_CONFIG_PATH` | `''` | Explicit agy MCP config path |
 | `mcpToolAllowlist` | `DSH_AGY_MCP_TOOL_ALLOWLIST` | `''` | Only expose these MCP tools (comma separated) |
+
+Scope selection takes effect when the bridge is enabled. It applies to discovery, direct calls and the inner tools available to PTC. With an explicit allowlist, include both `run_code` and the inner tools you need. For bridged tools that share an AGY built-in name, the prompt names the session's MCP server and requires that route.
+
+When a chat step includes host tools and either `mcpBridge` or `forwardSystemPrompt` is off, the host logs once per distinct set of tools and disabled settings. Both switches off produce an informational message. Exactly one switch off produces a warning. Each message explains how to enable the missing capability. `GET /plugins/agy-link/status` reports the most recent chat step's `bridgeDiagnostic.hostTools` and `bridgeDiagnostic.disabledSettings`. A healthy chat step clears it to `null`. In PTC the diagnostic identifies the projected `run_code` executor. Changing either setting remains an explicit user action.
 
 ## Network, quota and updates
 
@@ -96,6 +102,11 @@ Resolution order (highest first): `DSH_AGY_*` environment variable → runtime o
 | `quotaViaCli` | `DSH_AGY_QUOTA_VIA_CLI` | `true` | Prefer the agy CLI path for quota queries. The CLI is only spawned once the account's access token has at least two minutes of life left (refreshed up front when it does not); otherwise that round falls back to the REST quota endpoint |
 | `autoWarmup` | `DSH_AGY_AUTO_WARMUP` | `false` | Opt-in weekly-quota warmup |
 | `warmupModels` | `DSH_AGY_WARMUP_MODELS` | `gemini-3.8-flash,claude-sonnet-5-5` | Models used for warmup probes |
+| `warmupWindows` | `DSH_AGY_WARMUP_WINDOWS` | `'weekly'` | Target bucket windows for warmup (`weekly`, `5h`, `both`) |
+| `warmupDailyTime` | `DSH_AGY_WARMUP_DAILY_TIME` | `''` | Optional daily warmup time (`HH:MM`) |
+| `warmupTimezone` | `DSH_AGY_WARMUP_TIMEZONE` | `''` | IANA timezone for scheduled daily warmup |
+| `warmupIntervalHours` | `DSH_AGY_WARMUP_INTERVAL_HOURS` | `0` | Periodic warmup interval in hours (`0` disables, valid `1..168`) |
+| `warmupMaxProbesPerRun` | `DSH_AGY_WARMUP_MAX_PROBES` | `12` | Max probes per warmup pass (`0` = unlimited) |
 | `suppressAgyAutoUpdate` | `DSH_AGY_SUPPRESS_AUTOUPDATE` | `true` on Windows, `false` elsewhere | Refresh agy's update-check timestamp before every spawn to stop the `--bg-updater` console flash chain |
 
 ## Translation (`/tsl`)
@@ -106,6 +117,7 @@ Resolution order (highest first): `DSH_AGY_*` environment variable → runtime o
 | `translateModel` | `DSH_AGY_TRANSLATE_MODEL` | `gemini-3.8-flash` | Translate model, with catalog fallback |
 | `translateEffort` | `DSH_AGY_TRANSLATE_EFFORT` | `low` | Reasoning effort for the translate model (`low` faster, `medium` / `high` more rigorous) |
 | `translateTargetLanguage` | `DSH_AGY_TRANSLATE_LANG` | `中文（简体）` | Target language wording in the prompt |
+| `translateDisplay` | `DSH_AGY_TRANSLATE_DISPLAY` | `'card'` | Translation presentation mode (`card` below reply or `replace`) |
 | `translateMaxChars` | `—` | `8000` | Source truncation limit |
 | `translateMaxTokens` | `—` | `4096` | Output token cap |
 | `translateTimeoutMs` | `—` | `120000` | Per-translation timeout |
@@ -144,14 +156,25 @@ classification and the retry-on-effort-refusal all come from the same code path 
 normal turn uses. `--json` returns the validated artifact (`path`, `mime`,
 `width`, `height`, `bytes`, `aspectRatio`, `accountId`) or a stable failure `code`.
 
-## Side questions (`/btw`)
+## Side questions (`/atw`)
 
 | Key | Environment | Default | Description |
 | --- | --- | --- | --- |
-| `btwModel` | `DSH_AGY_BTW_MODEL` | (empty) | Antigravity model for `/btw` read-only side questions; empty → `defaultModel` → Gemini 4 Hydrogen → Gemini Flash |
-| `btwEffort` | `DSH_AGY_BTW_EFFORT` | `medium` | Reasoning effort for `/btw` (`medium` balanced, `low` faster, `high` deeper) |
+| `btwModel` | `DSH_AGY_BTW_MODEL` | (empty) | Antigravity model for `/atw` read-only side questions; empty → `defaultModel` → Gemini 4 Hydrogen → Gemini Flash |
+| `btwEffort` | `DSH_AGY_BTW_EFFORT` | `medium` | Reasoning effort for `/atw` (`medium` balanced, `low` faster, `high` deeper) |
 
-Both are editable in **Settings → Antigravity** (in the `/btw Side Questions` card).
+Both are editable in **Settings → Antigravity** (in the `/atw Side Questions` card).
+
+## Orchestrator & security options
+
+| Key | Environment | Default | Description |
+| --- | --- | --- | --- |
+| `orchestratorPlannerModel` | `DSH_AGY_ORCHESTRATOR_PLANNER_MODEL` | `''` | Planner model override passed via `--settings` when an Orchestrator model is active |
+| `orchestratorPlannerEffort` | `DSH_AGY_ORCHESTRATOR_PLANNER_EFFORT` | `''` | Planner reasoning effort override for Orchestrator turns |
+| `orchestratorExecutorModel` | `DSH_AGY_ORCHESTRATOR_EXECUTOR_MODEL` | `''` | Executor model override passed via `--settings` when an Orchestrator model is active |
+| `orchestratorExecutorEffort` | `DSH_AGY_ORCHESTRATOR_EXECUTOR_EFFORT` | `''` | Executor reasoning effort override for Orchestrator turns |
+| `cloakSystemPrompt` | `DSH_AGY_CLOAK_SYSTEM_PROMPT` | `true` | Replace DSH-specific wording/paths in injected prompts with neutral Antigravity phrasing |
+| `auxNeutralWorkspace` | `DSH_AGY_AUX_NEUTRAL_WORKSPACE` | `true` | Run auxiliary/side-channel turns (`btw`, translation, title, compaction) in a clean neutral cwd instead of leaking the user workspace |
 
 ## Client UI visibility (issue #105)
 

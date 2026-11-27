@@ -48,17 +48,20 @@ DSH 前端 `ModelCatalogDirectory.load()` 在首次加载（`status === 'ready'`
 2. **收口于 `pool.onAccountSwitch`**：
    - `setActiveAccount`、`setPrimaryAccount`、`reorderAccounts`、`advanceAccount`、`PoolAdmin.recordFailure`（429 自动切号）、`selectAccount`（含首次从 `undefined` 选定活跃号）、`deleteAccount`、`setAccountEnabled`、`clearCooldown` 凡引起有效活跃账号变化，统一触发一次 `onAccountSwitch`（立即 `notifyPicker()` 切换已有缓存视图 + 异步 `forceRefreshAndNotify(newId)` 补齐最新目录），HTTP 路由层不再重复调用第二次 `forceRefreshAndNotify`。
    - **OAuth 登录 / 重登 / 导入必刷新**：`PoolAuthFlow.finishWithCode`（全部三个分支：新账号、重认证、主账号）与 `importRefreshToken` 完成后均触发目录刷新与 `notifyPicker()`。
-   - **配置与 CLI 命令同步**：`/config` 修改影响可见模型集合的键（`hiddenModels`、`poolWideCatalog`、`enabled`，其中 `enabled` 通过 `AdapterRegistrationHandle.replace()` 动态挂载/卸载路由）以及 `/agy` 账号管理子命令（含 `/agy use <id>`、`/agy effort`）均同步调用 `notifyPicker()`；不影响 `listModels()` 列表集合的键（如 `defaultEffort`、`translateModel`）保持静默（遵循 `test/http-contract.test.ts` 与 `test/lifecycle.test.ts` 契约）。
+   - **配置与 CLI 命令同步**：`/config` 修改影响可见模型集合的键（`hiddenModels`、`poolWideCatalog`、`enabled`，其中 `enabled` 通过 `AdapterRegistrationHandle.replace()` 动态挂载/卸载路由）以及 `/agy` 账号管理子命令（含 `/agy use <id>`、`/agy effort`）均同步调用 `notifyPicker()`；不影响 `listModels()` 列表集合的键（如 `defaultEffort`、`translateModel`）保持静默（遵循 `test/transport/http-contract-*.test.ts` 与 `test/integration/lifecycle.test.ts` 契约）。
 
-### 4.3 按模型族作用域与手动切号优先于同族旧会话粘性（`manualPinAtByFamily`）
+### 4.3 按模型族作用域与同族严格单一活跃账号（防封号收敛）
 - 账号池活跃指针、冷却与预热严格按**模型族**（`google` Gemini / `argon` Argon / `anthropic` Claude / `openai` GPT-OSS）隔离：
   - `setActiveAccount(id, family)`、`markAccountActive(id, family)`、`advanceAccount`、`selectAccount` 与 `/pool/set-active` 默认严格按模型族作用域隔离，不越界覆写其他模型族的当前账号；`/agy use <id> [family]` 支持指定模型族（默认 `google`）。
-  - **共享组双向联动例外（`argonSharesGoogleGroup(acc)`）**：当 `acc.quotas?.argon` 缺省且 `acc.quotas?.google?.description` 显式列名 Argon（`agy 1.5.15+` 折叠进 `Gemini Models` 组）时，该账号上的 `google` ↔ `argon` 活跃指针、`manualPinAtByFamily`、冷却与 `stickyAccount` 双向同步（除非 `activeAccountIds.argon` 当前指向一个拥有独立 `quotas.argon` 的账号）；拥有独立 `quotas.argon` 的账号仍严格保持按族隔离。
+  - **共享组双向联动例外（`argonSharesGoogleGroup(acc)`）**：当 `acc.quotas?.google?.description` 显式列名 Argon（`agy 1.5.15+` 折叠进 `Gemini Models` 组，即使后端同时在 `quotas.argon` 下发镜像周行）时，该账号上的 `google` ↔ `argon` 活跃指针、`manualPinAtByFamily`、冷却与 `stickyAccount` 双向同步（除非 `activeAccountIds.argon` 当前指向一个拥有**独立**非共享 `quotas.argon` 的账号）；拥有独立 `quotas.argon` 的账号仍严格保持按族隔离。
   - `recordFailure()` / `advanceAccount()` / `updateAccountQuotas()` 对主动指针的轮换或自愈均按模型族边界校验（`lastActiveAccountId` 仅服务 `google` 族兜底，绝不跨族劫持 `argon` / `anthropic` / `openai`）。
   - `getPoolData().resolvedActiveAccountIds` 预计算每个模型族当前真正命中的可用账号 ID，UI 将「当前使用」「设为当前」「冷却中」「清除冷却」直接嵌入对应模型族分组内，消除账号级冗余状态标签与横幅。
-- `selectSessionAccount()` 中：
-  - `stickyAccount()` 仅在会话上次绑定模型属于同一 `modelFamilyOf(b.model)` 时复用同族粘性账号（例如会话 A 选 `gemini-pro-orchestrator-neon` 在 `google` 池内轮换，会话 B 选 `gemini-4-argon` 在 `argon` 池内独立轮换，互不串扰）。
-  - 若用户对该模型族显式切号发生在旧会话绑定更新时间之后（`Math.max(manualPinAt, manualPinAtByFamily[family]) > binding.updatedAt`），该同族会话**立即跟随用户新选账号**，不再被旧会话亲和拉回；且 `stickyAccount` 命中旧会话亲和时**绝不反向覆写全局其他族的 `activeAccountIds`**（`lastActiveAccountId` 亦受 `family === 'google' || !lastActiveAccountId` 守卫）。
+- `selectSessionAccount()` 与 `stickyAccount()` 中：
+  - 无论自动轮换（429 / 低配额让路）还是手动切号，只要 `activeAccountIds[family]`（或 `resolveEligibleActiveAccountId`）指向新账号，同族所有会话**立即收敛**到该单一活跃账号，禁止历史会话绑定越过当前活跃账号复活旧号或反向覆写 `activeAccountIds`；同族内亦不按窄能力拆号，锁定账号能服务请求模型即严格锁死。
+  - `stickyAccount()` 仅在会话上次绑定模型属于同一 `modelFamilyOf(b.model)`（或共享 Argon 组）、晚于该族 `manualPinAt`、**且绑定账号等于该族当前活跃可用账号**时返回绑定账号，供复核原生对话复用。
+  - **实时在途回合与同族换模失效（`resolveSessionView` + `resolvePromptBinding`）**：
+    - `resolveSessionView()`（会话顶栏徽标数据源）按 **在途活跃运行（`adapter.activeAccountForSession()` / `getActiveRun()`，校验与当前模型族或共享 Argon 组兼容） > 当前族活跃账号（匹配活跃账号的 `stickyAccount()` / 按会话模型精化的 `resolvedActiveAccountIds[family]`）** 顺序解析，确保顶栏展示与调度选号 100% 一致。
+    - `resolvePromptBinding()` 因模型 slug 变更使当前账号绑定失效时，同步清理同一 `bindingKey` 下属于目标模型族（及共享组）且模型 slug 不匹配的陈旧绑定（保留其他隔离族绑定），防止更早的旧账号在同号切模或绑定判断中残留。
 - `syncSessionModel()` 兼容 `dsh-agent` 真实接口 `(await ctx.agents.resolve(sessionId))?.model?.select(...)` 与持久事件追加。
 
 ## 5. `--effort` 档位拒绝自愈（issue #67 / #115）
@@ -68,15 +71,16 @@ DSH 前端 `ModelCatalogDirectory.load()` 在首次加载（`status === 'ready'`
 
 ## 6. Orchestrator 上下级模型与思考档位（issue #174）
 
-- 自 `agy 1.5.14` 起，命令行 `agy --settings '{"orchestrator":{"planner":"<tiered-slug>","executor":"<tiered-slug>"}}'` 支持为编排器角色模型（`gemini-pro-orchestrator*`）分别覆盖上级（Planner）与下级（Executor）模型及各自思考档位，而 `agy acp` 仍无 `--settings` 入参且会拒绝嵌套对象格式 `{ planner: { model, effort } }`。
+- 自 `agy 1.5.14` 起，命令行 `agy --settings '{"orchestrator":{"planner":"<tiered-slug>","executor":"<tiered-slug>"}}'` 支持为编排器角色模型（`gemini-pro-orchestrator*`）分别覆盖上级（Planner）与下级（Executor）模型及各自思考档位。`agy acp` 没有 `--settings` 入参，但启动时读取 `<home>/.gemini/antigravity-cli/settings.json`（与 `--settings` 同一套 key），因此编排器覆盖现在**写入该文件**而不是绕开 ACP（issue #204）。
 - **唯一格式化与合并源（`src/common/orchestrator.ts`）**：`isOrchestratorModel()`、`resolveOrchestratorRoleSlug()`（保留 `gpt-oss-120b-medium` 等无独立档位枚举模型后缀、剥离其余已有档位后再拼接 `<base>-<effort>`）、`buildOrchestratorSettingsObject()` 与 `mergeOrchestratorIntoAgySettings()`（合并进现有内联 JSON 或文件路径型 `agySettings` 的 `orchestrator` 对象，不覆盖无关字段）。
-- **生效路由边界**：仅当当前会话模型（或 `runAgyOnce` 请求模型）命中 `isOrchestratorModel()` 且配置了至少一个上级/下级模型时，`resolveEffectiveAgySettings()`（`src/provider/attempt.ts`）与 `runAgyOnce`（`src/host/oneshot.ts`）才会注入 `--settings`；`runAgyAttempt`（`src/provider/attempt-outcome.ts`）基于 `resolveEffectiveAgySettings(input)` 判定仅在此场景下绕开 ACP 走 CLI `-p --settings`，非编排器模型与未自定义编排器继续走 ACP 不受影响。
-- **配置与界面**：`orchestratorPlannerModel`、`orchestratorPlannerEffort`、`orchestratorExecutorModel`、`orchestratorExecutorEffort`（`src/common/types/config.ts` / `config.ts` / `/config` / `/status` / `/agy status` / `OrchestratorSettingsRows.ts`）；Role 下拉排除 `isOrchestratorModel` 本身，模型选「自动」或固定无档位模型时档位下拉仅允许「自动」。
+- **角色白名单（issue #204）**：`agy 1.5.15` 的 `orchestrator-model-roles` 固定为 Planner = `gemini-4-neon` / `gemini-4-carbon` / `gemini-4-argon` / `claude-opus-5-5`，Executor = `gemini-4-hydrogen` / `claude-sonnet-5-5`。`ORCHESTRATOR_ROLE_MODELS` + `isOrchestratorRoleModel()` 是唯一判据，设置页两个下拉分别过滤；`/agy-btw` 下拉不受角色限制（它跑普通聊天模型）。
+- **生效路由**：仅当当前会话模型命中 `isOrchestratorModel()` 且配置了至少一个上级/下级模型时，`resolveEffectiveAgySettings()` 才会生成 payload。若用户没有自己的自由 `agySettings`，`orchestratorSettingsCoveredByAcp()` 判定为「ACP 可覆盖」：`prepareOrchestratorSettingsForAcp()`（`src/features/acp/orchestrator-prep.ts`）先把 payload 合并写入账号 home 的 `settings.json`（原子写、保留无关字段、不可解析则放弃），并返回 payload 作为进程 key 的 `settingsTag`——不同 seats 绝不复用同一 ACP 进程，旧进程跑完由空闲 TTL 收敛；合并失败则返回 null 回退 CLI `-p --settings`，不允许静默丢失设置。用户自定义 `agySettings` 仍走 CLI，避免把一次调用的设置持久化进每个账号。
+- **配置与界面**：`orchestratorPlannerModel`、`orchestratorPlannerEffort`、`orchestratorExecutorModel`、`orchestratorExecutorEffort`（`src/common/types/config.ts` / `config.ts` / `/config` / `/status` / `/agy status` / `OrchestratorSettingsRows.ts`）；模型选「自动」或固定无档位模型时档位下拉仅允许「自动」。
 
 ## 7. 测试锚点
 
-- `test/models.test.ts`：折叠规则、按账号独立 single-flight 并发刷新、`name`/`efforts` 变更广播、`agy models` 未登录兜底输出不误标 `discovered`、`accountHasArgon` 目录优先于折叠 REST 列表。
-- `test/pool.test.ts` / `test/pool-auth.test.ts` / `test/http-contract.test.ts`：切号单次触发不双倍 spawn、429 自动切号广播、OAuth `finishWithCode` 广播、`manualPinAt` 优先于旧会话 `stickyAccount`、`/config` 修改 `defaultEffort`/`enabled` 同步刷新选择器。
+- `test/host/models.test.ts`：折叠规则、按账号独立 single-flight 并发刷新、`name`/`efforts` 变更广播、`agy models` 未登录兜底输出不误标 `discovered`、`accountHasArgon` 目录优先于折叠 REST 列表。
+- `test/domain/pool.test.ts` / `test/host/pool-auth.test.ts` / `test/transport/http-contract-*.test.ts`：切号单次触发不双倍 spawn、429 自动切号广播、OAuth `finishWithCode` 广播、`manualPinAt` 优先于旧会话 `stickyAccount`、`/config` 修改 `defaultEffort`/`enabled` 同步刷新选择器。
 
 ## 模型可见性是允许清单 + 拒绝清单两层（PR #149 / #131）
 
@@ -88,4 +92,4 @@ DSH 前端 `ModelCatalogDirectory.load()` 在首次加载（`status === 'ready'`
 
 - **解析（`resolveModel`）不受可见性过滤**：只有 `listModels`（选择器）过滤。用户取消勾选一个正在被会话使用的模型，该会话必须继续工作——把可见性当成可用性会打断进行中的任务。
 - 作用域：默认按**活跃账号**的配额快照合并（与它显示的 `agy models` 目录同源，避免两个来源互相矛盾）；`poolWideCatalog` 开启时按整池枚举。
-- 锚点：`test/quota-catalog.test.ts`、`test/models-panel.test.ts`、`test/models.test.ts`、`test/config-precedence.test.ts`。
+- 锚点：`test/features/quota/quota-catalog.test.ts`、`test/client/models-panel.test.ts`、`test/host/models.test.ts`、`test/common/config-precedence.test.ts`。

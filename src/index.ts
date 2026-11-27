@@ -16,6 +16,7 @@ import { AUTH_FAST_REVERIFY_MS } from './common/pool-types.ts'
 import { defineAgyAskTool } from './host/ask-tool.ts'
 import { defineAgyImageTool } from './host/image-tool.ts'
 import { agyCommandDefinition, buildAgyCommandDeps } from './host/commands.ts'
+import { agySlashCommandDefinitions } from './host/agy-slash-commands.ts'
 import { btwCommandDefinition } from './host/btw-command.ts'
 import { tslCommandDefinition } from './host/tsl-command.ts'
 import { defineAgyMirrorTool, MIRROR_TOOL_NAME } from './host/mirror-tool.ts'
@@ -23,7 +24,10 @@ import type { ToolExecution, PreToolDecision } from '@deepseek-ai/dsh-tools'
 import { MIN_AGY_VERSION, compareVersions, isolatedHomeEnv } from './host/runner.ts'
 import { agyNotInstalledMessage } from './provider/call-context.ts'
 import { sweepDir } from './host/media.ts'
+import { sweepMediaCache } from './host/media-transcode.ts'
+import { stateDir } from './common/config.ts'
 import { agyMcpConfigPath, registerBridgeMcpConfig, startMcpBridge, teardownBridgeState, type ToolsServiceLike } from './host/mcp-bridge.ts'
+import { observeBridgeAssemblies } from './host/bridge-steps.ts'
 import type { GoalServiceLike } from './host/commands/shared.ts'
 import { runBootHygiene } from './host/boot-hygiene.ts'
 import { scheduleBootMaintenance } from './host/boot-maintenance.ts'
@@ -44,6 +48,8 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
     sessionsSvc, sessionAuto, mediaDir, bridgeState, webServerPort,
   } = services
 
+  observeBridgeAssemblies(ctx, services.bridgeSteps, () => bridgeState.bridge !== null)
+
   // Boot-time pool/store hygiene: stale staging logs, keychains, credential slot.
   runBootHygiene(services)
 
@@ -55,7 +61,7 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
     accounts: () => services.pool.getAccounts(),
     sweepStaging: () => services.pool.sweepStaleStaging(),
     sweepLogs: () => services.pool.sweepOldLogs(getConfig().logRetentionDays),
-    ...(getConfig().syncAccountCustomizations ? { syncEcosystem: () => services.ecosystem?.syncAll() } : {}),
+    ...(getConfig().syncAccountCustomizations ? { syncEcosystem: () => services.ecosystem?.syncAllAsync() } : {}),
     log,
     reapOrphans: getConfig().reapOrphanMcp,
   })
@@ -192,26 +198,42 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
   // settings directory; registering here would put an unconfigured
   // antigravity into the provider-add list and confuse the UI state.
 
-  // ---- /agy, /tsl, and /btw commands ----
-  ctx.commands.register(
-    agyCommandDefinition(
-      buildAgyCommandDeps({
-        services,
-        goals: () => (ctx.get('goals') as GoalServiceLike | undefined) ?? ((ctx as unknown as { goals?: GoalServiceLike }).goals),
-        agents: () => (ctx.get('agents') as { get(id: unknown): unknown } | undefined) ?? ((ctx as unknown as { agents?: { get(id: unknown): unknown } }).agents),
-      }),
-    ),
-  )
+  // ---- /agy, /tsl, /atw, and full a-prefix slash bridge commands ----
+  const agyDeps = buildAgyCommandDeps({
+    services,
+    goals: () => (ctx.get('goals') as GoalServiceLike | undefined) ?? ((ctx as unknown as { goals?: GoalServiceLike }).goals),
+    agents: () => (ctx.get('agents') as { get(id: unknown): unknown } | undefined) ?? ((ctx as unknown as { agents?: { get(id: unknown): unknown } }).agents),
+  })
+  ctx.commands.register(agyCommandDefinition(agyDeps))
+  // Opt-out: the top-level `/a*` shortcuts (`/aplan`, `/agoal`, `/acmd`, …) fill DSH's
+  // slash menu even for users who mostly run other models. `/agy` above always stays.
+  // Read at registration time, so the switch takes effect on the next start.
+  if (getConfig().slashCommandsEnabled !== false) {
+    for (const def of agySlashCommandDefinitions({
+      deps: () => agyDeps,
+      armForcedPlan: services.armForcedPlan,
+      planMode: () => ctx.get('planMode' as never) as { enter?: (agent: unknown) => unknown } | undefined,
+    })) {
+      ctx.commands.register(def)
+    }
+  }
 
-  ctx.commands.register(
-    btwCommandDefinition({
-      btw: () => btw,
-      isWebActive: () => webServerPort.current !== undefined,
-    }),
-  )
+  // Opt-out (issue #201): a user who already runs a dedicated /btw plugin can
+  // turn this one off so the two never compete for a command name. Read at
+  // registration time, so the switch takes effect on the next start.
+  if (getConfig().btwEnabled !== false) {
+    ctx.commands.register(
+      btwCommandDefinition({
+        btw: () => btw,
+        isWebActive: () => webServerPort.current !== undefined,
+      }),
+    )
+  }
 
   // ---- /tsl command (Gemini plain-language translation) ----
-  ctx.commands.register(
+  // Opt-out: only the command entry. Automatic post-turn translation below and the
+  // translate action keep working. Read at registration time (next start).
+  if (getConfig().tslEnabled !== false) ctx.commands.register(
     tslCommandDefinition({
       cfg: getConfig,
       translate: () => translation,
@@ -408,6 +430,7 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
   ctx.effect(() => {
     const timer = setInterval(() => {
       void sweepDir(mediaDir(), getConfig().mediaTtlMs).catch(() => undefined)
+      void sweepMediaCache(join(stateDir(), 'media-cache')).catch(() => undefined)
     }, Math.max(60_000, Math.min(getConfig().mediaTtlMs, 3_600_000)))
     timer.unref?.()
     return () => clearInterval(timer)
@@ -495,22 +518,18 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
           // (URL.pathname would yield /C:/... there and break the spawn).
           const script = fileURLToPath(new URL('./bridge.mjs', import.meta.url))
           const toolsSvc = ctx.get('tools') as ToolsServiceLike | undefined
-          const agents = (): { get(id: unknown): unknown } | undefined => {
-            const svc = ctx.get('agents') as { get(id: unknown): unknown } | undefined
-            return svc ?? (ctx as unknown as { agents?: { get(id: unknown): unknown } }).agents
-          }
           const bridge = await startMcpBridge({
             bridgeScript: script,
             tools: () => (ctx.get('tools') as ToolsServiceLike | undefined),
             allowlist: () => getConfig().mcpToolAllowlist,
-            // Bridged calls run on behalf of the session that spawned agy
-            // (issue #55): resolve its agent so tools that require a caller work.
-            resolveAgent: (sessionId) => agents()?.get(sessionId),
+            scope: () => getConfig().mcpBridgeScope,
+            resolveStep: token => services.bridgeSteps.resolve(token),
             log,
           })
           // A scope can be disposed before asynchronous listener startup ends.
           // Do not publish a capability or registry configs after disposal.
-          if (bridgeDisposed) {
+          const current = getConfig()
+          if (bridgeDisposed || !current.enabled || !current.mcpBridge) {
             await bridge.close()
             return
           }
@@ -554,6 +573,7 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
       pluginDisposing = true
       bridgeDisposed = true
       services.backgroundWakeup.dispose()
+      services.quotaRefresher?.dispose()
       services.translationWorkers?.dispose()
       services.btw.dispose()
       acpPool.dispose()

@@ -173,6 +173,10 @@ export function resolveConfig(
     cloakSystemPrompt: asBool(get('cloakSystemPrompt')) ?? base.cloakSystemPrompt,
     digestMaxChars: asNum(get('digestMaxChars')) ?? base.digestMaxChars,
     contextTransferMaxChars: asNum(get('contextTransferMaxChars')) ?? base.contextTransferMaxChars,
+    contextTransferMaxBytes: asNum(get('contextTransferMaxBytes')) ?? base.contextTransferMaxBytes,
+    contextTransferFileAboveBytes: asNum(get('contextTransferFileAboveBytes')) ?? base.contextTransferFileAboveBytes,
+    promptMaxBytes: asNum(get('promptMaxBytes')) ?? base.promptMaxBytes,
+    contextTransferFileMaxBytes: asNum(get('contextTransferFileMaxBytes')) ?? base.contextTransferFileMaxBytes,
     modelsCacheTtlMs: asNum(get('modelsCacheTtlMs')) ?? base.modelsCacheTtlMs,
     allowAuxiliary: asBool(get('allowAuxiliary')) ?? base.allowAuxiliary,
     compactionMaxChars: asNum(get('compactionMaxChars')) ?? base.compactionMaxChars,
@@ -191,6 +195,8 @@ export function resolveConfig(
     mediaMaxBytes: asNum(get('mediaMaxBytes')) ?? base.mediaMaxBytes,
     mediaMaxImages: asNum(get('mediaMaxImages')) ?? base.mediaMaxImages,
     mcpBridge: asBool(get('mcpBridge')) ?? base.mcpBridge,
+    mcpBridgeScope: [env.DSH_AGY_MCP_BRIDGE_SCOPE, overrides.mcpBridgeScope, e.mcpBridgeScope]
+      .find(value => value === 'all' || value === 'host-only') ?? base.mcpBridgeScope,
     mcpConfigScope: asMcpConfigScope(get('mcpConfigScope')) ?? base.mcpConfigScope,
     mcpConfigPath: asString(get('mcpConfigPath')) ?? base.mcpConfigPath,
     mcpToolAllowlist: asString(get('mcpToolAllowlist')) ?? base.mcpToolAllowlist,
@@ -230,11 +236,15 @@ export function resolveConfig(
     imageMaxBytes: asNum(get('imageMaxBytes')) ?? base.imageMaxBytes,
     imageOutputDir: asString(get('imageOutputDir')) ?? base.imageOutputDir,
     imageRetries: asNum(get('imageRetries')) ?? base.imageRetries,
+    btwEnabled: asBool(get('btwEnabled')) ?? base.btwEnabled,
+    slashCommandsEnabled: asBool(get('slashCommandsEnabled')) ?? base.slashCommandsEnabled,
+    tslEnabled: asBool(get('tslEnabled')) ?? base.tslEnabled,
     btwModel: asString(get('btwModel')) ?? base.btwModel,
     btwEffort: asString(get('btwEffort')) ?? base.btwEffort,
     backgroundWakeup: asBool(get('backgroundWakeup')) ?? base.backgroundWakeup,
     backgroundWakeupTtlMinutes: asNum(get('backgroundWakeupTtlMinutes')) ?? base.backgroundWakeupTtlMinutes,
     backgroundWakeupMaxPerSession: asNum(get('backgroundWakeupMaxPerSession')) ?? base.backgroundWakeupMaxPerSession,
+    builtInMediaPreviewOnly: asBool(get('builtInMediaPreviewOnly')) ?? base.builtInMediaPreviewOnly,
   }
   // Env wins last (spec ADR-13).
   if (env.DSH_AGY_ENABLED !== undefined) cfg.enabled = asBool(env.DSH_AGY_ENABLED) ?? cfg.enabled
@@ -297,6 +307,11 @@ export function resolveConfig(
   if (env.DSH_AGY_CONTEXT_WINDOW) {
     const w = asNum(env.DSH_AGY_CONTEXT_WINDOW)
     if (w !== undefined && w > 0) cfg.contextWindowDefault = Math.floor(w)
+  {
+    const b = asNum(env.DSH_AGY_PROMPT_MAX_BYTES)
+    // Range is enforced where it is used (promptBudgetBytes); junk keeps the current value.
+    if (b !== undefined && Number.isFinite(b)) cfg.promptMaxBytes = Math.floor(b)
+  }
   }
   if (env.DSH_AGY_MAX_TOKENS) {
     const m = asNum(env.DSH_AGY_MAX_TOKENS)
@@ -421,6 +436,9 @@ export function resolveConfig(
     const v = asNum(env.DSH_AGY_IMAGE_RETRIES)
     if (v !== undefined) cfg.imageRetries = v
   }
+  if (env.DSH_AGY_BTW_ENABLED !== undefined) cfg.btwEnabled = asBool(env.DSH_AGY_BTW_ENABLED) ?? cfg.btwEnabled
+  if (env.DSH_AGY_SLASH_COMMANDS_ENABLED !== undefined) cfg.slashCommandsEnabled = asBool(env.DSH_AGY_SLASH_COMMANDS_ENABLED) ?? cfg.slashCommandsEnabled
+  if (env.DSH_AGY_TSL_ENABLED !== undefined) cfg.tslEnabled = asBool(env.DSH_AGY_TSL_ENABLED) ?? cfg.tslEnabled
   if (env.DSH_AGY_BTW_MODEL !== undefined) cfg.btwModel = env.DSH_AGY_BTW_MODEL
   if (env.DSH_AGY_BTW_EFFORT !== undefined) cfg.btwEffort = env.DSH_AGY_BTW_EFFORT
   if (env.DSH_AGY_CLOAK_SYSTEM_PROMPT !== undefined) {
@@ -442,6 +460,10 @@ export function resolveConfig(
   if (env.DSH_AGY_BACKGROUND_WAKEUP_MAX_PER_SESSION) {
     const max = asNum(env.DSH_AGY_BACKGROUND_WAKEUP_MAX_PER_SESSION)
     if (max !== undefined && max > 0) cfg.backgroundWakeupMaxPerSession = Math.min(100, Math.max(1, Math.floor(max)))
+  }
+  if (env.DSH_AGY_BUILTIN_MEDIA_ONLY !== undefined) {
+    const bm = asBool(env.DSH_AGY_BUILTIN_MEDIA_ONLY)
+    if (bm !== undefined) cfg.builtInMediaPreviewOnly = bm
   }
   cfg.backgroundWakeupTtlMinutes = Math.min(240, Math.max(1, Math.floor(cfg.backgroundWakeupTtlMinutes)))
   cfg.backgroundWakeupMaxPerSession = Math.min(100, Math.max(1, Math.floor(cfg.backgroundWakeupMaxPerSession)))

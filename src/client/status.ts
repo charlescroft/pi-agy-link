@@ -7,6 +7,8 @@ import type { AccountPoolData } from '../common/pool-types.ts';
 import type { WarmupStatusSnapshot } from '../common/warmup-types.ts';
 import { base, win, timedSignal, STATUS_TIMEOUT_MS } from './api.ts';
 import { useEffect, useState } from './react.ts';
+import { isScrollActive, onScrollIdle } from './scroll-guard.ts';
+import { setBuiltInMediaPreviewOnly } from './images/media.ts';
 
 /** One model row, shared by the picker, the visibility chips and the dropdowns. */
 export interface CatalogModelView {
@@ -44,6 +46,8 @@ export interface StatusPayload {
 	} | null;
 	backgroundWakeup?: boolean;
 	mcpBridge?: boolean;
+	mcpBridgeScope?: 'all' | 'host-only';
+	bridgeDiagnostic?: import('../common/bridge-tools.ts').BridgeDiagnostic | null;
 	imageTool?: boolean;
 	syncAccountCustomizations?: boolean;
 	workspaceRoot?: string;
@@ -101,10 +105,14 @@ export interface StatusPayload {
 	translateEffort?: string;
 	showHeaderBadge?: boolean;
 	showTranslateAction?: boolean;
+	builtInMediaPreviewOnly?: boolean;
 	poolWideCatalog?: boolean;
 	imageModel?: string;
 	imageEffort?: string;
 	imageOutputDir?: string;
+	btwEnabled?: boolean;
+	slashCommandsEnabled?: boolean;
+	tslEnabled?: boolean;
 	btwModel?: string;
 	btwEffort?: string;
 	bindings?: number;
@@ -139,6 +147,7 @@ function loadInitialStatusCache(): StatusPayload | null {
 
 // Module-level cache for instant remount rendering (preloaded from localStorage for zero-flicker startup)
 let statusCache: StatusPayload | null = loadInitialStatusCache();
+setBuiltInMediaPreviewOnly(statusCache?.builtInMediaPreviewOnly === true);
 let lastEtag: string | null = null;
 let inFlightStatus: Promise<{ kind: 'ok'; data: StatusPayload } | { kind: 'not-modified' } | { kind: 'error' }> | null = null;
 
@@ -204,17 +213,57 @@ export function isUiVisible(
 	return status?.[key] !== false
 }
 
+/**
+ * A poll that lands mid-scroll used to re-render the whole console (every panel,
+ * every quota bar) while the compositor was already repainting a moving
+ * scroller - a visible hitch or flash during the gesture. The snapshot is still
+ * stored immediately (state stays truthful); only the LISTENER notification is
+ * deferred until the scroll settles, then flushed once with the newest payload.
+ */
+let pendingPublish: StatusPayload | null = null;
+
+function notifyListeners(st: StatusPayload): void {
+	for (const fn of [...statusListeners]) {
+		try { fn(st); } catch { /* a dead consumer must not kill the loop */ }
+	}
+}
+
+function flushPendingPublish(): void {
+	const pending = pendingPublish;
+	pendingPublish = null;
+	if (pending !== null) notifyListeners(pending);
+}
+
+/**
+ * `onScrollIdle` keeps a Set, so re-registering the same callback is a no-op.
+ * Binding on every deferred publish (instead of a module flag) keeps working
+ * after a teardown cleared the listeners: the next publish re-subscribes, while
+ * the steady state still holds exactly one listener.
+ */
+function bindSettleFlush(): void {
+	onScrollIdle(flushPendingPublish);
+}
+
 /** Single writer for the shared status snapshot (poll loop, refresh, tests). */
 function publishStatus(st: StatusPayload): void {
 	statusCache = st;
+	setBuiltInMediaPreviewOnly(st.builtInMediaPreviewOnly === true);
 	try {
 		win.localStorage?.setItem(STATUS_CACHE_KEY, JSON.stringify(st));
 	} catch {
 		// Ignore storage quota / parsing errors
 	}
-	for (const fn of [...statusListeners]) {
-		try { fn(st); } catch { /* a dead consumer must not kill the loop */ }
+	if (isScrollActive()) {
+		pendingPublish = st;
+		bindSettleFlush();
+		return;
 	}
+	notifyListeners(st);
+}
+
+/** Synchronous read of the latest shared status snapshot for DOM enhancers. */
+export function getStatusSnapshot(): StatusPayload | null {
+	return statusCache;
 }
 
 /** Publish an externally obtained snapshot to every mounted consumer. */
@@ -290,6 +339,7 @@ export function disposeStatusPolling(): void {
 	visibilityCleanup = null;
 	lastEtag = null;
 	inFlightStatus = null;
+	pendingPublish = null;
 }
 
 /**

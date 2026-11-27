@@ -31,14 +31,20 @@ export function modelFamilyOf(modelId?: string): ModelFamily {
 }
 
 /**
- * True when an account has no dedicated `quotas.argon` row AND the backend's
- * shared `Gemini Models` (`quotas.google`) group description explicitly names
- * Argon as a member (observed on all paid plans since agy 1.5.12/1.5.15).
- * Kept strict on `google.description` so accounts/tests without that explicit
- * group membership keep `argon` unknown rather than borrowing `google`.
+ * True when the backend's shared `Gemini Models` (`quotas.google`) group
+ * description explicitly names Argon as a member (observed on all paid plans
+ * since agy 1.5.12/1.5.15) — i.e. Argon is not a separate plan bucket but one
+ * model family inside the Gemini pool.
+ *
+ * The group's own membership list is authoritative. An accompanying
+ * `quotas.argon` row does NOT prove an independent ledger: since agy 1.5.15 the
+ * backend reports the merged group under both keys, with the argon copy carrying
+ * the same weekly window and no 5h row of its own (2026-11-25: the account card
+ * grew a second, phantom "Argon 0%" bucket from exactly that shape). Accounts
+ * whose Gemini group does not list Argon keep independent ledgers.
  */
 export function argonSharesGoogleGroup(acc?: ManagedAccount | null): boolean {
-  return Boolean(acc && acc.quotas?.argon === undefined && isArgonModel(acc.quotas?.google?.description))
+  return Boolean(acc && isArgonModel(acc.quotas?.google?.description))
 }
 
 /**
@@ -68,6 +74,24 @@ export function effectiveFamilyCooldown(
   if (!direct) return peer
   if (!peer) return direct
   return peer.cooldownUntil > direct.cooldownUntil ? peer : direct
+}
+
+/**
+ * Resolve the pinned account ID for `family`, falling back to the shared-group
+ * peer (`google` <-> `argon`) when that peer names a merged Gemini account.
+ */
+export function resolveFamilyPinnedId(
+  accounts: readonly ManagedAccount[],
+  activeAccountIds: Partial<Record<ModelFamily, string>> | undefined,
+  family: ModelFamily,
+): string | undefined {
+  const direct = activeAccountIds?.[family]
+  if (direct) return direct
+  const peerFam = family === 'argon' ? 'google' : family === 'google' ? 'argon' : undefined
+  const peerId = peerFam ? activeAccountIds?.[peerFam] : undefined
+  if (!peerId) return undefined
+  const peer = accounts.find((a) => a.id === peerId)
+  return peer && argonSharesGoogleGroup(peer) ? peer.id : undefined
 }
 
 export interface ModelQuotaInfo {
@@ -101,6 +125,8 @@ export interface FamilyCooldownState {
   reason: string
   /** Consecutive rate-limit failure count (for exponential/tiered backoff). */
   consecutiveFailures: number
+  /** Timestamp when this cooldown was recorded (detects quota window rollovers). */
+  recordedAt?: number
 }
 
 export interface ManagedAccount {

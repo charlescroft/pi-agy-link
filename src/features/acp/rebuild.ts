@@ -1,3 +1,4 @@
+import { lastHistoryIndex } from '../../provider/history-boundary.ts'
 // Rebuilding a session agy can no longer find.
 //
 // A stale session id must never be silently replaced by an empty one: the new
@@ -7,7 +8,7 @@
 import { resolveModelSlug } from '../../host/models.ts'
 import type { AttemptDeps, AttemptInput } from '../../provider/attempt.ts'
 import { deliverContext } from '../../provider/context-delivery.ts'
-import { buildDigest, wrapLiveRequest } from '../../provider/prompt-text.ts'
+import { buildDigest, utf8Bytes, wrapLiveRequest } from '../../provider/prompt-text.ts'
 import type { AcpProcess } from './client.ts'
 
 /**
@@ -39,14 +40,18 @@ export async function rebuildAcpSession(opts: {
       '原常驻会话已重置（agy 侧已找不到该会话），已自动携历史上下文重建新会话。' +
       '\nThe persistent ACP session was reset; a new one was created with the conversation history carried over.',
   })
-  const digest = buildDigest(input.messages, 0, cfg.contextTransferMaxChars, {
+  const history = input.messages.slice(0, lastHistoryIndex(input.messages) + 1)
+  const digest = buildDigest(history, 0, cfg.contextTransferMaxChars, {
     maxBytes: cfg.contextTransferFileMaxBytes,
     maxLineBytes: 40_000,
     includeTaskLine: false,
   })
   const extraDirs: string[] = []
-  const delivered = digest === '' ? '' : await deliverContext(digest, input.sessionKey, extraDirs, cfg)
-  const prompt = delivered === '' ? input.prompt : wrapLiveRequest(input.prompt) + delivered
+  const liveWrapped = wrapLiveRequest(input.prompt)
+  const delivered = digest === ''
+    ? ''
+    : await deliverContext(digest, input.sessionKey, extraDirs, cfg, { liveRequestBytes: utf8Bytes(liveWrapped) })
+  const prompt = delivered === '' ? input.prompt : liveWrapped + delivered
   let sid = previousSid
   if (extraDirs.length > 0) {
     // The digest was spilled to a file; agy needs that directory in scope.

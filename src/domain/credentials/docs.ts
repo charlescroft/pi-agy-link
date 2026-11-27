@@ -10,6 +10,7 @@ import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tryWriteFileAtomic } from '../../common/atomic-write.ts'
+import { unwrapGoKeyringPayload } from '../../common/go-keyring.ts'
 import type { ManagedAccount } from '../../common/pool-types.ts'
 import { readAccountCredential } from './backup.ts'
 
@@ -35,7 +36,10 @@ export function parseCredentialDoc(raw: string | null | undefined): CredentialDo
   if (!raw) return null
   let parsed: unknown
   try {
-    parsed = JSON.parse(raw)
+    // Issue #203: the Windows desktop app writes the Credential Manager entry
+    // with a `go-keyring-base64:` prefix. Parsing raw text rejected it, so the
+    // external-slot guard never saw the desktop sign-in it was meant to protect.
+    parsed = JSON.parse(unwrapGoKeyringPayload(raw))
   } catch {
     return null
   }
@@ -85,8 +89,12 @@ export function parseCredentialDoc(raw: string | null | undefined): CredentialDo
  */
 export function extractRefreshToken(input: string | null | undefined): string | null {
   if (!input || typeof input !== 'string') return null
-  const trimmed = input.trim()
-  if (!trimmed) return null
+  const trimmedInput = input.trim()
+  if (!trimmedInput) return null
+  // A keyring-wrapped document is JSON once unwrapped; leaving the envelope on
+  // would make the regex miss and the base64 blob be returned as a "token".
+  const trimmed = unwrapGoKeyringPayload(trimmedInput).trim()
+  if (trimmed === '') return null
 
   // 1. Try parsing structured JSON
   if (trimmed.startsWith('{') || trimmed.endsWith('}')) {
@@ -143,6 +151,40 @@ export function sameCredentialGrant(
   const docB = parseCredentialDoc(b)
   if (!docA?.refreshToken || !docB?.refreshToken) return false
   return docA.refreshToken === docB.refreshToken
+}
+
+/**
+ * True when both blobs belong to the same OAuth grant AND carry identical
+ * live access-token state (`accessToken` + `expiryMs`).
+ */
+export function sameCredentialTokenState(
+  a: string | null | undefined,
+  b: string | null | undefined,
+): boolean {
+  if (!sameCredentialGrant(a, b)) return false
+  const docA = parseCredentialDoc(a)
+  const docB = parseCredentialDoc(b)
+  if (!docA?.accessToken || !docB?.accessToken) return false
+  if (docA.accessToken !== docB.accessToken) return false
+  return docA.expiryMs === docB.expiryMs
+}
+
+/**
+ * True when `liveRaw` already holds `targetRaw`'s exact token state OR a
+ * strictly newer expiry for the same OAuth grant, so syncing does not
+ * overwrite a fresher slot with an older mirror (issue #199).
+ */
+export function isSlotAtLeastAsFresh(
+  liveRaw: string | null | undefined,
+  targetRaw: string | null | undefined,
+): boolean {
+  if (sameCredentialTokenState(liveRaw, targetRaw)) return true
+  if (!sameCredentialGrant(liveRaw, targetRaw)) return false
+  const liveDoc = parseCredentialDoc(liveRaw)
+  const targetDoc = parseCredentialDoc(targetRaw)
+  if (!liveDoc?.accessToken || typeof liveDoc.expiryMs !== 'number') return false
+  if (typeof targetDoc?.expiryMs !== 'number') return false
+  return liveDoc.expiryMs > targetDoc.expiryMs
 }
 
 export function readTokenFileRaw(file: string): string | null {

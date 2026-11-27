@@ -3,6 +3,7 @@
 // Moved verbatim out of src/host/adapter.ts so the adapter file stays a thin
 // orchestrator. The adapter re-exports this type, so `import type {
 // AgyAdapterDeps } from '.../adapter.ts'` keeps working for hosts and tests.
+import type { AgyGenerateOptions, BridgeLease } from '../common/protocol.ts'
 import type { BackgroundTurnObserver } from '../common/background-types.ts'
 import type { ManagedAccount } from '../common/pool-types.ts'
 import type { PluginConfig } from '../common/types.ts'
@@ -16,6 +17,7 @@ import type { ImageRefLike } from '../host/media.ts'
 import type { AcpSessionNotice, AttemptDeps, AttemptInput, AttemptSlot } from './attempt.ts'
 
 export interface AgyAdapterDeps {
+  enterBridgeStep?: (options: AgyGenerateOptions) => BridgeLease | undefined
   getConfig: () => PluginConfig
   catalog: ModelCatalog
   store: SessionStore
@@ -23,7 +25,7 @@ export interface AgyAdapterDeps {
   bin: () => string | null
   /** Shared semaphore for cross-session concurrency (ADR-12). */
   acquire: (signal?: AbortSignal) => Promise<() => void>
-  log?: (msg: string) => void
+  log?: (msg: string, level?: 'info' | 'warn') => void
   /**
    * Re-poll pool quotas and the model catalog. Used ONLY as a self-heal when
    * every enabled account is denied purely because the requested model is
@@ -68,6 +70,8 @@ export interface AgyAdapterDeps {
    * signals decide).
    */
   sessionPlanMode?: (sessionId: string) => boolean | undefined
+  /** Consume a one-shot `/aplan` read-only guard armed for the upcoming turn. */
+  consumeForcedPlanMode?: (sessionId: string) => boolean
   /** Resolve the latest selected Antigravity model for this session (honored by compaction when DSH passes stale lastUsed). */
   sessionPendingModel?: (sessionId: string) => string | undefined
   /** Last-run telemetry surfaced by /agy status. Process completion and tool failures are distinct. */

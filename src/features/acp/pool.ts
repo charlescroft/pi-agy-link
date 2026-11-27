@@ -1,4 +1,4 @@
-// Pool of warm persistent `agy acp` processes keyed by account/mode/sandbox/agent.
+import { createHash } from 'node:crypto'
 import type { PermissionMode, PluginConfig } from '../../common/types.ts'
 import { slotGuardStats } from '../../domain/credentials/guards.ts'
 import { AcpProcess, type AcpProcessOptions } from './client.ts'
@@ -142,11 +142,12 @@ export class AcpSessionPool {
     }
   }
 
-  private keyFor(opts: { accountId?: string; mode: PermissionMode; sandbox: boolean; agent: string }): string {
-    return `${opts.accountId || 'primary'}|${opts.mode}|${opts.sandbox ? '1' : '0'}|${opts.agent}`
+  private keyFor(opts: { env?: NodeJS.ProcessEnv; accountId?: string; mode: PermissionMode; sandbox: boolean; agent: string; settingsTag?: string }): string {
+    const scope = opts.env?.DSH_MCP_ROUTE
+    const base = `${opts.accountId || 'primary'}|${opts.mode}|${opts.sandbox ? '1' : '0'}|${opts.agent}|${opts.settingsTag ?? ''}`
+    return scope ? base + '|scope:' + createHash('sha256').update(scope).digest('hex') : base
   }
 
-  /** Grace window for draining: the same budget background tasks get to finish. */
   private drainBudgetMs(): number {
     let minutes = 0
     try {
@@ -191,6 +192,7 @@ export class AcpSessionPool {
     mode: PermissionMode
     sandbox: boolean
     agent: string
+    addDirs?: readonly string[]
     preemptAutoUpdate?: boolean
     /** Account this process must authenticate as (gate 2 identity check). */
     expectedEmail?: string
@@ -198,6 +200,7 @@ export class AcpSessionPool {
     expectedIsolated?: boolean
     /** True when this process depends on the shared Windows Credential Manager slot (legacy agy < 1.5). */
     usesSharedSlot?: boolean
+    settingsTag?: string // different startup settings must not reuse this process
   }): AcpProcess {
     if (process.platform === 'win32' && req.usesSharedSlot === true) {
       this.evictOtherAccounts(req.accountId)
@@ -233,6 +236,7 @@ export class AcpSessionPool {
       permissionMode: req.mode,
       sandbox: req.sandbox,
       ...(req.agent ? { agent: req.agent } : {}),
+      ...(req.addDirs && req.addDirs.length > 0 ? { addDirs: req.addDirs } : {}),
       ...(req.preemptAutoUpdate !== undefined ? { preemptAutoUpdate: req.preemptAutoUpdate } : {}),
       ...(req.expectedEmail ? { expectedEmail: req.expectedEmail } : {}),
       ...(req.expectedIsolated === true ? { expectedIsolated: true } : {}),
@@ -258,7 +262,7 @@ export class AcpSessionPool {
     let oldestAny: string | null = null
     let oldestAnyAt = Infinity
     for (const [k, p] of this.procs) {
-      if (p.isBusy) continue // mid-turn, never a victim
+      if (k.includes('|scope:') || p.isBusy) continue // Preserve session-bound bridge routes and in-flight turns.
       if (p.lastUsedAt < oldestAnyAt) {
         oldestAnyAt = p.lastUsedAt
         oldestAny = k
@@ -272,8 +276,7 @@ export class AcpSessionPool {
   }
 
   /**
-   * Close a process, giving it a short window to flush before the tree is
-   * killed. `force` skips the window (a process we no longer trust).
+   * Close a process, optionally skipping the flush window.
    */
   private closeProc(proc: AcpProcess, force: boolean): void {
     if (force || !proc.isAlive()) {
@@ -309,6 +312,7 @@ export class AcpSessionPool {
     mode: PermissionMode
     sandbox: boolean
     agent: string
+    addDirs?: readonly string[]
     preemptAutoUpdate?: boolean
     expectedEmail?: string
     usesSharedSlot?: boolean
@@ -512,15 +516,7 @@ export class AcpSessionPool {
     return { strays: observed, reaped: kill ? result.strays.length : 0 }
   }
 
-  /**
-   * Strays seen by the last sweep, refreshed at a badge-poll-friendly rate.
-   *
-   * Reads are side-effect free WHILE the pool owns a process. With an empty pool
-   * the scan is authoritative — no live or draining session can own an `agy acp`
-   * child of this host — so it may reap: an idle stray keeps polling Google with
-   * a credential it no longer has, which is exactly the shape risk control
-   * watches for, and the 60s sweep timer is stopped while the pool is empty.
-   */
+  /** Strays seen by the last sweep; read-only while pool owns processes. */
   private observeStrays(now: number): readonly number[] {
     if (this.strays === null) return []
     if (this.strayScanAt !== 0 && now - this.strayScanAt < STRAY_SCAN_OBSERVE_MS) return this.strayObserved
@@ -587,13 +583,16 @@ export class AcpSessionPool {
     reapedStrays: number
     slotOverwriteDetectedCount: number
     lastSlotRecoveryAt: number | null
+    availableCommands?: readonly import('./protocol.ts').AvailableCommand[]
   } {
     let sessions = 0
     const keys: string[] = []
+    const cmdMap = new Map<string, import('./protocol.ts').AvailableCommand>()
     for (const [k, p] of this.procs) {
       if (!p.isAlive()) continue
       sessions += p.sessionCount
       keys.push(k)
+      for (const c of p.advertisedCommands ?? []) cmdMap.set(c.name, c)
     }
     const drainingKeys = [...this.draining.values()].map((e) => e.key)
     const strayPids = this.observeStrays(Date.now())
@@ -611,6 +610,7 @@ export class AcpSessionPool {
       reapedStrays: this.reapedStrays,
       slotOverwriteDetectedCount: Math.max(this.slotOverwriteDetectedCount, guards.overwriteDetected),
       lastSlotRecoveryAt: Math.max(this.lastSlotRecoveryAt ?? 0, guards.lastRecoveryAt ?? 0) || null,
+      availableCommands: [...cmdMap.values()],
     }
   }
 

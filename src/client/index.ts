@@ -11,15 +11,18 @@ import { installAgyToolView } from './toolview.ts';
 import { installMermaidRendering } from './mermaid.ts';
 import { installAutoExpandReasoning } from './reasoning.ts';
 import { installImageEnhancer, setClientContext } from './images.ts';
+import { installSidebarMediaPreviews } from './images/sidebar-preview.ts';
 import { installAgentEmbedRenderer } from './embed.ts';
 import { installDecisionChips } from './decisions.ts';
 import { installTranslationUi } from './translate.ts';
 import { installAcpCards } from './acp-notice.ts';
 import { installBtwUi } from './btw.ts';
+import { installAgySlashUi } from './slash-commands.ts';
 import { installCompactionCard } from './compaction.ts';
 import { ensureScrollListener, disposeScrollListener, setOverlaySuspended } from './scroll-guard.ts';
 import { installSettingsNavIcon } from './icons.ts';
 import { disposeStatusPolling, ensureStatusPolling } from './status.ts';
+import { h } from './react.ts';
 import { injectGlobalStyles } from './styles.ts';
 import { agyModalStore } from './ui/Modal.ts';
 import { createSettingsSection } from './sections/SettingsSection.ts';
@@ -152,7 +155,7 @@ export function apply(ctx: ClientContext): void {
 			(ownerProps?: unknown) => {
 				const view = (ownerProps as { view?: string } | undefined)?.view;
 				if (view === 'summary') return null;
-				return AgySettingsSection({ isModal: false });
+				return h(AgySettingsSection, { isModal: false });
 			},
 		);
 		return dispose;
@@ -166,7 +169,7 @@ export function apply(ctx: ClientContext): void {
 			(ownerProps?: unknown) => {
 				const view = (ownerProps as { view?: string } | undefined)?.view;
 				if (view === 'summary') return null;
-				return AgySettingsSection({ isModal: false });
+				return h(AgySettingsSection, { isModal: false });
 			},
 		);
 		return dispose;
@@ -245,7 +248,14 @@ export function apply(ctx: ClientContext): void {
 			} catch (e) {
 				console.warn('[dsh-agy-link] btw UI unavailable:', e);
 			}
+			let disposeSlash = () => {};
+			try {
+				disposeSlash = installAgySlashUi(ctx as never, NS);
+			} catch (e) {
+				console.warn('[dsh-agy-link] slash UI unavailable:', e);
+			}
 			return () => {
+				disposeSlash();
 				disposeBtw();
 				disposeAcp();
 				dispose();
@@ -255,6 +265,9 @@ export function apply(ctx: ClientContext): void {
 			return () => {};
 		}
 	});
+
+	// Native DSH right-sidebar media previewers (video, audio, TIFF/HEIC).
+	ctx.effect(() => installSidebarMediaPreviews(ctx as never), 'agy-link: sidebar media previews');
 
 	// Custom Antigravity brand icon inside Settings dialog nav list
 	ctx.effect(() => installSettingsNavIcon(ctx, () => locale.bind(NS)('section.label')));

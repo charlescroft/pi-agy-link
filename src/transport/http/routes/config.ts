@@ -31,6 +31,9 @@ function validateConfigValue(key: string, value: unknown): string | null {
       ? null
       : 'permissionMode must be skip, auto, plan, or accept-edits'
   }
+  if (key === 'mcpBridgeScope') {
+    return value === 'all' || value === 'host-only' ? null : 'mcpBridgeScope must be all or host-only'
+  }
   if (key === 'transport') {
     return typeof value === 'string' && TRANSPORTS.has(value)
       ? null
@@ -41,7 +44,7 @@ function validateConfigValue(key: string, value: unknown): string | null {
       ? null
       : 'translateDisplay must be card or replace'
   }
-  if (key === 'sandbox' || key === 'imageTool' || key === 'syncAccountCustomizations' || key === 'backgroundWakeup' || key === 'mcpBridge' || key === 'cloakSystemPrompt' || key === 'respectExternalSignIn' || key === 'auxNeutralWorkspace') {
+  if (key === 'sandbox' || key === 'imageTool' || key === 'syncAccountCustomizations' || key === 'backgroundWakeup' || key === 'mcpBridge' || key === 'btwEnabled' || key === 'slashCommandsEnabled' || key === 'tslEnabled' || key === 'cloakSystemPrompt' || key === 'respectExternalSignIn' || key === 'auxNeutralWorkspace' || key === 'builtInMediaPreviewOnly') {
     return typeof value === 'boolean' ? null : `${key} must be a boolean`
   }
   if (key === 'warmupWindows') {
@@ -87,6 +90,11 @@ function validateConfigValue(key: string, value: unknown): string | null {
       ? null
       : 'quotaPollIntervalMs must be a number of milliseconds >= 60000'
   }
+  if (key === 'promptMaxBytes') {
+    return typeof value === 'number' && Number.isInteger(value) && value >= 16_000 && value <= 192_000
+      ? null
+      : 'promptMaxBytes must be a whole number of bytes between 16000 and 192000'
+  }
   if (key === 'agySettings') {
     if (typeof value !== 'string') return 'agySettings must be a string'
     const trimmed = value.trim()
@@ -115,7 +123,7 @@ function handleConfig(services: HostServices, req: unknown, res: unknown): void 
         const body = await readBody(req)
         const key = typeof body.key === 'string' ? body.key : ''
         const allowed = [
-          'enabled', 'permissionMode', 'sandbox', 'agent', 'agySettings', 'transport', 'imageTool', 'syncAccountCustomizations', 'backgroundWakeup', 'mcpBridge',
+          'enabled', 'permissionMode', 'sandbox', 'agent', 'agySettings', 'transport', 'imageTool', 'syncAccountCustomizations', 'backgroundWakeup', 'mcpBridge', 'mcpBridgeScope', 'btwEnabled', 'slashCommandsEnabled', 'tslEnabled',
           'cloakSystemPrompt', 'respectExternalSignIn', 'auxNeutralWorkspace',
           'defaultModel', 'defaultEffort',
           'orchestratorPlannerModel', 'orchestratorPlannerEffort', 'orchestratorExecutorModel', 'orchestratorExecutorEffort',
@@ -126,7 +134,7 @@ function handleConfig(services: HostServices, req: unknown, res: unknown): void 
           'btwModel', 'btwEffort',
           'showHeaderBadge', 'showTranslateAction', 'poolWideCatalog', 'selectedModels',
           'autoCompactOverride', 'modelApiMaxRetries', 'slimPromptRules', 'proxyUrl', 'disableTelemetry',
-          'quotaPollIntervalMs',
+          'quotaPollIntervalMs', 'promptMaxBytes', 'builtInMediaPreviewOnly',
         ]
         if (!allowed.includes(key)) {
           sendJson(res as RawRes, 400, { error: 'key not settable' })

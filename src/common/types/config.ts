@@ -147,6 +147,15 @@ export interface PluginConfig {
    * the only way a long history can use the model's real (1M-token) window.
    */
   contextTransferFileAboveBytes: number
+  /**
+   * Byte budget the plugin keeps for one prompt (default 150,000; agy's own
+   * ceiling is ~192,000 and its system prompt, tool schemas and skills count
+   * against it too — about 27 KB in the installation that reported issue #223,
+   * which is why the default leaves 42 KB of room). Lower it further when agy
+   * still truncates a request that is inside the default budget. Range
+   * 16,000–192,000; other values fall back to the default.
+   */
+  promptMaxBytes: number
   /** Byte cap for the file-backed digest (not bounded by agy's message cap). */
   contextTransferFileMaxBytes: number
   modelsCacheTtlMs: number
@@ -182,6 +191,7 @@ export interface PluginConfig {
   mediaMaxImages: number
   /** Experimental: expose DSH tools to agy over a local MCP bridge. */
   mcpBridge: boolean
+  mcpBridgeScope: 'all' | 'host-only'
   /** Where the bridge publishes its MCP entry. `agy` 1.4+ only reads the global registry. */
   mcpConfigScope: 'global' | 'workspace' | 'both'
   /** Absolute override for the agy MCP registry file. Empty = <agy home>/.gemini/config/mcp_config.json */
@@ -320,9 +330,18 @@ export interface PluginConfig {
   imageRetries: number
   // ---- `/btw` side questions ----
   /** Model used for `/btw` side questions (`''` = auto: `defaultModel` → Gemini 4 Hydrogen → Gemini Flash). */
+  /** Register the `/agy-btw` side-question command at all (default true). Off needs a restart. */
+  btwEnabled: boolean
   btwModel: string
   /** Reasoning effort for `/btw` side questions (default `'medium'` for balanced quality and speed). */
   btwEffort: string
+  // ---- `/a*` shortcut commands ----
+  /** Register the top-level `/a*` shortcut family (`/aplan`, `/agoal`, `/acmd`, …) at all (default true).
+   *  `/agy` itself always stays. Off needs a restart. */
+  slashCommandsEnabled: boolean
+  /** Register the `/tsl` plain-language translation command (default true). Automatic and
+   *  button-triggered translation keep working without it. Off needs a restart. */
+  tslEnabled: boolean
   /**
    * Wake idle DSH sessions across turns when an agy `schedule` timer,
    * detached background task/subagent, or persistent ACP update finishes
@@ -338,6 +357,12 @@ export interface PluginConfig {
   backgroundWakeupTtlMinutes: number
   /** Max automatic background wakeups per session between real human turns (default 12). */
   backgroundWakeupMaxPerSession: number
+  /**
+   * Always preview local media inside DSH (right sidebar / lightbox) and hide
+   * host OS "Open"/"Reveal" actions even on desktop/localhost. Remote browsers
+   * (e.g. Cloudflare Tunnel) automatically enforce this regardless of the flag.
+   */
+  builtInMediaPreviewOnly: boolean
 }
 
 // The offline/signed-out lineup lives in `common/model-lineup.ts` — the single
@@ -417,7 +442,8 @@ export function defaultConfig(): PluginConfig {
     digestMaxChars: 8_000,
     contextTransferMaxChars: 660_000,
     contextTransferMaxBytes: 150_000,
-    contextTransferFileAboveBytes: 55_000,
+    contextTransferFileAboveBytes: 150_000,
+    promptMaxBytes: 150_000,
     contextTransferFileMaxBytes: 2_000_000,
     modelsCacheTtlMs: 300_000,
     allowAuxiliary: true,
@@ -433,6 +459,7 @@ export function defaultConfig(): PluginConfig {
     mediaMaxBytes: 10 * 1024 * 1024,
     mediaMaxImages: 8,
     mcpBridge: false,
+    mcpBridgeScope: 'all',
     mcpConfigScope: 'global',
     mcpConfigPath: '',
     mcpToolAllowlist: '',
@@ -483,10 +510,14 @@ export function defaultConfig(): PluginConfig {
     imageMaxBytes: 20 * 1024 * 1024,
     imageOutputDir: '',
     imageRetries: 1,
+    btwEnabled: true,
     btwModel: '',
     btwEffort: 'medium',
+    slashCommandsEnabled: true,
+    tslEnabled: true,
     backgroundWakeup: false,
     backgroundWakeupTtlMinutes: 30,
     backgroundWakeupMaxPerSession: 12,
+    builtInMediaPreviewOnly: false,
   }
 }

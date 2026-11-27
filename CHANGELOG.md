@@ -1,5 +1,33 @@
 # Changelog
 
+## 1.6.0 (2026-11-25)
+
+### English
+
+- **Sync upstream `dsh-agy-link` (`v0.6.83` → `v0.6.105`)**:
+  - **Real Tool Card Output (`v0.6.105`)**: `agy_tool` mirror now echoes real tool output instead of status envelopes (`mirror/definition.ts`, `mirror/result-recovery.ts`).
+  - **ACP Early Binding & Background Visibility (`v0.6.104`)**: Persist ACP session binding on first output and surface background-task wait state.
+  - **Strict Single-Account Lock & Cooldown Reconciliation (`v0.6.98`, `v0.6.104`)**: Enforce strict single-account-per-family lock (dropping narrow-account splitting), reconcile model/family cooldowns on quota refresh and warmup, and clear stale same-family bindings on model switch.
+  - **Prompt Byte Budget & Hybrid Handover (`v0.6.88`, `v0.6.100`–`v0.6.103`)**: 150KB inline-first hybrid context transfer and configurable `promptMaxBytes` (default `150,000` bytes) to prevent silent truncation of oversized prompts by `agy` (issue #223).
+  - **Lineup, Credentials, Orchestrator & Boot Perf (`v0.6.85`–`v0.6.104`)**: Refreshed offline model lineup to `agy 1.5.18`; fixed ACP Orchestrator settings forwarding (#205), keyring slot unwrapping (#203), unterminated file link buffering across chunks (#202), deferred quota refresh while busy (#199), scoped reverse MCP bridge routing, and async boot maintenance with ecosystem sync skip-list.
+- **New API (`src/pi/index.ts`)**:
+  - Added `/agy prompt-max-bytes <bytes|150k|1m|default|0>` (alias `/agy prompt-budget`) and exposed `settings.promptMaxBytes` in `agy-link-state`.
+- **Preserved Pi-Specific Fixes**:
+  - Retained process-wide `AcpSessionPool` registry (`src/features/acp/pool.ts`), GUI `node` PATH injection (`src/features/acp/spawn.ts`), local config extensions, and minified zero-dependency npm packaging.
+
+### 中文
+
+- **跟进上游 `dsh-agy-link`（`v0.6.83` → `v0.6.105`）**：
+  - **工具卡真实输出（`v0.6.105`）**：`agy_tool` 镜像改为回显真实工具输出而非状态壳（`mirror/definition.ts`、`mirror/result-recovery.ts`）。
+  - **ACP 首包绑定与后台等待态（`v0.6.104`）**：ACP 收到首包输出即持久化会话绑定，并透出后台任务等待状态。
+  - **严格同家族单账号锁与冷却对账（`v0.6.98`、`v0.6.104`）**：同家族严格锁定单账号（移除 narrow-account 拆分），配额刷新与 warmup 时自动对账清理冷却，切换同家族模型时清理陈旧会话绑定。
+  - **Prompt 字节预算与混合交接（`v0.6.88`、`v0.6.100`–`v0.6.103`）**：150KB inline-first 混合上下文交接与可配置 `promptMaxBytes`（默认 `150,000` 字节），防止超大 prompt 被 `agy` 静默截断（issue #223）。
+  - **模型阵容、凭证、Orchestrator 与启动性能（`v0.6.85`–`v0.6.104`）**：离线模型阵容更新至 `agy 1.5.18`；修复 ACP Orchestrator 配置传递（#205）、keyring 解包（#203）、跨 chunk 未闭合文件链接缓冲（#202）、忙碌时延迟配额刷新（#199）、MCP 反向桥接隔离路由及异步启动维护。
+- **新增接口（`src/pi/index.ts`）**：
+  - 新增 `/agy prompt-max-bytes <bytes|150k|1m|default|0>`（别名 `/agy prompt-budget`），并在 `agy-link-state` 中暴露 `settings.promptMaxBytes`。
+- **保留 Pi 端专项修复**：
+  - 完整保留同进程 `AcpSessionPool` 共享注册表（`src/features/acp/pool.ts`）、GUI 启动 `node` PATH 注入（`src/features/acp/spawn.ts`）、本地扩展配置及精简零依赖 npm 打包配置。
+
 ## 1.5.1 (2026-11-25)
 
 ### English

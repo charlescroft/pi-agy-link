@@ -57,7 +57,8 @@ export class PoolAdmin {
   private canSyncSharedPeer(data: AccountPoolData, acc: ManagedAccount | undefined, fam: ModelFamily): ModelFamily | undefined {
     const peer = sharedArgonPeerFamily(acc, fam)
     if (!peer) return undefined
-    return peer === 'argon' && data.activeAccountIds?.argon && this.account(data.activeAccountIds.argon)?.quotas?.argon ? undefined : peer
+    const cur = peer === 'argon' && data.activeAccountIds?.argon ? this.account(data.activeAccountIds.argon) : undefined
+    return cur && cur.quotas?.argon !== undefined && !argonSharesGoogleGroup(cur) ? undefined : peer
   }
 
   /**
@@ -459,7 +460,7 @@ export class PoolAdmin {
       const sharedArgon = argonSharesGoogleGroup(acc)
       if (targetFamily) {
         delete acc.cooldowns[targetFamily]
-        if (targetFamily === 'google' && !acc.quotas?.argon) delete acc.cooldowns.argon
+        if (targetFamily === 'google' && (sharedArgon || !acc.quotas?.argon)) delete acc.cooldowns.argon
         if (targetFamily === 'argon' && includeQuotaBench && sharedArgon) delete acc.cooldowns.google
       } else {
         acc.cooldowns = {}
@@ -467,7 +468,7 @@ export class PoolAdmin {
       acc.modelCooldowns = {} // same user action: release paused model buckets too
       if (!includeQuotaBench) return
       const families: ModelFamily[] = targetFamily
-        ? ((targetFamily === 'google' && !acc.quotas?.argon) || (targetFamily === 'argon' && sharedArgon) ? ['google', 'argon'] : [targetFamily])
+        ? ((targetFamily === 'google' && (sharedArgon || !acc.quotas?.argon)) || (targetFamily === 'argon' && sharedArgon) ? ['google', 'argon'] : [targetFamily])
         : [...new Set([...(Object.keys(acc.quotas ?? {}) as ModelFamily[]), ...(sharedArgon ? (['argon'] as ModelFamily[]) : [])])]
       if (families.length === 0) return
       acc.quotaGateClearedAt ??= {}
@@ -509,9 +510,10 @@ export class PoolAdmin {
     const acc = this.account(id)
     if (!acc) return
     acc.cooldowns ??= {}
+    const now = Date.now()
     const prev = effectiveFamilyCooldown(acc, family)
     const failures = (prev?.consecutiveFailures ?? 0) + 1
-    const entry = { cooldownUntil: cooldownUntilFor(data, failures, reason, serverResetTime), reason, consecutiveFailures: failures }
+    const entry = { cooldownUntil: cooldownUntilFor(data, failures, reason, serverResetTime, now), reason, consecutiveFailures: failures, recordedAt: now }
     acc.cooldowns[family] = entry
     const peer = sharedArgonPeerFamily(acc, family)
     if (peer) acc.cooldowns[peer] = { ...entry }
@@ -557,22 +559,16 @@ export class PoolAdmin {
     if (!data.activeAccountIds) data.activeAccountIds = {}
     data.activeAccountIds[family] = next.id
     const peer = this.canSyncSharedPeer(data, next, family)
-    if (peer && (data.activeAccountIds[peer] === fromId || data.activeAccountIds[peer] === undefined) && isAccountEligible(next, peer, now, this.deps.pool)) {
-      data.activeAccountIds[peer] = next.id
-    }
-    if (family === 'google' || (peer === 'google' && data.activeAccountIds.google === next.id) || !data.lastActiveAccountId) {
-      data.lastActiveAccountId = next.id
-    }
+    const peerCur = peer ? data.activeAccountIds[peer] : undefined
+    const peerAcc = peerCur ? this.account(peerCur) : undefined
+    const canSyncPeer = peerCur === fromId || peerCur === undefined || !peerAcc || argonSharesGoogleGroup(peerAcc) || peer === 'argon'
+    if (peer && canSyncPeer && isAccountEligible(next, peer, now, this.deps.pool)) data.activeAccountIds[peer] = next.id
+    if (family === 'google' || (peer === 'google' && data.activeAccountIds.google === next.id) || !data.lastActiveAccountId) data.lastActiveAccountId = next.id
     this.deps.persist()
     return next.id
   }
 
-  /**
-   * Returns the currently active and healthy account ID for `family`.
-   * Checks this family's active pointer first; only checks `lastActiveAccountId`
-   * when this family has no pointer yet, otherwise selects the next eligible
-   * candidate strictly within `family`.
-   */
+  /** Returns the active healthy account ID for `family` (checks family pin, then google fallback, else selects). */
   getActiveAccountId(family: ModelFamily = 'google', model?: string): string | undefined {
     const data = this.deps.getData()
     const now = Date.now()

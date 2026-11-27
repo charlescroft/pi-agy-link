@@ -24,6 +24,19 @@ function selectableModels(
   return sanitizeCatalogEntries(mergeCatalogWithQuotaModels(sanitizeCatalogEntries(supportedModels).entries, quota)).entries
 }
 
+/** UI display & command opt-out flags mirrored from config into the status payload. */
+function uiAndCommandFlags(cfg: ReturnType<HostServices['getConfig']>) {
+  return {
+    showHeaderBadge: cfg.showHeaderBadge,
+    showTranslateAction: cfg.showTranslateAction,
+    builtInMediaPreviewOnly: cfg.builtInMediaPreviewOnly,
+    poolWideCatalog: cfg.poolWideCatalog,
+    btwEnabled: cfg.btwEnabled,
+    slashCommandsEnabled: cfg.slashCommandsEnabled,
+    tslEnabled: cfg.tslEnabled,
+  }
+}
+
 function handleStatus(services: HostServices, req: unknown, res: unknown): void {
   const { getConfig, bin, store, pool, quota, warmup, catalog, auth, poolAuth, adapter, acpPool, backgroundWakeup, translation, lastRun } = services
   const { version: versionCache, dormantReason } = services.status
@@ -68,6 +81,10 @@ function handleStatus(services: HostServices, req: unknown, res: unknown): void 
             }
           }
         }
+        const rawAcpStatus = typeof acpPool?.status === 'function' ? acpPool.status() : null
+        const acpStatus = rawAcpStatus && typeof rawAcpStatus === 'object' && 'availableCommands' in rawAcpStatus
+          ? (({ availableCommands: _omit, ...rest }) => rest)(rawAcpStatus as Record<string, unknown>)
+          : rawAcpStatus
         sendJsonWithEtag(req, res as RawRes, 200, {
           plugin: 'dsh-agy-link',
           bin: bin(),
@@ -79,9 +96,11 @@ function handleStatus(services: HostServices, req: unknown, res: unknown): void 
           agent: cfg.agent,
           agySettings: cfg.agySettings,
           transport: cfg.transport,
-          acpStatus: typeof acpPool?.status === 'function' ? acpPool.status() : null,
+          acpStatus,
           backgroundWakeup: cfg.backgroundWakeup,
           mcpBridge: cfg.mcpBridge,
+          mcpBridgeScope: cfg.mcpBridgeScope,
+          bridgeDiagnostic: adapter.bridgeDiagnostic ?? null,
           backgroundWakeupTtlMinutes: cfg.backgroundWakeupTtlMinutes,
           backgroundWakeupMaxPerSession: cfg.backgroundWakeupMaxPerSession,
           backgroundWakeState: typeof backgroundWakeup?.status === 'function' ? backgroundWakeup.status() : null,
@@ -125,9 +144,7 @@ function handleStatus(services: HostServices, req: unknown, res: unknown): void 
           translateModel: cfg.translateModel,
           translateEffort: cfg.translateEffort,
           translateTargetLanguage: cfg.translateTargetLanguage,
-          showHeaderBadge: cfg.showHeaderBadge,
-          showTranslateAction: cfg.showTranslateAction,
-          poolWideCatalog: cfg.poolWideCatalog,
+          ...uiAndCommandFlags(cfg),
           imageModel: cfg.imageModel,
           imageEffort: cfg.imageEffort,
           imageOutputDir: cfg.imageOutputDir,

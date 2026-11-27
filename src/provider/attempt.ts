@@ -38,14 +38,15 @@ import type { SpawnLimiter } from './spawn-limiter.ts'
 import { readFileSync } from 'node:fs'
 import { buildOrchestratorSettingsObject, isOrchestratorModel, mergeOrchestratorIntoAgySettings } from '../common/orchestrator.ts'
 import { resolveModelSlug } from '../host/models.ts'
-import type { RunTelemetry } from './finalize.ts'
+import { warnWatermarkDrop, type RunTelemetry } from './finalize.ts'
 import { SubagentTracker } from '../features/subagent/tracker.ts'
 import {
   createLiveQuotaController,
   reportDirectToolQuota,
   type LiveQuotaFailoverState,
 } from './quota-failover.ts'
-import { AGY_PROMPT_SAFE_BYTES, trimToUtf8Bytes, utf8Bytes } from './prompt-text.ts'
+import { trimToUtf8Bytes, utf8Bytes } from './prompt-text.ts'
+import { promptBudgetBytes } from './prompt-budget.ts'
 
 export function brief(s: string): string {
   const flat = s.trim().replace(/\s+/g, ' ')
@@ -122,6 +123,7 @@ export interface AcpSessionNotice {
 
 /** Everything one attempt needs. Values are produced by streamAttempt. */
 export interface AttemptInput {
+  bridgeRoute?: string
   cfg: PluginConfig
   bin: string
   permissionMode: PluginConfig['permissionMode']
@@ -243,9 +245,10 @@ export function buildSpawnArgs(
   log: ((msg: string) => void) | undefined,
 ): SpawnPlan {
   let prompt = stripNulBytes(input.prompt)
-  if (utf8Bytes(prompt) > AGY_PROMPT_SAFE_BYTES) {
-    log?.('prompt is ' + utf8Bytes(prompt) + ' B (> agy single-message budget) — trimming the tail')
-    prompt = trimToUtf8Bytes(prompt, AGY_PROMPT_SAFE_BYTES)
+  const budget = promptBudgetBytes(input.cfg)
+  if (utf8Bytes(prompt) > budget) {
+    log?.('prompt is ' + utf8Bytes(prompt) + ' B (> prompt budget ' + budget + ' B) — trimming the tail')
+    prompt = trimToUtf8Bytes(prompt, budget)
   }
   const activeModelForArgs = input.activeModel === '' ? input.cfg.defaultModel : input.activeModel
   const conversationId = input.persistBinding && input.binding !== undefined ? input.binding.conversationId : undefined
@@ -296,6 +299,26 @@ export function resolveEffectiveAgySettings(
   )
 }
 
+/**
+ * True when the ONLY reason `resolveEffectiveAgySettings` returns a value is
+ * the Orchestrator planner/executor payload — i.e. the user has no free-form
+ * `agySettings` of their own (issue #204).
+ *
+ * ACP has no `--settings` flag but reads `settings.json` at startup, and the
+ * flag accepts exactly the same "settings.json keys". So an orchestrator-only
+ * payload is covered by writing that file, and routing does not need to force
+ * the batch CLI. A user's own agySettings stay on the CLI path: persisting them
+ * into every account's settings.json would silently outlive one call.
+ */
+export function orchestratorSettingsCoveredByAcp(
+  input: Pick<AttemptInput, 'activeModel' | 'agySettings' | 'cfg'>,
+): boolean {
+  if ((input.agySettings ?? input.cfg.agySettings).trim() !== '') return false
+  const activeModel = input.activeModel === '' ? input.cfg.defaultModel : input.activeModel
+  if (!isOrchestratorModel(resolveModelSlug(activeModel))) return false
+  return buildOrchestratorSettingsObject(input.cfg) !== undefined
+}
+
 export interface AttemptRecorder {
   rec: RunRecording
   parser: StreamJsonParser
@@ -317,6 +340,20 @@ export interface AttemptRecorder {
   conversationId: () => string | null
 }
 
+function resolveFallbackConversationId(
+  before: DirSnapshot,
+  conversationsDir: string,
+  log: ((msg: string) => void) | undefined,
+  logged: { done: boolean },
+): string | null {
+  const outcome = diffConversations(before, conversationsDir)
+  if (outcome.ambiguous && !logged.done) {
+    logged.done = true
+    log?.(`[discovery] multiple new conversation dbs detected; picked newest ${outcome.conversationId ?? 'none'}`)
+  }
+  return outcome.conversationId
+}
+
 /** Create the recording, parser, HOME snapshot and tool watchdog for one run. */
 export function createAttemptRecorder(
   deps: AttemptDeps,
@@ -329,6 +366,8 @@ export function createAttemptRecorder(
 ): AttemptRecorder {
   const rec = deps.runs.create()
   rec.accountHome = account && account.dir ? account.dir : undefined
+  rec.accountId = account?.id
+  rec.family = quotaCtx?.family
   const conversationsDir = conversationsDirFor(rec.accountHome)
   const before = snapshotConversations(conversationsDir)
   const parser = new StreamJsonParser()
@@ -360,6 +399,7 @@ export function createAttemptRecorder(
         noteActivity: () => watchdog.markEvent(),
       })
     : undefined
+  const loggedAmbiguousCid = { done: false }
   const state: AttemptRecorder = {
     rec,
     parser,
@@ -430,7 +470,7 @@ export function createAttemptRecorder(
     },
     quotaFailover: () => quotaCtrl?.failoverState() ?? null,
     cooledInLiveFamilies: () => quotaCtrl?.cooledFamilies() ?? new Set<ModelFamily>(),
-    conversationId: () => state.streamCid ?? diffConversations(before, conversationsDir).conversationId,
+    conversationId: () => state.streamCid ?? resolveFallbackConversationId(before, conversationsDir, deps.log, loggedAmbiguousCid),
   }
   return state
 }
@@ -485,6 +525,19 @@ export function persistBindingOnResult(
   // actually wrote to beats the binding we entered with.
   const finalId = ev.conversationId || recorder.streamCid || input.binding?.conversationId
   if (!finalId) return
+  const prevCount = Math.max(
+    input.binding?.lastMessageCount ?? 0,
+    deps.store.get(input.sessionAccountKey)?.lastMessageCount ?? 0,
+  )
+  warnWatermarkDrop({
+    ...(deps.log ? { log: deps.log } : {}),
+    source: 'persistBindingOnResult',
+    key: input.sessionAccountKey,
+    conversationId: finalId,
+    previousCount: prevCount,
+    nextCount: input.messages.length,
+    messages: input.messages,
+  })
   const mergedImages =
     input.binding?.sentImageIds || input.newlySentImageIds.length > 0
       ? [...new Set([...(input.binding?.sentImageIds ?? []), ...input.newlySentImageIds])]

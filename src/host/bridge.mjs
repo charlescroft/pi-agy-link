@@ -2,8 +2,7 @@
 // dsh-agy-link MCP bridge script: a minimal stdio MCP server with zero
 // dependencies. agy launches it from its MCP registry; it forwards
 // tools/list and tools/call to the plugin loopback endpoint whose URL and
-// token arrive via env. DSH_MCP_SESSION carries the spawning DSH session so
-// the host can resolve the calling agent (issue #55).
+// token arrive via env. DSH_MCP_ROUTE binds requests to a live DSH model step.
 // Protocol: newline-delimited JSON-RPC 2.0.
 import { request as httpRequest } from 'node:http'
 import process from 'node:process'
@@ -12,6 +11,7 @@ import { createInterface } from 'node:readline'
 const URL_BASE = process.env.DSH_MCP_URL || ''
 const TOKEN = process.env.DSH_MCP_TOKEN || ''
 const SESSION = process.env.DSH_MCP_SESSION || ''
+const ROUTE = process.env.DSH_MCP_ROUTE || ''
 const PROTOCOL = '2024-11-05'
 
 function post(path, body) {
@@ -32,6 +32,7 @@ function post(path, body) {
         'Content-Length': Buffer.byteLength(data),
         Authorization: 'Bearer ' + TOKEN,
         ...(SESSION === '' ? {} : { 'X-DSH-Session': SESSION }),
+        ...(ROUTE === '' ? {} : { 'X-DSH-Route': ROUTE }),
       },
       timeout: 600000,
     });
@@ -39,10 +40,15 @@ function post(path, body) {
       const chunks = []
       res.on('data', (c) => chunks.push(c))
       res.on('end', () => {
+        const raw = Buffer.concat(chunks).toString('utf8')
+        if (raw.trim() === '') {
+          resolve({ status: res.statusCode, body: null, raw })
+          return
+        }
         try {
-          resolve({ status: res.statusCode, body: JSON.parse(Buffer.concat(chunks).toString('utf8')) })
-        } catch (e) {
-          reject(e)
+          resolve({ status: res.statusCode, body: JSON.parse(raw), raw })
+        } catch {
+          resolve({ status: res.statusCode, body: null, raw })
         }
       })
     });
@@ -52,20 +58,27 @@ function post(path, body) {
   })
 }
 
-let toolCache = null;
+function formatHttpError(res) {
+  if (res.body !== null && res.body !== undefined && typeof res.body === 'object') {
+    return JSON.stringify(res.body)
+  }
+  const text = typeof res.raw === 'string' && res.raw.trim() !== '' ? res.raw.trim() : '<empty response>'
+  return 'HTTP ' + String(res.status) + ': ' + text
+}
 
 async function listTools() {
-  if (toolCache) return toolCache;
   const res = await post('/tools', {})
-  if (res.status !== 200) throw new Error('bridge /tools failed: ' + JSON.stringify(res.body))
-  toolCache = (res.body.tools || []).map((t) => ({
+  if (res.status !== 200) throw new Error('bridge /tools failed: ' + formatHttpError(res))
+  if (!res.body || typeof res.body !== 'object' || !Array.isArray(res.body.tools)) {
+    throw new Error('bridge /tools returned invalid JSON payload: ' + formatHttpError(res))
+  }
+  return res.body.tools.map((t) => ({
     name: t.name,
     description: t.description || t.dshName,
     inputSchema: t.inputSchema || { type: 'object' },
     _meta: t._meta || { 'antigravity/alwaysLoad': true },
     _dshName: t.dshName,
   }))
-  return toolCache;
 }
 
 function send(msg) {
@@ -87,15 +100,15 @@ async function handle(id, method, params) {
     const name = params && params.name
     const args = (params && params.arguments) || {}
     const tools = await listTools()
-    const hit = tools.find((t) => t.name === name)
+    const hit = tools.find(t => t.name === name)
     if (!hit) {
       send({ jsonrpc: '2.0', id, error: { code: -32602, message: 'unknown tool: ' + name } })
       return;
     }
     try {
       const res = await post('/call', { dshName: hit._dshName, arguments: args })
-      if (res.status !== 200 || res.body.ok !== true) {
-        send({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: 'ERROR: ' + JSON.stringify(res.body) }], isError: true } })
+      if (res.status !== 200 || !res.body || typeof res.body !== 'object' || res.body.ok !== true) {
+        send({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: 'ERROR: ' + formatHttpError(res) }], isError: true } })
         return;
       }
       const content = Array.isArray(res.body.content) && res.body.content.length > 0

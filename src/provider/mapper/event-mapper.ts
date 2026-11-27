@@ -17,14 +17,14 @@
 import type { LlmFailure, StreamChunk } from '@deepseek-ai/dsh-llm'
 import { isAgyQuotaBannerLine, isNonConsumableResultError, type AgyEvent, type RawUsage } from '../../common/types.ts'
 import { type CompactionNotice, renderCompactionMarker } from '../../common/compaction.ts'
-import { type GoalContext, buildGoalCompleteToolCallBlock, buildPlanExitToolCallBlock } from '../../host/dsh-goal.ts'
-import { unwrapMcpTool } from '../../host/mirror-tool.ts'
+import { buildGoalCompleteToolCallBlock, buildPlanExitToolCallBlock, type GoalContext } from '../../host/dsh-goal.ts'
 import { composeThinkingText } from './thoughts.ts'
 import {
   normalizeFileLinks,
   rewriteAgentEmbeds,
   rewriteImageMarkdown,
   splitPendingEmbedFragment,
+  splitPendingMarkdownLink,
   splitPendingWarn,
   stripAgyInternalNoise,
   stripQuotaBannerLines,
@@ -33,32 +33,8 @@ import {
 import { buildToolCallBlock } from './tool-block.ts'
 import { usageFromRaw } from './usage.ts'
 import type { ToolCallState } from './tool-calls.ts'
+import { formatRunningToolFallback } from './running-tool-fallback.ts'
 
-function formatRunningToolFallback(toolName: string, rawArgs: unknown): string {
-  const unwrapped = unwrapMcpTool(toolName, rawArgs)
-  const a = unwrapped.input
-  const str = (...keys: string[]): string => {
-    for (const k of keys) {
-      const v = a[k]
-      if (typeof v === 'string' && v.trim() !== '') return v.trim()
-      if (typeof v === 'number' && Number.isFinite(v)) return String(v)
-    }
-    return ''
-  }
-  if (unwrapped.tool === 'schedule') {
-    const cron = str('CronExpression', 'cron_expression')
-    const dur = str('DurationSeconds', 'duration_seconds')
-    const prompt = str('Prompt', 'prompt')
-    const timing = cron ? `cron ${cron}` : dur ? `${dur}s timer` : 'schedule'
-    return prompt ? `Schedule active (${timing}): ${prompt}` : `Schedule active (${timing})`
-  }
-  const cmd = str('CommandLine', 'command_line', 'command', 'cmd')
-  const taskId = str('TaskId', 'taskId', 'task_id', 'bgTaskId')
-  if (cmd !== '') {
-    return `Tool is running as a background task${taskId ? ` (${taskId})` : ''}: ${cmd}`
-  }
-  return taskId ? `Tool is running as a background task (${taskId})` : 'Tool is running as a background task'
-}
 
 export interface EventMapperOptions {
   /** Run whose event indices mint mirror callIds. */
@@ -89,6 +65,7 @@ export interface EventMapperOptions {
     finalUsage(resultRaw: RawUsage): RawUsage
     consumeInternalCompaction?(): CompactionNotice | undefined
     consumeSpanUsage?(resultRaw?: RawUsage): RawUsage | null
+    zeroDeltaUsageForCut?(): RawUsage | null
   }
   /**
    * Resolve FULL tool args for a recorded step from the agy conversation DB
@@ -128,7 +105,6 @@ export class EventMapper {
   private openAcc = ''
   private readonly emittedByKey = new Map<string, string>()
   private readonly announcedTools = new Set<string>()
-  private readonly pendingAnnounced = new Set<string>()
   private readonly thinkingAnnounced = new Set<string>()
   /**
    * Steps whose banner already streamed WITHOUT prose (issue #43: desktop
@@ -145,6 +121,9 @@ export class EventMapper {
   private finished = false
   private totalTextOutput = ''
   private pendingEmbedFrag = ''
+  // Issue #202: an unterminated `[label](file:///…)` tail, held so the
+  // file:// → / rewrite sees a complete link instead of half of one.
+  private pendingLinkFrag = ''
   private pendingWarnFrag = ''
   private readonly toolCallStates = new Map<string, ToolCallState>()
   private emittedCompactionNotice = false
@@ -184,6 +163,14 @@ export class EventMapper {
 
   private *flushPendingEmbed(): Generator<StreamChunk> {
     yield* this.flushPendingWarn(true)
+    if (this.pendingLinkFrag !== '') {
+      // No more chunks are coming: emit the held link tail so nothing is lost.
+      const tail = this.pendingLinkFrag
+      this.pendingLinkFrag = ''
+      yield* this.ensureBlock('text')
+      const d = this.appendDelta(this.formatAssistantText(tail))
+      if (d) yield d
+    }
     if (this.pendingEmbedFrag === '') return
     const raw = this.pendingEmbedFrag
     this.pendingEmbedFrag = ''
@@ -358,10 +345,12 @@ export class EventMapper {
           if (stripped !== '' || this.pendingEmbedFrag !== '') {
             const embedSplit = splitPendingEmbedFragment(this.pendingEmbedFrag + stripped)
             this.pendingEmbedFrag = embedSplit.pending
-            if (embedSplit.ready !== '') {
+            const linkSplit = splitPendingMarkdownLink(this.pendingLinkFrag + embedSplit.ready)
+            this.pendingLinkFrag = linkSplit.pending
+            if (linkSplit.ready !== '') {
               this.sawTextStep = true
               yield* this.ensureBlock('text')
-              const processedText = this.formatAssistantText(embedSplit.ready)
+              const processedText = this.formatAssistantText(linkSplit.ready)
               const acc = (this.emittedByKey.get(ev.stepKey) ?? '') + processedText
               this.emittedByKey.set(ev.stepKey, acc)
               d = this.appendDelta(processedText)
@@ -436,28 +425,21 @@ export class EventMapper {
           ev.state === 'CANCELED' ||
           ev.state === 'CANCELLED' ||
           ev.state === 'RUNNING' ||
+          (ev.tool.name === 'ask_question' &&
+            ev.tool.args != null &&
+            typeof ev.tool.args === 'object' &&
+            Array.isArray((ev.tool.args as { questions?: unknown }).questions) &&
+            (ev.tool.args as { questions: unknown[] }).questions.length > 0) ||
           (ev.state === undefined && (ev.tool.output !== undefined || ev.tool.error !== undefined))
         if (!isCompleted) {
-          // Live progress for long-running agy tools: while a step is ACTIVE
-          // (a maven build can hold the turn for many minutes) nothing else
-          // streams, so the turn looked frozen. Emit the pending note once per
-          // step into the reasoning block; the completed step still cuts the
-          // span with the real tool card below.
-          if (
-            this.canCutOnTool() &&
-            !this.finished &&
-            ev.state === 'ACTIVE' &&
-            !this.pendingAnnounced.has(ev.stepKey)
-          ) {
-            this.pendingAnnounced.add(ev.stepKey)
-            yield* this.ensureBlock('reasoning')
-            const unwrapped = unwrapMcpTool(ev.tool.name, ev.tool.args)
-            const label = unwrapped.server ? `${unwrapped.tool} (${unwrapped.server})` : unwrapped.tool
-            const d = this.appendDelta(
-              '[agy tool running: ' + label + ' — the result card streams when it finishes]\n',
-            )
-            if (d) yield d
-          }
+          // While a step is ACTIVE the turn shows no content of its own. It used
+          // to append a `[agy tool running: …]` note into the reasoning block as
+          // a "not frozen" signal, but that note was indistinguishable from the
+          // model's real thinking, repeated once per tool call (121 times in one
+          // recorded session), and it was persisted and replayed to the model as
+          // reasoning for every later turn. DSH already renders the running span
+          // itself, so the card that the completed step cuts below is the only
+          // progress surface this mapper needs.
           return
         }
         if (ev.state === 'RUNNING' && (ev.tool.output === undefined || ev.tool.output === '')) {
@@ -485,6 +467,7 @@ export class EventMapper {
               ? this.opts.usage.consumeSpanUsage()
               : this.opts.usage?.finalUsage({})
           ),
+          zeroDeltaUsage: () => this.opts.usage?.zeroDeltaUsageForCut?.(),
         })
         for (const ch of block.chunks) yield ch
         this.blockIdx = block.nextBlockIdx

@@ -22,7 +22,8 @@ import type { RunRecording } from '../../host/recording.ts'
 import { resolveModelSlug } from '../../host/models.ts'
 import { ensureIsolatedKeychain, type RunOutcome } from '../../host/runner.ts'
 import { supportsSshIsolation } from '../../runtime/agy/env.ts'
-import { buildAgyEnv } from '../../runtime/net/account-env.ts'
+import { accountHome, buildAgyEnv } from '../../runtime/net/account-env.ts'
+import { prepareOrchestratorSettingsForAcp } from './orchestrator-prep.ts'
 import { createAttemptRecorder, type AttemptDeps, type AttemptInput, type AttemptSlot } from '../../provider/attempt.ts'
 import { deliverContext } from '../../provider/context-delivery.ts'
 import { classifyFailure, type AttemptFailure } from '../../provider/failure.ts'
@@ -42,6 +43,7 @@ import {
   finishAcpAttempt,
   identityFailureKind,
   isAgyFailureBanner,
+  buildAcpPromptOutcome,
   settleEarlyAbort,
   settleIdentityFailure,
   shouldSelfHealAcpResult,
@@ -50,19 +52,8 @@ import {
 export { isAgyFailureBanner, shouldSelfHealAcpResult } from './settle.ts'
 import { AcpTranscriptUsageTailer } from './transcript-usage.ts'
 import { reportAcpCacheTurn } from './cache-turn.ts'
-
-/**
- * How long we watch a fresh ACP turn for its first event before handing the
- * recording back to the caller. A turn that dies without emitting anything is
- * the signature of a transport that is up but cannot reach Google; waiting for
- * the whole idle budget first would make the CLI fallback feel like a hang.
- */
-const FIRST_OUTPUT_GATE_MS = 20_000
-
-function firstLine(text: string): string {
-  const line = text.split('\n').find((l) => l.trim() !== '')
-  return (line ?? text).trim().slice(0, 240)
-}
+import { FIRST_OUTPUT_GATE_MS, firstLine } from './turn-format.ts'
+import { createBackgroundWaitMonitor, persistInterimAcpBinding } from './bg-wait-notice.ts'
 
 /** Drive one prompt and classify what happened. Never settles, never cleans up. */
 async function runAcpPrompt(opts: {
@@ -118,6 +109,7 @@ async function runAcpPrompt(opts: {
   const usageTailer = !input.isAux && sid !== ''
     ? new AcpTranscriptUsageTailer(sid, recorder.rec.accountHome)
     : null
+  const bgWait = createBackgroundWaitMonitor(subTracker, recorder)
   const flushTranscriptUsage = (): number => {
     if (!usageTailer) return 0
     const samples = usageTailer.poll()
@@ -137,6 +129,7 @@ async function runAcpPrompt(opts: {
 
   try {
     subTracker?.start()
+    bgWait?.start()
     // Align ACP's generation idle floor with the CLI watchdog (15m minimum when
     // configured timeout >= 60s) so large tool-argument generation never trips a
     // premature 600s idle timeout (#183).
@@ -188,6 +181,7 @@ async function runAcpPrompt(opts: {
               else if (ev.stepKind === 'tool') sawTools = true
             }
             recorder.rec.append(ev)
+            bgWait?.noteEvent(ev)
             input.agyOnEvent?.(ev)
             reportDirectToolQuota(quotaCtrl, ev)
           }
@@ -208,12 +202,14 @@ async function runAcpPrompt(opts: {
     if (liveQf !== null) {
       throw new Error(liveQf.rawErrorText)
     }
+    const isCancelled = () => recorder.rec.isAbortRequested || result.stopReason === 'cancelled' || result.stopReason === 'canceled'
     let selfHealed = false
     let resEv = acpPromptResultToAgyEvent(sid, result, streamState.accumulatedText, streamState.lastContextUsed)
     if (
       !input.isAux &&
       !input.signal?.aborted &&
       !quotaCancelled &&
+      !isCancelled() &&
       shouldSelfHealAcpResult(resEv, { sawText, sawThinking, sawTools })
     ) {
       selfHealed = true
@@ -243,6 +239,9 @@ async function runAcpPrompt(opts: {
       : undefined
     if (quotaBanner !== undefined) {
       throw new Error(quotaBanner)
+    }
+    if (!quotaCancelled && isCancelled()) {
+      return buildAcpPromptOutcome({ kind: 'aborted', code: Err.AGY_ERROR, message: 'ACP prompt cancelled' }, startedAt, roundStderr(), quotaCtrl.cooledFamilies())
     }
     if (resEv.kind === 'result' && !resEv.ok && (resEv.response === '' || isNonConsumableResultError(resEv.ok, resEv.error, resEv.response))) {
       throw new Error(resEv.error ?? 'ACP prompt returned error without response')
@@ -278,16 +277,7 @@ async function runAcpPrompt(opts: {
       }
       throw new Error(`ACP prompt returned an empty turn: ${firstLine(textOnly) || 'agy produced no output for this request'}`)
     }
-    return {
-      failure: null,
-      durationMs: Date.now() - startedAt,
-      stderr: roundStderr(),
-      rawErrText: '',
-      runLogText: '',
-      silentTimeout: false,
-      empty: false,
-      cooledInLiveFamilies: quotaCtrl.cooledFamilies(),
-    }
+    return buildAcpPromptOutcome(null, startedAt, roundStderr(), quotaCtrl.cooledFamilies())
   } catch (err) {
     subTracker?.flush()
     const liveQf = quotaCtrl.failoverState()
@@ -298,7 +288,7 @@ async function runAcpPrompt(opts: {
     // A quota-triggered kill is not a timeout and not the user aborting: its
     // classification comes from the quota evidence, not from the error text.
     const timedOut = liveQf === null && /timed out/i.test(msg)
-    const aborted = !quotaCancelled && liveQf === null && (Boolean(input.signal?.aborted) || /aborted/i.test(msg))
+    const aborted = !quotaCancelled && liveQf === null && (Boolean(input.signal?.aborted) || recorder.rec.isAbortRequested || /aborted|cancelled|canceled/i.test(msg))
     const outcome: RunOutcome = {
       code: 1,
       signal: null,
@@ -361,6 +351,7 @@ async function runAcpPrompt(opts: {
       keyringJitter: looksLikeAuthVerificationJitter(`${errText} ${logText}`),
     }
   } finally {
+    bgWait?.stop()
     // Subagents belong to this round: stopping detaches the tracker from the
     // live registry so the header stops reporting them the moment the turn ends.
     subTracker?.stop()
@@ -393,6 +384,25 @@ export async function runAcpAttempt(
     ...(sessionKey === '' ? {} : { sessionId: sessionKey }),
     telemetryFlags: cfg.disableTelemetry,
   })
+  if (input.bridgeRoute) env.DSH_MCP_ROUTE = input.bridgeRoute
+  else delete env.DSH_MCP_ROUTE
+
+  // ACP has no per-invocation `--settings`: the resident server reads
+  // `<home>/.gemini/antigravity-cli/settings.json` at STARTUP. Persist the
+  // Orchestrator seats; the returned tag joins the process key so a process
+  // spawned under other seats is never reused. If the file cannot be merged
+  // safely, fall back to the CLI path below so `--settings` still applies (#204).
+  let settingsTag: string | undefined
+  if (!input.isAux) {
+    const prep = prepareOrchestratorSettingsForAcp({
+      cfg,
+      activeModel: input.activeModel,
+      account,
+      ...(deps.log === undefined ? {} : { log: deps.log }),
+    })
+    if (!prep.ok) return null
+    settingsTag = prep.settingsTag
+  }
 
   // Isolated accounts must authenticate from their OWN token file. If that
   // token is stale agy may fall back to the machine-wide keyring and silently
@@ -423,9 +433,11 @@ export async function runAcpAttempt(
         mode: input.permissionMode,
         sandbox: input.sandbox ?? cfg.sandbox,
         agent: (input.agent ?? cfg.agent).trim(),
+        ...(cfg.mediaDir !== '' ? { addDirs: [cfg.mediaDir] } : {}),
         preemptAutoUpdate: cfg.suppressAgyAutoUpdate,
         ...(account?.email ? { expectedEmail: account.email } : {}),
         ...(account?.dir && !account.systemHome ? { expectedIsolated: true } : {}),
+        ...(settingsTag === undefined ? {} : { settingsTag }),
         usesSharedSlot,
       })
       const resumeId = input.persistBinding ? input.binding?.conversationId : undefined
@@ -478,10 +490,14 @@ export async function runAcpAttempt(
   }
 
   const recorder = createAttemptRecorder(deps, cfg, account, sid, !input.isAux)
+  recorder.rec.family = input.family
   recorder.setTrackerSession?.(input.sessionKey)
   recorder.streamCid = sid
   recorder.startTracker?.()
-  recorder.rec.requestAbort = () => proc.cancelSession(sid)
+  recorder.rec.requestAbort = () => {
+    recorder.rec.markAbortRequested()
+    proc.cancelSession(sid)
+  }
   if (!input.isAux && sessionKey !== '') {
     deps.registerActiveRun(sessionKey, recorder.rec)
   }
@@ -520,18 +536,16 @@ export async function runAcpAttempt(
     sid,
     prompt,
     sessionStatus: openedStatus,
-    onFirstOutput: () => settleGate('stream'),
+    onFirstOutput: () => {
+      persistInterimAcpBinding({ deps, input, recorder, sid })
+      settleGate('stream')
+    },
   })
-  promptPromise.then(
-    () => {
-      clearTimeout(gateTimer)
-      settleGate('done')
-    },
-    () => {
-      clearTimeout(gateTimer)
-      settleGate('done')
-    },
-  )
+  const finishGate = (): void => {
+    clearTimeout(gateTimer)
+    settleGate('done')
+  }
+  promptPromise.then(finishGate, finishGate)
 
   const started = await gate
   if (started === 'done') {
